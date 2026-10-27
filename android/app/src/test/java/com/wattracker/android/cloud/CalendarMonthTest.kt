@@ -5,6 +5,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
+import java.util.Locale
 
 class CalendarMonthTest {
 
@@ -78,6 +79,48 @@ class CalendarMonthTest {
         assertNull(CalendarMonth.fromISODate("2026-1-1"))
         assertNull(CalendarMonth.fromISODate("2026-09-01T00:00:00"))
         assertNull(CalendarMonth.fromISODate(null))
+    }
+
+    /**
+     * #456 review, finding 4. The month heading's order belongs to the locale,
+     * not to this class: the caller passes the platform's month-year skeleton,
+     * which is Android's answer to the ICU template iOS asks
+     * (`setLocalizedDateFormatFromTemplate("LLLLyyyy")`), and a year-first
+     * locale gets a year-first title. A fixed "LLLL yyyy" could not say this.
+     */
+    @Test
+    fun theMonthTitleFollowsTheSkeletonItIsGiven() {
+        val september = CalendarMonth(2026, 9)
+        assertEquals("September 2026", september.title(Locale.ENGLISH, "LLLL yyyy"))
+        assertEquals("septembre 2026", september.title(Locale.FRENCH, "MMMM yyyy"))
+        assertEquals("2026年9月", september.title(Locale.JAPAN, "yyyy年M月"))
+        assertEquals("2026. szeptember", september.title(Locale.forLanguageTag("hu"), "yyyy. MMMM"))
+        assertTrue(
+            "the year-first locales read year-first, which is the finding",
+            september.title(Locale.JAPAN, "yyyy年M月").startsWith("2026"),
+        )
+    }
+
+    @Test
+    fun aCallerWithNoSkeletonStillGetsTheMonthNamed() {
+        assertEquals("September 2026", CalendarMonth(2026, 9).title(Locale.ENGLISH))
+        assertEquals(
+            "September 2026",
+            CalendarMonth(2026, 9).title(Locale.ENGLISH, CalendarMonth.FALLBACK_TITLE_PATTERN),
+        )
+    }
+
+    /**
+     * ICU is free to answer with a letter or a calendar this ISO, date-only
+     * model has no field for. A header that degrades to the old order beats a
+     * screen that throws on a device, so the fallback is a rule, not a hope.
+     */
+    @Test
+    fun anUnusableSkeletonFallsBackInsteadOfThrowing() {
+        // A pattern whose field this date-only arithmetic has no answer for:
+        // an offset, and a time of day. Neither a month nor a year.
+        assertEquals("September 2026", CalendarMonth(2026, 9).title(Locale.ENGLISH, "yyyy MMMM XXX"))
+        assertEquals("September 2026", CalendarMonth(2026, 9).title(Locale.ENGLISH, "HH:mm yyyy MMMM"))
     }
 
     @Test

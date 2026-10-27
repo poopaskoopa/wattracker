@@ -68,14 +68,16 @@ data class CalendarUiState(
  * rider's month and supersedes the load in flight, and a same-identity
  * resume joins that load rather than restarting it.
  *
- * Two reads ride along with the calendar itself, exactly as iOS runs them:
- * the activities collection supplies the summaries of rides linked to
- * completed workouts (the calendar objects deliberately omit them), and the
- * dashboard supplies the FTP that turns a published %FTP target into watts.
+ * Two reads ride along with the calendar itself: the activities collection
+ * supplies the summaries of rides linked to completed workouts (the calendar
+ * objects deliberately omit them), and the dashboard supplies the FTP that
+ * turns a published %FTP target into watts. Both are re-read on a refresh and
+ * served from the cache on a month move -- see [load] -- so paging months
+ * costs one read per month, not three.
  * Neither may hide a usable calendar -- a failed ride read is a thinner day,
- * not a broken screen -- but both must propagate a `notPaired` or a
- * `deviceRemoved`, because a calendar that arrives just before a revocation
- * must never keep presenting the departed rider's data.
+ * not a broken screen -- but both must propagate a `notPaired`, a
+ * `deviceRemoved` or a local 401, because a calendar that arrives just before
+ * a revocation must never keep presenting the departed rider's data.
  */
 class CalendarViewModel(
     private val readModel: ReadSession,
@@ -125,7 +127,7 @@ class CalendarViewModel(
         loadIdentity = identity
         loadMonth = month
         val generation = ++requestGeneration
-        loadJob = scope.launch { load(generation, month, refreshDashboard = true) }
+        loadJob = scope.launch { load(generation, month, refreshSideReads = true) }
     }
 
     /**
@@ -144,7 +146,7 @@ class CalendarViewModel(
             // The desktop never scales to zero; only the cloud can be waking,
             // and only a cold-start gate may be lifted.
             if (readModel.mayBeWaking) readModel.retryNowIfWaking()
-            load(generation, month, refreshDashboard = true)
+            load(generation, month, refreshSideReads = true)
         }
     }
 
@@ -181,10 +183,25 @@ class CalendarViewModel(
         loadIdentity = readModel.identity
         loadMonth = target
         val generation = ++requestGeneration
-        loadJob = scope.launch { load(generation, target, refreshDashboard = false) }
+        loadJob = scope.launch { load(generation, target, refreshSideReads = false) }
     }
 
-    private suspend fun load(generation: Int, month: CalendarMonth, refreshDashboard: Boolean) {
+    /**
+     * Read one month, and -- on a refresh, not on a month move -- the two
+     * collections the month borrows from: the rides that turn a completed
+     * workout into a ride row, and the dashboard that carries the FTP.
+     *
+     * The month read is unconditional: it is what discovers a revocation. The
+     * side reads are not, because over the cloud each one is a paginated delta
+     * walk over the rider's whole history (#456 review, finding 1): paying for
+     * one per chevron tap is a quota bill the rider never asked for, and a
+     * month boundary is not a reason to re-ask for last month's rides. iOS's
+     * `moveMonth` does re-read them; Android deliberately does not, and the
+     * difference is recorded in `docs/mobile-parity.md`. A move still fetches
+     * a side collection when the cache holds nothing for it, so a cold start
+     * whose first read has not landed does not paint a month with no rides.
+     */
+    private suspend fun load(generation: Int, month: CalendarMonth, refreshSideReads: Boolean) {
         val deviceState = readModel.deviceState
         val isPaired = readModel.isPaired
         val identity = readModel.identity
@@ -256,24 +273,23 @@ class CalendarViewModel(
 
         // The linked-ride summaries. A missing activities collection must not
         // hide the calendar, but a terminal session state must not be eaten.
-        // Re-read per month, as iOS's `moveMonth` does: the summaries are what
-        // turn a completed workout into the ride row under it, and the desktop
-        // answer is one rider's history, not a paging problem.
         var activities = cachedOrNull(CloudRoute.Activities, null)
-        try {
-            activities = readModel.load(CloudRoute.Activities, null)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            if (isTerminal(e)) {
-                checkActive()
-                showFailure(e)
-                return
+        if (refreshSideReads || activities == null) {
+            try {
+                activities = readModel.load(CloudRoute.Activities, null)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (isTerminal(e)) {
+                    checkActive()
+                    showFailure(e)
+                    return
+                }
             }
         }
         if (!stillCurrent(generation, month)) return
 
-        if (refreshDashboard) {
+        if (refreshSideReads) {
             try {
                 dashboard = readModel.load(CloudRoute.Dashboard, null)
             } catch (e: CancellationException) {
@@ -365,8 +381,21 @@ class CalendarViewModel(
         null
     }
 
+    /**
+     * Whether a failed side read (rides, dashboard) ends the screen instead of
+     * only thinning it: the session is over, so the month must not go on
+     * presenting a departed rider's plan.
+     *
+     * `LocalClientException.Unauthorized` belongs here with the cloud's two
+     * terminal states (#456 review, finding 2). A 401 from the desktop -- or a
+     * redirect onto its login page -- means the connector token is gone, which
+     * is exactly what a cloud revocation means on the other side of the seam,
+     * and leaving it out swallowed the sign-out into "a thinner day" and
+     * delayed it by one read.
+     */
     private fun isTerminal(e: Exception): Boolean =
         e is CloudSession.Failure.NotPaired || e is CloudSession.Failure.DeviceRemoved ||
+            e is LocalClientException.Unauthorized ||
             readModel.deviceState != CloudSession.DeviceState.paired
 
     /**

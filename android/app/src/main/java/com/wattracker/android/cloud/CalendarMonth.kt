@@ -66,22 +66,28 @@ data class CalendarMonth(val year: Int, val month: Int) : Comparable<CalendarMon
     }
 
     /**
-     * The month named in [locale] ("September 2026"). Locale-free arithmetic;
-     * only this reads it.
+     * The month named in [locale] -- "September 2026", "2026年9月", "2026. září":
+     * whatever order [pattern] gives them. Locale-free arithmetic; only this
+     * reads a locale.
      *
-     * iOS names the same month from a localized template
-     * (`setLocalizedDateFormatFromTemplate("LLLLyyyy")`), which puts the year
-     * and the month in the order that locale wants. `java.time` has no
-     * month-year template to ask, and the Android call that does
-     * (`android.text.format.DateFormat.getBestDateTimePattern`) is a framework
-     * API this cloud-plane class cannot reach from its JVM tests. So the order
-     * here is fixed -- "LLLL yyyy", the standalone month form -- and the
-     * ordering a locale like ja would want is recorded in
-     * `docs/mobile-parity.md` rather than papered over with hand-written
-     * per-language patterns.
+     * [pattern] is the locale's own month-year skeleton, which is what iOS asks
+     * ICU for with `setLocalizedDateFormatFromTemplate("LLLLyyyy")`. Android's
+     * equivalent is `android.text.format.DateFormat.getBestDateTimePattern(
+     * locale, "yyyyMMMM")`, and the screen that has a locale asks it and passes
+     * the answer here -- the #456 review's fourth finding was that a fixed
+     * `"LLLL yyyy"` put the year on the wrong side of the month for every
+     * year-first locale (ja, ko, zh, hu), because this class takes its pattern
+     * as an argument rather than calling a framework it cannot reach from its
+     * JVM tests.
+     *
+     * A pattern this formatter cannot apply falls back to [FALLBACK_TITLE_PATTERN]
+     * rather than throwing on a real device: ICU is free to answer with a field
+     * or a calendar this ISO, date-only arithmetic does not have, and a header
+     * that degrades to the old fixed order beats a crashed screen.
      */
-    fun title(locale: Locale = Locale.getDefault()): String =
-        DateTimeFormatter.ofPattern("LLLL yyyy", locale).format(firstDate)
+    fun title(locale: Locale = Locale.getDefault(), pattern: String = FALLBACK_TITLE_PATTERN): String =
+        runCatching { DateTimeFormatter.ofPattern(pattern, locale).format(firstDate) }
+            .getOrElse { DateTimeFormatter.ofPattern(FALLBACK_TITLE_PATTERN, locale).format(firstDate) }
 
     /** The month [offset] months away, with the wrap the calendar does. */
     fun addingMonths(offset: Int): CalendarMonth {
@@ -101,6 +107,14 @@ data class CalendarMonth(val year: Int, val month: Int) : Comparable<CalendarMon
     }
 
     companion object {
+        /**
+         * The month-year order used when a caller has no locale skeleton to
+         * pass, and the one used when the skeleton it passes cannot be applied:
+         * the standalone month name and the year, in English order. Pass a real
+         * skeleton -- see [title] -- rather than settling for this.
+         */
+        const val FALLBACK_TITLE_PATTERN = "LLLL yyyy"
+
         private val ISO_DATE: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.US)
 
         /** The month the device's clock sits in, in its own zone -- the rider's "now". */

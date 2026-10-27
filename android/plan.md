@@ -2031,7 +2031,10 @@ into `docs/mobile-parity.md` in the same PR.
   header used `with(stringResource(...))` as a receiver trick, the wildcard
   `kotlinx.coroutines.*` import and the framework FQNs inside source were tidied,
   and `volume_syncing`, `optBoolean` and `Stroke` went with them.
-- **Left alone on purpose.** The per-month `.activities` re-read after a cached
+- **Left alone on purpose.** *(Both of these were taken up by the owner's
+  #456 review on 2026-10-27 and are fixed — see the entry below; the wording
+  here is kept as what that round decided at the time.)* The per-month
+  `.activities` re-read after a cached
   month hits: iOS's `moveMonth` does exactly this and the cache is the fallback
   when the re-read fails - a comment now says so. And the two localization nits:
   `CalendarMonth.title()`'s fixed `"LLLL yyyy"` order and the fixed day pattern.
@@ -2102,6 +2105,69 @@ Two pre-existing RTL artefacts were seen and deliberately **not** touched here:
 value strings built as "$value $unit" bidi-swap in an RTL locale ("kg 70",
 "h 4.0"), and untranslated strings staying English in a locale the app has no
 strings for. Physical-device no-jank stays owed, as it does on #197.
+
+**Revised 2026-10-27 — the owner's #456 review (four minor findings) addressed.**
+The review was read-only ("no blocking defects found", tests not run here) and
+listed four minor findings. All four are fixed on this branch.
+
+1. **A month move re-read the whole Activities collection** (finding 1). Over the
+   cloud that is a paginated delta walk per chevron tap — quota the rider never
+   asked for, spent on summaries that do not change at a month boundary.
+   `CalendarViewModel.load`'s `refreshDashboard` became `refreshSideReads` and
+   now gates both side collections: a refresh or a pull re-reads rides and
+   dashboard, a month move joins what the last read left in the cache, and a move
+   still fetches a collection the cache has never held, so a cold start paints no
+   thinner a calendar. iOS's `moveMonth` re-reads; Android deliberately no longer
+   does, and that is a parity row now.
+   (`aMonthMoveJoinsTheCachedRidesInsteadOfReReadingThem`,
+   `aMonthMoveStillFetchesTheRidesTheCacheNeverHad`)
+2. **A local 401 was swallowed as a non-terminal side-read failure** (finding 2).
+   `isTerminal()` knew the cloud's `NotPaired`/`DeviceRemoved` and the seam's
+   `deviceState`, but not `LocalClientException.Unauthorized` — the desktop's
+   "your connector token is gone", which `showFailure` two lines below already
+   treats as a sign-out. The screen kept a departed rider's month up and delayed
+   the sign-out by a read, and the review was right that nothing pinned it.
+   (`aLocalUnauthorizedAnswerFromTheRideReadEndsTheScreenToo`,
+   `aLocalUnauthorizedAnswerFromTheDashboardReadEndsTheScreenToo`)
+3. **`VolumeData.densify` could drop a published week** (finding 3). It stepped
+   seven days from the first bucket, so a bucket published on any other weekday
+   landed between slots and vanished from the chart, every window and every
+   total. The fill now steps from the Monday of the first bucket — the server's
+   own anchor, and identical to the old start whenever the first bucket is a
+   Monday, which it is — and a bucket that falls off the cadence is emitted at
+   its own date instead of dropped, because re-bucketing it here is the
+   day-boundary bug this file refuses to commit. Only the zero fill is bounded
+   (5 000 weeks); a published week never is.
+   (`anOffCadenceBucketCountsAndTheMondayGridHoldsItsSpacing`,
+   `theZeroFillAnchorsOnMondaysNotOnTheFirstBucket`)
+4. **The month title's order was hard-coded** (finding 4). `CalendarMonth.title()`
+   used a fixed `"LLLL yyyy"`, so a year-first locale read the year on the wrong
+   side of the month — "9月 2026" where the locale wants "2026年9月". `title`
+   now takes the locale's month-year skeleton, and the screen asks the platform
+   for it (`android.text.format.DateFormat.getBestDateTimePattern(locale,
+   "yyyyMMMM")`, Android's equivalent of iOS's
+   `setLocalizedDateFormatFromTemplate("LLLLyyyy")`, remembered per locale). A
+   skeleton this date-only formatter cannot apply falls back to the old order
+   rather than throwing on a device. The earlier reasoning — the model cannot
+   reach the ICU call — had the wrong frame: the model does not need to reach it,
+   the screen does, and the screen has a configuration to ask.
+   (`theMonthTitleFollowsTheSkeletonItIsGiven`,
+   `anUnusableSkeletonFallsBackInsteadOfThrowing`,
+   `aCallerWithNoSkeletonStillGetsTheMonthNamed`)
+
+Verification: **320 JVM tests green** (was 311) and `:app:assembleDebug`
+assembles. Each fix was mutation-proved locally, one at a time: re-gating the
+activities read turns exactly the two month-move tests red; dropping
+`Unauthorized` from `isTerminal` turns exactly the two new terminal tests red;
+dropping an off-cadence bucket turns exactly the off-cadence test red, and
+stepping from the first bucket rather than its Monday exactly the anchor test
+red; ignoring the passed skeleton turns exactly the skeleton test red, and
+removing the fallback guard exactly the fallback test red.
+
+**Not verified this round:** the framework skeleton lookup is a device-side call
+the JVM suite cannot reach, and no emulator was run — the year-first month title
+needs a device pass (recorded in the parity row), along with the three states the
+previous entry lists as still unseen.
 
 **Preamble — server route:**
 The read-only route `GET /api/calendar?year=&month=` exists in `wattracker/server.py` (since commit `32444f7`), returning `build_calendar_month(...)` as JSON (`{"weeks": ...}`). The app's local calendar adapter is written against its test-pinned shape.

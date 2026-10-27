@@ -5,7 +5,9 @@ import com.wattracker.android.cloud.CloudPayload
 import com.wattracker.android.cloud.CloudSnapshot
 import com.wattracker.android.cloud.VolumeWeek
 import com.wattracker.android.cloud.isoDateOrNull
+import java.time.DayOfWeek
 import java.time.LocalDate
+import java.time.temporal.TemporalAdjusters
 import java.util.Locale
 
 /**
@@ -113,29 +115,53 @@ data class VolumeData(
             return byStart.values.sortedBy { it.weekStart ?: "" }
         }
 
+        /**
+         * Fill the gaps between published buckets with zero weeks.
+         *
+         * The zero weeks ride the server's cadence, and the cadence is the
+         * server's own Monday anchor: the grid steps seven days at a time from
+         * the Monday of the first published week (#456 review, finding 3 --
+         * stepping from the first bucket itself means that a bucket published on
+         * any other weekday silently vanished from every window and every
+         * total). Anchoring on the Monday changes nothing for the normal case,
+         * where the server does publish Mondays, and keeps the spacing the
+         * desktop's even when it does not.
+         *
+         * A published bucket that falls off the cadence is still emitted, at
+         * its own date with its own totals, and it does not shift the grid:
+         * a week the server published is never invisible to the rider, and
+         * re-bucketing it here is exactly the day-boundary bug this file
+         * refuses to commit.
+         *
+         * Only the zero fill is bounded: a bogus ancient bucket must not be
+         * able to ask for a million-row chart. Published weeks never are.
+         */
         private fun densify(weeks: List<VolumeWeek>): List<VolumeWeek> {
             val first = weeks.firstOrNull()?.weekStart?.let { isoDateOrNull(it) } ?: return emptyList()
-            val last = weeks.lastOrNull()?.weekStart?.let { isoDateOrNull(it) } ?: return emptyList()
-            val byStart = LinkedHashMap<String, VolumeWeek>()
+            val output = ArrayList<VolumeWeek>(weeks.size)
+            var slot = first.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY))
+            var zeros = 0
             for (week in weeks) {
-                // A reconciled snapshot normally has one object per week. If
-                // an older cache contains duplicates, keep the last one
-                // rather than wedging the chart.
-                week.weekStart?.let { byStart[it] = week }
-            }
-            val output = mutableListOf<VolumeWeek>()
-            var date = first
-            var steps = 0
-            while (!date.isAfter(last) && steps < 5000) {
-                val start = date.toString()
-                output.add(
-                    byStart[start] ?: VolumeWeek(start, hours = 0.0, tss = 0.0, distanceKm = 0.0, calories = 0.0),
-                )
-                date = date.plusDays(7)
-                steps += 1
+                // `parse` returns the buckets sorted and de-duplicated (an
+                // older cache may hold two objects for one week: keep the
+                // last), so this walk is monotonic in both the fill and the
+                // buckets themselves.
+                val start = week.weekStart?.let { isoDateOrNull(it) } ?: continue
+                while (slot.isBefore(start) && zeros < MAX_ZERO_WEEKS) {
+                    output.add(
+                        VolumeWeek(slot.toString(), hours = 0.0, tss = 0.0, distanceKm = 0.0, calories = 0.0),
+                    )
+                    zeros += 1
+                    slot = slot.plusDays(7)
+                }
+                output.add(week)
+                if (slot == start) slot = slot.plusDays(7)
             }
             return output
         }
+
+        /** The bound on the zero fill, not on the weeks the server published. */
+        private const val MAX_ZERO_WEEKS = 5000
     }
 
     /** The window's weeks: the last N dense weeks, or this year's buckets. */

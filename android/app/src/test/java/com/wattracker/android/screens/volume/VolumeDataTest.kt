@@ -58,6 +58,55 @@ class VolumeDataTest {
         assertEquals(0.0, data.denseWeeks[1].hours!!, 1e-9)
     }
 
+    /**
+     * #456 review, finding 3. The zero fill used to step seven days from the
+     * first published bucket, so a bucket the server published on any other
+     * weekday was dropped -- invisible in the chart, in every window and in
+     * every total. The server publishes Mondays, so this is protocol drift
+     * rather than a live defect, but a published week is never allowed to
+     * vanish: it keeps its own date, and the Monday grid keeps its cadence.
+     */
+    @Test
+    fun anOffCadenceBucketCountsAndTheMondayGridHoldsItsSpacing() {
+        val data = VolumeData(
+            snapshot(
+                listOf(
+                    weekItem("2026-05-04", hours = 1.0),   // Monday
+                    weekItem("2026-05-12", hours = 3.0),   // the Tuesday the server should not have published
+                    weekItem("2026-05-18", hours = 2.0),   // Monday again
+                ),
+            ),
+        )
+        assertEquals(
+            listOf("2026-05-04", "2026-05-11", "2026-05-12", "2026-05-18"),
+            data.denseWeeks.map { it.weekStart },
+        )
+        assertEquals(6.0, data.summaryFor(VolumeRange.Last4).hours, 1e-9)
+        assertEquals(3.0, data.weeks.single { it.weekStart == "2026-05-12" }.hours!!, 1e-9)
+    }
+
+    /**
+     * The cadence is the server's Monday anchor, not whichever bucket happens
+     * to sort first: when the first published week is not a Monday, the fill
+     * still lands on Mondays so the spacing matches the desktop's grid.
+     */
+    @Test
+    fun theZeroFillAnchorsOnMondaysNotOnTheFirstBucket() {
+        val data = VolumeData(
+            snapshot(
+                listOf(
+                    weekItem("2026-05-05", hours = 1.0),   // Tuesday
+                    weekItem("2026-05-11", hours = 2.0),   // Monday
+                ),
+            ),
+        )
+        assertEquals(listOf("2026-05-04", "2026-05-05", "2026-05-11"), data.denseWeeks.map { it.weekStart })
+        // The 4th is the fill -- the Monday the Tuesday bucket belongs to --
+        // and the 12th never appears, because the grid steps Mondays.
+        assertEquals(0.0, data.denseWeeks.first().hours!!, 1e-9)
+        assertEquals(3.0, data.summaryFor(VolumeRange.Last4).hours, 1e-9)
+    }
+
     @Test
     fun duplicateWeeksKeepTheLast() {
         val data = VolumeData(

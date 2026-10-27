@@ -1,6 +1,7 @@
 package com.wattracker.android.screens
 
 import android.content.res.Configuration
+import android.text.format.DateFormat
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -97,6 +98,7 @@ import com.wattracker.android.ui.theme.wtFlag
 import com.wattracker.android.ui.theme.wtFlight
 import com.wattracker.android.ui.theme.wtPedalBike
 import kotlinx.coroutines.CancellationException
+import java.util.Locale
 import kotlin.math.max
 
 /**
@@ -417,6 +419,41 @@ private fun CalendarContent(
  * name -- not these. In a right-to-left locale the previous month is the one
  * on the right, so mirroring them is ours to do.
  */
+/** The CLDR skeleton for "the month and the year, nothing else". */
+private const val MONTH_YEAR_SKELETON = "yyyyMMMM"
+
+/**
+ * The locale the device configuration carries, which is the locale the month
+ * heading is named in.
+ */
+@Composable
+private fun screenLocale(): Locale = LocalConfiguration.current.locales[0]
+
+/**
+ * The platform's month-year skeleton for [locale] (#456 review, finding 4).
+ *
+ * `getBestDateTimePattern` is Android's equivalent of the ICU template iOS
+ * asks for (`setLocalizedDateFormatFromTemplate("LLLLyyyy")`): it answers with
+ * the order that locale wants -- "2026年10月", "2026. oktober", "Oktober 2026"
+ * -- where a fixed `"LLLL yyyy"` put the year on the wrong side of the month
+ * for every year-first locale. The framework call lives here, where a device
+ * configuration exists to ask; [CalendarMonth.title] takes the skeleton, which
+ * is what keeps the skeleton's effect pinned by JVM tests. The lookup is
+ * remembered per locale: it is an ICU call, not a string concat.
+ */
+@Composable
+private fun monthYearPattern(locale: Locale): String = remember(locale) {
+    runCatching { DateFormat.getBestDateTimePattern(locale, MONTH_YEAR_SKELETON) }
+        .getOrDefault(CalendarMonth.FALLBACK_TITLE_PATTERN)
+}
+
+/** Names [month] the way this device's locale orders a month and a year. */
+@Composable
+private fun monthTitle(month: CalendarMonth): String {
+    val locale = screenLocale()
+    return month.title(locale, monthYearPattern(locale))
+}
+
 @Composable
 private fun CalendarMonthNavigation(month: CalendarMonth, onMoveMonth: (Int) -> Unit) {
     val mirrored = if (LocalLayoutDirection.current == LayoutDirection.Rtl) {
@@ -438,7 +475,7 @@ private fun CalendarMonthNavigation(month: CalendarMonth, onMoveMonth: (Int) -> 
             )
         }
         Text(
-            text = month.title(),
+            text = monthTitle(month),
             style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
             modifier = Modifier.weight(1f),
             textAlign = TextAlign.Center,
@@ -473,8 +510,10 @@ private fun CalendarMonthGrid(
     // sort chronologically as strings, so a date before the 1st belongs to the
     // month before and a date after it to the month after.
     val firstIso = remember(month) { month.isoDate(1) }
-    val previousTitle = remember(month) { month.addingMonths(-1).title() }
-    val nextTitle = remember(month) { month.addingMonths(1).title() }
+    val locale = screenLocale()
+    val pattern = monthYearPattern(locale)
+    val previousTitle = remember(month, locale, pattern) { month.addingMonths(-1).title(locale, pattern) }
+    val nextTitle = remember(month, locale, pattern) { month.addingMonths(1).title(locale, pattern) }
     Panel(modifier = Modifier.fillMaxWidth()) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(modifier = Modifier.fillMaxWidth()) {
@@ -780,7 +819,7 @@ private fun CalendarStates(
                     style = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
                 )
                 Text(
-                    text = stringResource(R.string.calendar_month_empty_note, uiState.month.title()),
+                    text = stringResource(R.string.calendar_month_empty_note, monthTitle(uiState.month)),
                     style = TextStyle(fontSize = 13.sp, color = Palette.muted),
                 )
             }

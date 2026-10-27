@@ -1,5 +1,6 @@
 package com.wattracker.android.screens.calendar
 
+import com.wattracker.android.cloud.ActivitySummary
 import com.wattracker.android.cloud.CalendarDay
 import com.wattracker.android.cloud.CalendarMonth
 import com.wattracker.android.cloud.CloudItem
@@ -11,6 +12,7 @@ import com.wattracker.android.cloud.CloudSnapshot
 import com.wattracker.android.cloud.LocalClientException
 import com.wattracker.android.cloud.ReadSession
 import com.wattracker.android.cloud.TrainingState
+import com.wattracker.android.json.JsonValue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -98,6 +100,52 @@ class CalendarViewModelTest {
                 parts = null,
             ),
         ),
+    )
+
+    /** A planned block the rider finished, recorded as activity [activityId]. */
+    private fun dayWithCompletedWorkout(date: String, activityId: Double): CloudItem = CloudItem(
+        id = "calendar-day-$date",
+        kind = CloudKind.CalendarDay,
+        revision = 1,
+        payload = CloudPayload.CalendarDay(
+            CalendarDay(
+                date = date,
+                ooto = null,
+                phase = null,
+                race = null,
+                workouts = listOf(
+                    JsonValue.Object(
+                        linkedMapOf(
+                            "id" to JsonValue.Number(1.0),
+                            "name" to JsonValue.String("Endurance"),
+                            "completed_activity_id" to JsonValue.Number(activityId),
+                        ),
+                    ),
+                ),
+                activities = null,
+                part = null,
+                parts = null,
+            ),
+        ),
+    )
+
+    /** The activities route as the screen reads it: one rider's recorded rides. */
+    private fun activitiesSnapshot(summary: ActivitySummary, source: CloudSnapshot.Source): CloudSnapshot = CloudSnapshot(
+        CloudRoute.Activities, 1,
+        listOf(
+            CloudItem(
+                id = "activity-${summary.id?.toInt()}",
+                kind = CloudKind.Activity,
+                revision = 1,
+                payload = CloudPayload.Activity(summary),
+            ),
+        ),
+        source, 1000L,
+    )
+
+    private fun rideSummary(id: Double, startTime: String): ActivitySummary = ActivitySummary(
+        id = id, startTime = startTime, durationS = 5400.0, distanceM = 61000.0,
+        avgPower = 190.0, avgHr = 138.0, np = 205.0, intensityFactor = 0.82, tss = 74.0, rpe = 5.0,
     )
 
     private fun calendarSnapshot(
@@ -369,6 +417,129 @@ class CalendarViewModelTest {
         assertNotNull(vm.uiState.value.data)
     }
 
+    /**
+     * #456 review, finding 2. A 401 from the desktop -- or its redirect onto
+     * the login page -- means the connector token is gone, which is exactly
+     * what a cloud revocation means on the other side of the seam. Treated as
+     * an ordinary side-read failure it left the departed rider's month on
+     * screen and delayed the sign-out by a whole read, and nothing pinned it.
+     */
+    @Test
+    fun aLocalUnauthorizedAnswerFromTheRideReadEndsTheScreenToo() = runTest(testDispatcher) {
+        val session = FakeReadSession(
+            loadHandler = { route, _ ->
+                if (route == CloudRoute.Calendar) {
+                    calendarSnapshot(listOf(dayItem("2026-05-04")))
+                } else {
+                    throw LocalClientException.Unauthorized()
+                }
+            },
+        )
+        val vm = CalendarViewModel(session, coroutineScope = backgroundScope)
+        vm.moveMonth(monthsFromTodayTo(may))
+        val state = vm.uiState.value
+        assertEquals("a refused local token is a sign-out, not a thinner day", CloudSession.DeviceState.removed, state.deviceState)
+        assertFalse(state.isPaired)
+        assertNull("and the departed rider's month does not stay up", state.data)
+        assertNull(state.selectedDate)
+    }
+
+    /**
+     * The same terminal answer arriving from the dashboard read: the FTP read
+     * that used to be swallowed is the one a re-pairing revocation reaches
+     * first when the rides were already cached.
+     */
+    @Test
+    fun aLocalUnauthorizedAnswerFromTheDashboardReadEndsTheScreenToo() = runTest(testDispatcher) {
+        val summary = rideSummary(7.0, "2026-05-04T06:30:00")
+        val session = FakeReadSession(
+            cachedSnapshots = mapOf(
+                (CloudRoute.Activities to null) to activitiesSnapshot(summary, CloudSnapshot.Source.cache),
+            ),
+            loadHandler = { route, _ ->
+                when (route) {
+                    CloudRoute.Calendar -> calendarSnapshot(listOf(dayItem("2026-05-04")))
+                    CloudRoute.Dashboard -> throw LocalClientException.Unauthorized()
+                    else -> CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
+                }
+            },
+        )
+        val vm = CalendarViewModel(session, coroutineScope = backgroundScope)
+        vm.refresh()
+        val state = vm.uiState.value
+        assertEquals(CloudSession.DeviceState.removed, state.deviceState)
+        assertNull(state.data)
+    }
+
+    /**
+     * #456 review, finding 1. The activities collection is one rider's whole
+     * history, and over the cloud reading it is a paginated delta walk: paging
+     * months used to buy one walk per chevron tap, which is quota the rider
+     * never asked for and a read the month does not need. A refresh still
+     * re-reads it; a move joins what the last read left in the cache, and the
+     * rides still link -- the cached collection is what supplies them.
+     */
+    @Test
+    fun aMonthMoveJoinsTheCachedRidesInsteadOfReReadingThem() = runTest(testDispatcher) {
+        val summary = rideSummary(7.0, "2026-06-02T06:30:00")
+        val session = FakeReadSession(
+            cachedSnapshots = mapOf(
+                (CloudRoute.Activities to null) to activitiesSnapshot(summary, CloudSnapshot.Source.cache),
+            ),
+            loadHandler = { route, month ->
+                when (route) {
+                    CloudRoute.Calendar -> calendarSnapshot(listOf(dayWithCompletedWorkout(month!!.isoDate(2), 7.0)))
+                    else -> CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
+                }
+            },
+        )
+        val vm = CalendarViewModel(session, coroutineScope = backgroundScope)
+        vm.refresh()
+        vm.moveMonth(1)
+        val state = vm.uiState.value
+        assertEquals(
+            "one collection read for the refresh, none for the move",
+            1,
+            session.loads.count { it.first == CloudRoute.Activities },
+        )
+        assertEquals(2, session.loads.count { it.first == CloudRoute.Calendar })
+        val day = state.data?.entry(state.month.isoDate(2))
+        assertNotNull("the month moved to is on screen", day)
+        assertEquals(
+            "and its ride row came out of the collection the refresh cached",
+            1,
+            day?.activityCount,
+        )
+    }
+
+    /**
+     * The other half of the same rule: the cache is the fallback, not the
+     * assumption. A screen whose first read is a month move has never read the
+     * collection at all, and painting that month without its rides would be a
+     * silently thinner calendar.
+     */
+    @Test
+    fun aMonthMoveStillFetchesTheRidesTheCacheNeverHad() = runTest(testDispatcher) {
+        val session = FakeReadSession(
+            loadHandler = { route, month ->
+                when (route) {
+                    CloudRoute.Calendar -> calendarSnapshot(listOf(dayWithCompletedWorkout(month!!.isoDate(2), 7.0)))
+                    CloudRoute.Activities -> activitiesSnapshot(rideSummary(7.0, "2026-05-02T06:30:00"), CloudSnapshot.Source.network)
+                    else -> CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
+                }
+            },
+        )
+        // Nothing cached for any route: the month move is the screen's first
+        // read, so the collection is not in the cache to join.
+        session.cacheServes = false
+        val vm = CalendarViewModel(session, coroutineScope = backgroundScope)
+        vm.moveMonth(monthsFromTodayTo(may))
+        assertEquals("the cache held nothing, so the move reads the collection once", 1, session.loads.count { it.first == CloudRoute.Activities })
+        val day = vm.uiState.value.data?.entry(may.isoDate(2))
+        assertNotNull(day)
+        assertEquals(1, day?.activityCount)
+    }
+
     @Test
     fun movingMonthsDropsTheAnswerOfTheMonthJustLeft() = runTest(testDispatcher) {
         // Same shape as the activities list's supersession test: the first
@@ -432,11 +603,11 @@ class CalendarViewModelTest {
 
     /** A tiny fixture builder for workout rows inside a `calendar_day`. */
     private object CloudItemFixture {
-        fun workoutRow(id: Double): com.wattracker.android.json.JsonValue =
-            com.wattracker.android.json.JsonValue.Object(
+        fun workoutRow(id: Double): JsonValue =
+            JsonValue.Object(
                 linkedMapOf(
-                    "id" to com.wattracker.android.json.JsonValue.Number(id),
-                    "name" to com.wattracker.android.json.JsonValue.String("Planned $id"),
+                    "id" to JsonValue.Number(id),
+                    "name" to JsonValue.String("Planned $id"),
                 ),
             )
     }
