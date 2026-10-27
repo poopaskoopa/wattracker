@@ -160,6 +160,118 @@ val wtCalendarMonth: ImageVector = ImageVector.Builder(
     )
 }.build()
 
+/**
+ * Month steppers for the calendar header (Material's `chevron_left` and
+ * `chevron_right`). The vendored set, not the icons artifact: the trimmed
+ * `material-icons-core` this app builds against does not carry them, and the
+ * extended artifact is the same 50 MB "no" as everywhere else.
+ */
+val wtChevronLeft: ImageVector = ImageVector.Builder(
+    name = "wtChevronLeft",
+    defaultWidth = 24.dp,
+    defaultHeight = 24.dp,
+    viewportWidth = 24f,
+    viewportHeight = 24f,
+).apply {
+    addPath(
+        fill = whiteFill,
+        pathData = PathBuilder().apply {
+            moveTo(15.41f, 7.41f)
+            lineTo(14f, 6f)
+            lineTo(8f, 12f)
+            lineTo(14f, 18f)
+            lineTo(15.41f, 16.59f)
+            lineTo(10.83f, 12f)
+            close()
+        }.nodes,
+    )
+}.build()
+
+val wtChevronRight: ImageVector = ImageVector.Builder(
+    name = "wtChevronRight",
+    defaultWidth = 24.dp,
+    defaultHeight = 24.dp,
+    viewportWidth = 24f,
+    viewportHeight = 24f,
+).apply {
+    addPath(
+        fill = whiteFill,
+        pathData = PathBuilder().apply {
+            moveTo(10f, 6f)
+            lineTo(8.59f, 7.41f)
+            lineTo(13.17f, 12f)
+            lineTo(8.59f, 16.59f)
+            lineTo(10f, 18f)
+            lineTo(16f, 12f)
+            close()
+        }.nodes,
+    )
+}.build()
+
+/**
+ * Airplane, marking an out-of-office day in the calendar grid. The iOS cell
+ * uses the `airplane` SF Symbol; this is Material's `flight`, same posture
+ * as the four nav icons: vendored path data, no extended-icons dependency.
+ */
+val wtFlight: ImageVector = ImageVector.Builder(
+    name = "wtFlight",
+    defaultWidth = 24.dp,
+    defaultHeight = 24.dp,
+    viewportWidth = 24f,
+    viewportHeight = 24f,
+).apply {
+    addPath(
+        fill = whiteFill,
+        pathData = PathBuilder().apply {
+            moveTo(22f, 16.5f)
+            lineTo(14f, 11.5f)
+            lineTo(14f, 3.5f)
+            curveTo(14f, 2.67f, 13.33f, 2f, 12.5f, 2f)
+            curveTo(11.67f, 2f, 11f, 2.67f, 11f, 3.5f)
+            lineTo(11f, 11.5f)
+            lineTo(3f, 16.5f)
+            lineTo(3f, 18.5f)
+            lineTo(11f, 16f)
+            lineTo(11f, 19f)
+            lineTo(9f, 20.5f)
+            lineTo(9f, 22f)
+            lineTo(12.5f, 21f)
+            lineTo(16f, 22f)
+            lineTo(16f, 20.5f)
+            lineTo(14f, 19f)
+            lineTo(14f, 16f)
+            lineTo(22f, 18.5f)
+            close()
+        }.nodes,
+    )
+}.build()
+
+/** Flag, marking a race day in the calendar grid (the iOS `flag.checkered`). */
+val wtFlag: ImageVector = ImageVector.Builder(
+    name = "wtFlag",
+    defaultWidth = 24.dp,
+    defaultHeight = 24.dp,
+    viewportWidth = 24f,
+    viewportHeight = 24f,
+).apply {
+    addPath(
+        fill = whiteFill,
+        pathData = PathBuilder().apply {
+            moveTo(14.4f, 6f)
+            lineTo(14f, 4f)
+            lineTo(5f, 4f)
+            lineTo(5f, 21f)
+            lineTo(7f, 21f)
+            lineTo(7f, 14f)
+            lineTo(12.6f, 14f)
+            lineTo(13f, 16f)
+            lineTo(20f, 16f)
+            lineTo(20f, 6f)
+            close()
+        }.nodes,
+    )
+}.build()
+
 /** Bar chart icon for Volume. */
 val wtBarChart: ImageVector = ImageVector.Builder(
     name = "wtBarChart",
