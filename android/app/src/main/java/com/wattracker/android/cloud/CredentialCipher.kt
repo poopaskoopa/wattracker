@@ -1,6 +1,7 @@
 package com.wattracker.android.cloud
 
 import java.security.SecureRandom
+import java.security.UnrecoverableKeyException
 import javax.crypto.Cipher
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
@@ -27,6 +28,10 @@ interface CredentialCipher {
      * bytes that were written -- another key, a flipped bit, an envelope meant
      * for another file, a truncated read. GCM authenticates, and this seam does
      * not turn that signal into a plausible-looking wrong answer.
+     *
+     * A [CredentialKeyStore.CredentialKeyException] is not wrapped: "there is no
+     * key to ask" and "the vault answers badly" are different failures with
+     * different advice, and a caller has to be able to tell them apart.
      */
     fun decrypt(envelope: ByteArray): ByteArray
 }
@@ -84,7 +89,7 @@ class AesGcmCipher(
             cipher.updateAAD(associatedData)
             return iv + cipher.doFinal(plaintext)
         } catch (e: Exception) {
-            throw CredentialCipherException("could not encrypt the credential vault", e)
+            throw wrapFailure("could not encrypt the credential vault", e)
         }
     }
 
@@ -96,7 +101,7 @@ class AesGcmCipher(
             cipher.updateAAD(associatedData)
             return cipher.doFinal(envelope, GCM_IV_BYTES, envelope.size - GCM_IV_BYTES)
         } catch (e: Exception) {
-            throw CredentialCipherException("the credential vault is not one this key wrote", e)
+            throw wrapFailure("the credential vault is not one this key wrote", e)
         }
     }
 
@@ -113,7 +118,7 @@ class AesGcmCipher(
             cipher.updateAAD(associatedData)
             return cipher.doFinal(plaintext)
         } catch (e: Exception) {
-            throw CredentialCipherException("could not encrypt the credential vault", e)
+            throw wrapFailure("could not encrypt the credential vault", e)
         }
     }
 
@@ -124,8 +129,26 @@ class AesGcmCipher(
             cipher.updateAAD(associatedData)
             return cipher.doFinal(envelope)
         } catch (e: Exception) {
-            throw CredentialCipherException("the credential vault is not one this key wrote", e)
+            throw wrapFailure("the credential vault is not one this key wrote", e)
         }
+    }
+
+    /**
+     * A key problem stays a key problem. [keyProvider] throws
+     * [CredentialKeyStore.CredentialKeyException] when the Keystore will not
+     * hand over the key, and a stale Keystore handle says so at `init` with
+     * [UnrecoverableKeyException]; wrapping either into a cipher failure would
+     * tell the store "the vault is bad" when the truth is "there is no key", and
+     * the store would then advise pairing again on a device that cannot write
+     * one. Everything else is the envelope's own fault.
+     */
+    private fun wrapFailure(message: String, failure: Exception): Exception = when (failure) {
+        is CredentialKeyStore.CredentialKeyException -> failure
+        is UnrecoverableKeyException -> CredentialKeyStore.CredentialKeyException(
+            "the credential key could not be used",
+            failure,
+        )
+        else -> CredentialCipherException(message, failure)
     }
 
     companion object {

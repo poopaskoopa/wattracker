@@ -265,6 +265,9 @@ object WatTrackerApp {
     private fun openCredentialStore(context: Context): DeviceCredentialStore {
         dropLegacyEncryptedStore(context)
         return try {
+            // The store's constructor takes the Keystore key, so a Keystore
+            // that will not hand one over throws right here rather than on the
+            // first write after a pairing code has been spent.
             KeystoreDeviceCredentialStore(context)
         } catch (_: Exception) {
             // The Keystore itself will not take part: it hands over no AES key,
@@ -281,14 +284,19 @@ object WatTrackerApp {
 
     /**
      * #457 took the credential store off `security-crypto`, and with that library
-     * gone nothing here can read the two files it left behind: the encrypted prefs
-     * and the Tink keyset beside them. Nothing ever shipped them -- no release has
-     * carried the encrypted store, and #199's internal testing starts on this
-     * branch -- so there is nothing to migrate and no rider re-pairs; what exists
-     * is dead bytes on developer and emulator installs, so they are dropped.
-     * Idempotent, and this call can go once no such install is in use.
+     * gone nothing here can read the prefs file it wrote. One file, not two:
+     * `EncryptedSharedPreferences` kept its Tink keysets inside that same file
+     * under the reserved keys `__androidx_security_crypto_encrypted_prefs_*`
+     * (verified against the library's own source), and the master key was a plain
+     * Keystore entry with no prefs of its own.
      *
-     * The orphan Keystore entry that guarded that keyset is deliberately left
+     * Nothing ever shipped it -- no release has carried the encrypted store, and
+     * #199's internal testing starts on this branch -- so there is nothing to
+     * migrate and no rider re-pairs; what exists is dead bytes on developer and
+     * emulator installs, so it is dropped. Idempotent, and this call can go once
+     * no such install is in use.
+     *
+     * The orphan Keystore entry that guarded those keysets is deliberately left
      * alone: it cannot be exported, it protects nothing now, and the Keystore
      * takes it back with the app. Naming another library's private alias to delete
      * it is a coupling worth less than the residue it clears.
@@ -297,7 +305,6 @@ object WatTrackerApp {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         if (prefs.getBoolean(KEY_LEGACY_STORE_DROPPED, false)) return
         context.deleteSharedPreferences(LEGACY_CREDENTIAL_PREFS)
-        context.deleteSharedPreferences(LEGACY_CREDENTIAL_KEYSET_PREFS)
         prefs.edit().putBoolean(KEY_LEGACY_STORE_DROPPED, true).apply()
     }
 
@@ -313,7 +320,6 @@ object WatTrackerApp {
     private const val KEY_DATA_SOURCE = "active_data_source"
     private const val KEY_LEGACY_STORE_DROPPED = "legacy_credential_store_dropped"
 
-    /** The names the security-crypto store wrote; see [dropLegacyEncryptedStore]. */
+    /** The prefs file the security-crypto store wrote; see [dropLegacyEncryptedStore]. */
     private const val LEGACY_CREDENTIAL_PREFS = "wattracker_device_credential"
-    private const val LEGACY_CREDENTIAL_KEYSET_PREFS = "wattracker_device_credential_master"
 }

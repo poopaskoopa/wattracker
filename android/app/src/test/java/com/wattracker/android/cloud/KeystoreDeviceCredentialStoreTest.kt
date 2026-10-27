@@ -19,11 +19,12 @@ import javax.crypto.spec.SecretKeySpec
  * What this suite can pin is the store: that the file never holds a secret in
  * the clear, that a vault this key did not write is refused rather
  * than half-believed, that a refusal is reported through `health` while the
- * file stays put, that writes are all-or-nothing, and that a refused write
- * throws. What it cannot pin is the AndroidKeyStore itself -- the non-exportable
- * key, the provider-chosen IV -- which is device-only and stays a device check
- * (the same split as [DeviceKeyStore], whose JVM coverage is nil for the same
- * reason).
+ * file stays put, that "there is no key" and "the vault is bad" stay separate
+ * answers, that the key is taken before the store exists and only once, that
+ * writes are all-or-nothing, and that a refused write throws. What it cannot pin
+ * is the AndroidKeyStore itself -- the non-exportable key, the provider-chosen
+ * IV -- which is device-only and stays a device check (the same split as
+ * [DeviceKeyStore], whose JVM coverage is nil for the same reason).
  */
 class KeystoreDeviceCredentialStoreTest {
 
@@ -288,6 +289,110 @@ class KeystoreDeviceCredentialStoreTest {
         // #195's pairing screen asks the store what it promises about the next
         // launch; the in-memory one must not be allowed to answer "durable".
         assertEquals(StoreHealth.Unavailable, InMemoryDeviceCredentialStore().health)
+    }
+
+    /**
+     * The key is taken while the store is being built, and once. Both halves
+     * matter: a Keystore that will not hand over a key has to fail where its
+     * caller can still choose a fallback, not on the write that follows a spent
+     * pairing code; and the alias is fixed for the life of the process, so a
+     * Keystore round trip per `loadLocal()` is waste.
+     */
+    @Test
+    fun theKeyIsTakenBeforeTheStoreExistsAndOnlyOnceAfterThat() {
+        var reads = 0
+        val provider = eagerKeyProvider {
+            reads++
+            key(7)
+        }
+        assertEquals("the load ran during construction, not on first use", 1, reads)
+        repeat(4) { provider() }
+        assertEquals("and one read covers every later operation", 1, reads)
+    }
+
+    @Test
+    fun aKeystoreThatWantsNoPartFailsAtConstructionWhereTheCallerCanHearIt() {
+        val thrown = try {
+            eagerKeyProvider { throw CredentialKeyStore.CredentialKeyException("the Android Keystore is unavailable") }
+            null
+        } catch (e: CredentialKeyStore.CredentialKeyException) {
+            e
+        }
+        assertNotNull("the store must not be built around a key that does not exist", thrown)
+    }
+
+    /**
+     * "No key" and "bad vault" are different advice: one means pair again and
+     * the file is replaced, the other means this device cannot save a pairing at
+     * all. If the cipher wraps a key failure into a cipher failure -- or the
+     * store catches both alike -- the two collapse and the screen lies.
+     */
+    @Test
+    fun aKeyFailureStaysAKeyFailureThroughTheCipher() {
+        val cipher = AesGcmCipher(
+            keyProvider = { throw CredentialKeyStore.CredentialKeyException("the credential key could not be read") },
+            associatedData = "aad".toByteArray(Charsets.UTF_8),
+        )
+
+        val readFailure = try {
+            cipher.decrypt(ByteArray(64))
+            null
+        } catch (e: Exception) {
+            e
+        }
+        assertTrue(
+            "a read must be able to say the key is gone, not that the vault is wrong",
+            readFailure is CredentialKeyStore.CredentialKeyException,
+        )
+
+        val writeFailure = try {
+            cipher.encrypt("x".toByteArray(Charsets.UTF_8))
+            null
+        } catch (e: Exception) {
+            e
+        }
+        assertTrue(
+            "and so must a write",
+            writeFailure is CredentialKeyStore.CredentialKeyException,
+        )
+    }
+
+    @Test
+    fun aKeyThatCannotBeUsedSaysUnavailableRatherThanBlamingTheVault() {
+        val file = vaultFile()
+        storeOn(file).save(device)   // a real vault, written while the key still worked
+
+        val orphan = KeystoreDeviceCredentialStore(file, KeyDeadCipher())
+        assertNull(orphan.load())
+        assertEquals(
+            """"pair again replaces it" is wrong advice when nothing can be written""",
+            StoreHealth.Unavailable,
+            orphan.health,
+        )
+        assertTrue("and the vault is left where it is", file.exists())
+    }
+
+    @Test
+    fun aWriteTheKeyRefusesIsARefusedWriteAndSaysSoAfterwards() {
+        val store = KeystoreDeviceCredentialStore(vaultFile(), KeyDeadCipher())
+
+        val thrown = try {
+            store.save(device)
+            null
+        } catch (e: CredentialStoreException) {
+            e
+        }
+        assertNotNull("the session has to learn the pairing did not persist", thrown)
+        assertEquals(StoreHealth.Unavailable, store.health)
+    }
+
+    /** A cipher whose key is gone: no key to ask, rather than a bad envelope. */
+    private class KeyDeadCipher : CredentialCipher {
+        override fun encrypt(plaintext: ByteArray): ByteArray =
+            throw CredentialKeyStore.CredentialKeyException("the Android Keystore is unavailable")
+
+        override fun decrypt(envelope: ByteArray): ByteArray =
+            throw CredentialKeyStore.CredentialKeyException("the credential key could not be read")
     }
 
     /** A cipher that adds nothing, so the test can address the store's own rules. */

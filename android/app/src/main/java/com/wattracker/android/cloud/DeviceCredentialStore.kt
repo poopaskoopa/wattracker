@@ -9,6 +9,7 @@ import com.wattracker.android.json.optString
 import com.wattracker.android.json.toJson
 import java.io.File
 import java.io.FileOutputStream
+import javax.crypto.SecretKey
 
 /**
  * Storage for the cloud device binding and local desktop credentials.
@@ -110,10 +111,17 @@ class InMemoryDeviceCredentialStore : DeviceCredentialStore {
  * A vault that will not open -- another key, a tampered byte, a file carried in
  * from another installation -- is left exactly where it is and reported through
  * [health] as [StoreHealth.UnreadableVault]: the rider is unpaired, and the next
- * pairing overwrites the file.
- * Deleting it would destroy a credential that may yet open (one Keystore hiccup
- * is not a credential that is gone), and answering `null` in silence would look
- * exactly like "never paired".
+ * pairing overwrites the file. Deleting it would destroy a credential that may
+ * yet open (one Keystore hiccup is not a credential that is gone), and answering
+ * `null` in silence would look exactly like "never paired".
+ *
+ * A vault that cannot be opened *because there is no key* says
+ * [StoreHealth.Unavailable] instead, which is the difference between "pair again
+ * and it is fixed" and "this device cannot save a pairing at all". The key is
+ * taken in the constructor for that reason: [CredentialKeyStore.loadOrCreateKey]
+ * has to be able to throw while the app is still choosing a store, where the
+ * answer is to fall back and say so, and not on the first write after a pairing
+ * code has already been spent.
  */
 class KeystoreDeviceCredentialStore internal constructor(
     private val file: File,
@@ -123,7 +131,14 @@ class KeystoreDeviceCredentialStore internal constructor(
     constructor(context: Context) : this(
         File(context.filesDir, FILE_NAME),
         AesGcmCipher(
-            keyProvider = { CredentialKeyStore.loadOrCreateKey() },
+            // Eager, and taken once. A Keystore that will not hand over a key
+            // has to throw here, while the app is still choosing a store
+            // (WatTrackerApplication.openCredentialStore): handed to the cipher
+            // as a lazy lambda, that fallback could never fire and the failure
+            // would arrive on the write that follows a spent pairing code.
+            // One read per launch rather than one per operation because the
+            // alias is fixed for the life of the process.
+            keyProvider = eagerKeyProvider { CredentialKeyStore.loadOrCreateKey() },
             associatedData = ASSOCIATED_DATA.toByteArray(Charsets.UTF_8),
             ivSource = AesGcmCipher.IvSource.PROVIDER_GENERATED,
         ),
@@ -136,12 +151,29 @@ class KeystoreDeviceCredentialStore internal constructor(
     private var vaultUnreadable = false
 
     /**
+     * Sticky for this launch once anything says the *key* is the problem rather
+     * than the file. Not cleared by a later success: the store holds one key
+     * handle, so a success after a key failure would mean the first failure was
+     * an oddity, and the honest answer to that is a relaunch, not a promise of
+     * durability.
+     */
+    @Volatile
+    private var keyUnavailable = false
+
+    /**
+     * [StoreHealth.Unavailable] if the key could not be used at all, else
      * [StoreHealth.UnreadableVault] while the last look at [file] found
-     * something this installation's key could not open. Set by a read, cleared
-     * by the next read that succeeds -- including the one a fresh pairing writes.
+     * something this installation's key could not open. The vault flag is set by
+     * a read and cleared by the next read that succeeds -- including the one a
+     * fresh pairing writes; the key flag is not cleared, because this launch has
+     * no second key to try.
      */
     override val health: StoreHealth
-        get() = if (vaultUnreadable) StoreHealth.UnreadableVault else StoreHealth.Durable
+        get() = when {
+            keyUnavailable -> StoreHealth.Unavailable
+            vaultUnreadable -> StoreHealth.UnreadableVault
+            else -> StoreHealth.Durable
+        }
 
     override fun load(): PairedDevice? = readVault().pairedDevice
 
@@ -188,11 +220,21 @@ class KeystoreDeviceCredentialStore internal constructor(
             }
             file.readBytes()
         } catch (_: Exception) {
+            // The file was there and would not read. That is more often a
+            // transient I/O failure than a corrupted vault, which is why the
+            // file is left alone and this clears on the next successful read --
+            // the next pull-to-refresh answers it correctly.
             vaultUnreadable = true
             return Vault()
         }
         return try {
             decode(envelope).also { vaultUnreadable = false }
+        } catch (_: CredentialKeyStore.CredentialKeyException) {
+            // No key to ask, which is not the same message as a vault that
+            // answers badly: "pair again replaces it" is a lie on a device that
+            // cannot write a pairing either.
+            keyUnavailable = true
+            Vault()
         } catch (_: Exception) {
             vaultUnreadable = true
             Vault()
@@ -223,7 +265,15 @@ class KeystoreDeviceCredentialStore internal constructor(
     }
 
     private fun writeVaultLocked(vault: Vault) {
-        val envelope = cipher.encrypt(encode(vault))
+        val envelope = try {
+            cipher.encrypt(encode(vault))
+        } catch (e: CredentialKeyStore.CredentialKeyException) {
+            // The key, not the filesystem: reported as a refused write (the
+            // session already handles that) and remembered as Unavailable, so
+            // the screen can say the pairing will not outlive this launch.
+            keyUnavailable = true
+            throw CredentialStoreException("the credential key could not wrap the vault", e)
+        }
         val temp = File(file.parentFile, file.name + TEMP_SUFFIX)
         try {
             FileOutputStream(temp).use { out ->
@@ -273,6 +323,20 @@ class KeystoreDeviceCredentialStore internal constructor(
         private const val FORMAT_VERSION = 1
         private const val TEMP_SUFFIX = ".tmp"
     }
+}
+
+/**
+ * Takes the key **now** and hands back a provider for the held handle.
+ *
+ * Both halves are the point, and both are tested: the load happens when this
+ * function is called -- so a store whose key is unavailable fails during
+ * construction, where its caller can still choose a fallback -- and it happens
+ * once however many operations follow, because a Keystore round trip per
+ * `loadLocal()` is waste on a fixed alias.
+ */
+internal fun eagerKeyProvider(load: () -> SecretKey): () -> SecretKey {
+    val key = load()
+    return { key }
 }
 
 fun LocalCredentials.toJson(): String {

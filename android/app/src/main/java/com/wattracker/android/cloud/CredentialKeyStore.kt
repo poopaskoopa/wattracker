@@ -39,16 +39,40 @@ object CredentialKeyStore {
      * every later launch will use, and a write wrapped under anything else is a
      * credential the next launch cannot open. [DeviceKeyStore] takes the same
      * posture for the signing key, for the same reason.
+     *
+     * Every failure here comes back as [CredentialKeyException]. Left raw, a
+     * corrupt Keystore (`IOException` from [KeyStore.load]) or an entry that
+     * will not release (`UnrecoverableKeyException`) would reach the store as
+     * generic I/O and be mistaken for a bad vault -- "pair again" copy for a
+     * device on which pairing again cannot be written.
      */
     fun loadOrCreateKey(): SecretKey {
-        val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
-        (keyStore.getKey(ALIAS, null) as? SecretKey)?.let { existing ->
-            assertNonExportable(existing)
-            return existing
+        val keyStore = try {
+            KeyStore.getInstance(KEYSTORE).apply { load(null) }
+        } catch (e: Exception) {
+            throw CredentialKeyException("the Android Keystore is unavailable", e)
         }
 
-        val generated = generate()
-        val stored = (keyStore.getKey(ALIAS, null) as? SecretKey) ?: generated
+        val existing = try {
+            keyStore.getKey(ALIAS, null) as? SecretKey
+        } catch (e: Exception) {
+            throw CredentialKeyException("the credential key could not be read", e)
+        }
+        existing?.let {
+            assertNonExportable(it)
+            return it
+        }
+
+        generate()
+        // Read back rather than use the handle `generate` handed back: a key the
+        // Keystore will not show again would wrap a vault this installation can
+        // never open, and admitting that now beats a pairing that vanishes at
+        // the next launch.
+        val stored = try {
+            keyStore.getKey(ALIAS, null) as? SecretKey
+        } catch (e: Exception) {
+            throw CredentialKeyException("the credential key could not be read back", e)
+        } ?: throw CredentialKeyException("the Keystore did not store the credential key")
         assertNonExportable(stored)
         return stored
     }
