@@ -57,18 +57,7 @@ struct PairingScreen: View {
     private var form: some View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Pair this device")
-                        .font(.title2.weight(.semibold))
-                        .foregroundStyle(Palette.textBright)
-                    Spacer()
-                    if gate.canCancelPairing {
-                        Button("Cancel") { Task { await gate.cancelPairing() } }
-                            .buttonStyle(.bordered)
-                            .tint(Palette.accent)
-                            .accessibilityIdentifier("pairing-cancel")
-                    }
-                }
+                pairingTitleRow
                 Text(
                     model.backend == .cloud
                         ? "Open wattracker on your computer and ask it for a pairing code."
@@ -157,6 +146,41 @@ struct PairingScreen: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("pairing-message")
                     }
+                }
+            }
+        }
+    }
+
+    private var pairingHeading: some View {
+        Text("Pair this device")
+            .font(.title2.weight(.semibold))
+            .foregroundStyle(Palette.textBright)
+    }
+
+    @ViewBuilder
+    private var cancelButton: some View {
+        if gate.canCancelPairing, let fallback = gate.pairedFallback {
+            Button("Cancel") { Task { await gate.cancelPairing() } }
+                .buttonStyle(.bordered)
+                .tint(Palette.accent)
+                .disabled(model.isWorking)
+                .accessibilityIdentifier("pairing-cancel")
+                .accessibilityHint("Return to \(fallback.title)")
+        }
+    }
+
+    private var pairingTitleRow: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline) {
+                pairingHeading.fixedSize(horizontal: true, vertical: false)
+                Spacer(minLength: 8)
+                cancelButton
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                pairingHeading
+                HStack {
+                    Spacer()
+                    cancelButton
                 }
             }
         }

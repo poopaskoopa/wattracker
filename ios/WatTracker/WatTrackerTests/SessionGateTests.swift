@@ -967,6 +967,211 @@ final class SessionGateTests: XCTestCase {
         XCTAssertNil(preference.backend)
     }
 
+    func testCancelAfterFallbackRevocationReevaluatesToRemovedCloud() async {
+        let clock = TestClock()
+        let preference = MemoryPreferenceStore()
+        let cloud = harness(paired: true, clock: clock) { _, _ in
+            .refused(404, serverDate: clock.now)
+        }
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(), cache: MemorySnapshotCache()
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference, pathMonitor: FakePathMonitor()
+        )
+
+        await gate.start()
+        await gate.automaticReevaluate()
+        await gate.select(.local)
+        XCTAssertEqual(gate.pairedFallback, .cloud)
+        XCTAssertTrue(gate.canCancelPairing)
+
+        await gate.probe()
+        XCTAssertTrue(gate.canCancelPairing)
+        clock.advance(400)
+        await gate.probe()
+
+        let revokedState = await cloud.session.deviceState
+        XCTAssertEqual(revokedState, .removed)
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertNil(gate.pairedFallback)
+        XCTAssertFalse(gate.canCancelPairing)
+
+        // Exercise a tap that raced the update which hid the button.
+        await gate.cancelPairing()
+
+        XCTAssertEqual(gate.phase, .removed)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertNil(preference.backend)
+    }
+
+    func testCancelRechecksFallbackIfCloudIsRemovedBeforeGateRefresh() async {
+        let clock = TestClock()
+        let preference = MemoryPreferenceStore()
+        let cloud = harness(paired: true, clock: clock) { _, _ in
+            .refused(404, serverDate: clock.now)
+        }
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(), cache: MemorySnapshotCache()
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference, pathMonitor: FakePathMonitor()
+        )
+
+        await gate.start()
+        await gate.automaticReevaluate()
+        await gate.select(.local)
+        XCTAssertEqual(gate.pairedFallback, .cloud)
+        XCTAssertTrue(gate.canCancelPairing)
+
+        // Mutate the actor state without notifying SessionGate, reproducing a
+        // tap that races the refresh which would otherwise hide Cancel.
+        _ = try? await cloud.session.readerContext()
+        clock.advance(400)
+        _ = try? await cloud.session.readerContext()
+        let revokedState = await cloud.session.deviceState
+        XCTAssertEqual(revokedState, .removed)
+        XCTAssertTrue(gate.canCancelPairing)
+
+        await gate.cancelPairing()
+
+        XCTAssertNil(gate.pairedFallback)
+        XCTAssertEqual(gate.phase, .removed)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertNil(preference.backend)
+    }
+
+    func testAutomaticPairingWithPairedFallbackDoesNotOfferCancel() async {
+        let clock = TestClock()
+        let preference = MemoryPreferenceStore()
+        let cloud = harness(paired: true, clock: clock) { _, _ in
+            .refused(404, serverDate: clock.now)
+        }
+        let localTransport = LocalProbeTransport()
+        localTransport.setReachable(false)
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!, token: value.token,
+                    transport: localTransport
+                )
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference, pathMonitor: FakePathMonitor()
+        )
+
+        await gate.start()
+        await gate.automaticReevaluate()
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
+
+        // Keep Cloud selected for the pairing screen without writing a
+        // Settings override. The owner is handling this route separately.
+        await gate.selectBackend(.cloud)
+        await gate.probe()
+        clock.advance(400)
+        await gate.probe()
+        let revokedState = await cloud.session.deviceState
+        XCTAssertEqual(revokedState, .removed)
+
+        await gate.startOver()
+
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertEqual(gate.pairedFallback, .local)
+        XCTAssertFalse(gate.canCancelPairing)
+        XCTAssertNil(preference.backend)
+    }
+
+    func testRefreshWithoutActiveSessionRecordsPairedFallback() async throws {
+        struct NoCloudSession: Error {}
+        let localTransport = LocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(), cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!, token: value.token,
+                    transport: localTransport
+                )
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { throw NoCloudSession() }, makeLocalSession: { local },
+            preferences: MemoryPreferenceStore(), pathMonitor: FakePathMonitor()
+        )
+
+        await gate.start()
+        XCTAssertNil(gate.activeSession)
+
+        // This test seam makes the opposite session paired after startup's
+        // missing-cloud-session state, then exercises refresh's nil branch.
+        try await local.pair(host: "https://desktop.example", token: "token")
+        await gate.refresh()
+
+        XCTAssertNil(gate.activeSession)
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.pairedFallback, .local)
+        XCTAssertFalse(gate.canCancelPairing)
+    }
+
+    func testCancelPairingIsIgnoredWhileLocalPairingIsInFlight() async throws {
+        let preference = MemoryPreferenceStore()
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = BlockingLocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(), cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!, token: value.token,
+                    transport: transport
+                )
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference, pathMonitor: FakePathMonitor()
+        )
+
+        await gate.start()
+        await gate.automaticReevaluate()
+        await gate.select(.local)
+        XCTAssertTrue(gate.canCancelPairing)
+
+        let pairing = Task {
+            try await gate.pairLocal(
+                host: "https://desktop.example", token: "token", label: nil
+            )
+        }
+        guard await transport.gate.waitForArrival(timeout: 1) else {
+            await transport.gate.openGate()
+            _ = try? await pairing.value
+            return XCTFail("local pairing did not reach the blocked request")
+        }
+
+        XCTAssertTrue(gate.pairingInFlight)
+        XCTAssertFalse(gate.canCancelPairing)
+        await gate.cancelPairing()
+        XCTAssertEqual(gate.selection, .local)
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(preference.backend, .local)
+
+        await transport.gate.openGate()
+        try await pairing.value
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertFalse(gate.pairingInFlight)
+    }
+
     func testARefusedPairingLeavesTheGateOnThePairingScreen() async {
         let rig = harness(paired: false) { _, _ in .refused(404) }
         await rig.gate.start()

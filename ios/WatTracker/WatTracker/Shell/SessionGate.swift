@@ -183,6 +183,7 @@ final class SessionGate {
     /// one is paired. This lets PairingScreen offer a way back to a working
     /// session when a Settings override leads here.
     private(set) var pairedFallback: Backend?
+    private(set) var pairingInFlight = false
 
     private let makeSession: @Sendable () throws -> CloudSession
     private let makeLocalSession: @Sendable () throws -> LocalSession
@@ -208,6 +209,7 @@ final class SessionGate {
 
     var canCancelPairing: Bool {
         phase == .unpaired && manualOverride != nil && pairedFallback != nil
+            && !pairingInFlight
     }
 
     init(
@@ -350,6 +352,11 @@ final class SessionGate {
                 // `startOver()` has cleared the session, so replace the
                 // invalidated write before returning.
                 await refresh()
+            } else if phase == .unpaired, manualOverride != nil {
+                // A foreground probe may have changed the other session to
+                // `.removed` while this gate is still showing pairing. Re-read
+                // both states so `pairedFallback` reflects live availability.
+                await refresh()
             }
             return
         }
@@ -390,6 +397,10 @@ final class SessionGate {
             // Keep the only paired backend selected when the desktop is
             // temporarily unavailable, so its cache remains usable.
             backend = .local
+        } else {
+            // With no paired backend, Automatic returns to the normal cloud
+            // first-run flow (or its removed state after a cloud revocation).
+            backend = .cloud
         }
         await refresh()
     }
@@ -441,8 +452,26 @@ final class SessionGate {
 
     /// Leave the pairing screen for the backend that is already paired.
     func cancelPairing() async {
-        guard canCancelPairing else { return }
+        guard phase == .unpaired, manualOverride != nil, !pairingInFlight else { return }
+        let generation = selectionGeneration
+        let fallback = pairedFallback
+        let fallbackIsPaired = await isPaired(fallback)
+        guard generation == selectionGeneration, manualOverride != nil,
+              !pairingInFlight else { return }
+        if !fallbackIsPaired {
+            pairedFallback = nil
+        }
         await select(.automatic)
+    }
+
+    private func isPaired(_ backend: Backend?) async -> Bool {
+        guard let backend else { return false }
+        switch backend {
+        case .cloud:
+            return await session?.deviceState == .paired
+        case .local:
+            return await localSession?.deviceState == .paired
+        }
     }
 
     static func phase(for state: CloudSession.DeviceState) -> Phase {
@@ -457,6 +486,8 @@ final class SessionGate {
     /// through `PairingFailureMessage` and never directly.
     func pair(code: String, label: String?) async throws {
         guard let session else { throw GateFailure.noSession }
+        pairingInFlight = true
+        defer { pairingInFlight = false }
         selectionGeneration += 1
         temporaryOverride = nil
         backend = .cloud
@@ -477,6 +508,8 @@ final class SessionGate {
     /// cookie it receives from the desktop.
     func pairLocal(host: String, token: String, label: String?) async throws {
         guard let localSession else { throw GateFailure.noSession }
+        pairingInFlight = true
+        defer { pairingInFlight = false }
         selectionGeneration += 1
         temporaryOverride = nil
         backend = .local
