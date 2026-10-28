@@ -9,7 +9,9 @@ navigationCompose = "2.10.0"
 # Step 2 (#194): revision-keyed cloud cache + credential storage. Pinned here
 # per the plan; the dependencies are wired in when the client is written.
 room = "2.8.4"
-securityCrypto = "1.1.0"
+# androidx.security:security-crypto is gone (#457): it is deprecated with no
+# further releases, and the credential store it backed is now wrapped by an
+# Android Keystore AES-GCM key directly -- no third-party crypto in the app.
 # Coroutines back the §2.3 single-flight refresh (a Mutex-guarded shared
 # Deferred) and the suspend read seam. It is already a transitive of
 # room-ktx / activity-compose; declared explicitly so the client does not rely
@@ -35,7 +37,6 @@ androidx-navigation-compose = { group = "androidx.navigation", name = "navigatio
 androidx-room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
 androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
 androidx-room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
-androidx-security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "securityCrypto" }
 kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }
 kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
 
