@@ -797,7 +797,8 @@ final class SessionGateTests: XCTestCase {
 
         await gate.start()
 
-        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
         XCTAssertEqual(gate.phase, .unpaired)
         XCTAssertNil(gate.lastSuccess)
     }
@@ -871,6 +872,98 @@ final class SessionGateTests: XCTestCase {
         XCTAssertEqual(gate.selection, .automatic)
         XCTAssertEqual(gate.backend, .local)
         XCTAssertEqual(gate.phase, .paired)
+        XCTAssertNil(preference.backend)
+    }
+
+    // MARK: - Leaving the pairing screen (#460)
+
+    func testPairingReachedFromSettingsCanBeCancelledBackToThePairedBackend() async {
+        let preference = MemoryPreferenceStore()
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(), cache: MemorySnapshotCache()
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference, pathMonitor: FakePathMonitor()
+        )
+
+        await gate.start()
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertFalse(gate.canCancelPairing)
+
+        await gate.select(.local)
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.pairedFallback, .cloud)
+        XCTAssertTrue(gate.canCancelPairing)
+
+        await gate.cancelPairing()
+
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertNil(gate.pairedFallback)
+        XCTAssertNil(preference.backend)
+    }
+
+    func testLaunchWithOverrideForUnpairedBackendLandsOnThePairedOne() async {
+        let preference = MemoryPreferenceStore(.local)
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(), cache: MemorySnapshotCache()
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference, pathMonitor: FakePathMonitor()
+        )
+
+        await gate.start()
+
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertNil(preference.backend)
+    }
+
+    func testLaunchWithOverrideAndNeitherBackendPairedFallsBackToAutomaticPairing() async {
+        let preference = MemoryPreferenceStore(.local)
+        let cloud = harness(paired: false) { _, _ in .refused(404) }
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(), cache: MemorySnapshotCache()
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference, pathMonitor: FakePathMonitor()
+        )
+
+        await gate.start()
+
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertNil(gate.pairedFallback)
+        XCTAssertNil(preference.backend)
+    }
+
+    func testFirstRunPairingHasNoCancelAction() async {
+        let preference = MemoryPreferenceStore()
+        let cloud = harness(paired: false) { _, _ in .refused(404) }
+        let gate = SessionGate(
+            makeSession: { cloud.session }, preferences: preference,
+            pathMonitor: FakePathMonitor()
+        )
+
+        await gate.start()
+
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertFalse(gate.canCancelPairing)
+        XCTAssertNil(gate.pairedFallback)
+
+        await gate.cancelPairing()
+
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
         XCTAssertNil(preference.backend)
     }
 

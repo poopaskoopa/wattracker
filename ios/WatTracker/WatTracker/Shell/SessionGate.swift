@@ -179,6 +179,10 @@ final class SessionGate {
     private(set) var localSession: LocalSession?
     private(set) var backend: Backend
     private(set) var lastSuccess: Date?
+    /// The other backend when the selected backend is unpaired and the other
+    /// one is paired. This lets PairingScreen offer a way back to a working
+    /// session when a Settings override leads here.
+    private(set) var pairedFallback: Backend?
 
     private let makeSession: @Sendable () throws -> CloudSession
     private let makeLocalSession: @Sendable () throws -> LocalSession
@@ -200,6 +204,10 @@ final class SessionGate {
 
     var selection: Selection {
         manualOverride.map { $0 == .cloud ? .cloud : .local } ?? .automatic
+    }
+
+    var canCancelPairing: Bool {
+        phase == .unpaired && manualOverride != nil && pairedFallback != nil
     }
 
     init(
@@ -281,7 +289,15 @@ final class SessionGate {
 
         let cloudPaired = await session?.deviceState == .paired
         let localPaired = await localSession?.deviceState == .paired
-        if let manualOverride {
+        if let manualOverride,
+           manualOverride == .cloud ? !cloudPaired : !localPaired {
+            // Do not let a persisted override pin the app to PairingScreen.
+            // This also covers the first-run case where neither backend has
+            // been paired yet.
+            self.manualOverride = nil
+            preferences.clearBackendOverride()
+        }
+        if let manualOverride = self.manualOverride {
             backend = manualOverride
         } else {
             backend = cloudPaired ? .cloud : (localPaired ? .local : .cloud)
@@ -393,20 +409,40 @@ final class SessionGate {
         let generation = selectionGeneration
         let selectedBackend = backend
         guard let activeSession else {
+            let nextFallback = await pairedAlternative(to: selectedBackend)
             guard generation == selectionGeneration, selectedBackend == backend else {
                 return
             }
             phase = .unpaired
             lastSuccess = nil
+            pairedFallback = nextFallback
             return
         }
         let (nextState, nextLastSuccess) = await stateReader(activeSession)
         let nextPhase = Self.phase(for: nextState)
+        let nextFallback = nextPhase == .unpaired
+            ? await pairedAlternative(to: selectedBackend) : nil
         guard generation == selectionGeneration, selectedBackend == backend else {
             return
         }
         phase = nextPhase
         lastSuccess = nextLastSuccess
+        pairedFallback = nextFallback
+    }
+
+    private func pairedAlternative(to backend: Backend) async -> Backend? {
+        switch backend {
+        case .cloud:
+            return await localSession?.deviceState == .paired ? .local : nil
+        case .local:
+            return await session?.deviceState == .paired ? .cloud : nil
+        }
+    }
+
+    /// Leave the pairing screen for the backend that is already paired.
+    func cancelPairing() async {
+        guard canCancelPairing else { return }
+        await select(.automatic)
     }
 
     static func phase(for state: CloudSession.DeviceState) -> Phase {

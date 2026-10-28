@@ -57,9 +57,18 @@ struct PairingScreen: View {
     private var form: some View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Pair this device")
-                    .font(.title2.weight(.semibold))
-                    .foregroundStyle(Palette.textBright)
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Pair this device")
+                        .font(.title2.weight(.semibold))
+                        .foregroundStyle(Palette.textBright)
+                    Spacer()
+                    if gate.canCancelPairing {
+                        Button("Cancel") { Task { await gate.cancelPairing() } }
+                            .buttonStyle(.bordered)
+                            .tint(Palette.accent)
+                            .accessibilityIdentifier("pairing-cancel")
+                    }
+                }
                 Text(
                     model.backend == .cloud
                         ? "Open wattracker on your computer and ask it for a pairing code."
