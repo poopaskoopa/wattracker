@@ -41,7 +41,7 @@ until the command timeout kills them. Always prefix `git --no-pager`, e.g.
 `git --no-pager log --oneline -5`; for a whole session, set `GIT_PAGER=`
 to empty instead.
 
-**Resume point — Step 4 (#196) Dashboard is merged (PR #419, 2026-10-06, `736f290`). Step 5 (#197) Activities list + ride detail is being implemented on `feature/android-client-5` (cut from `main` at `25e7220`). PR #459 (#457, the credential store off `security-crypto`) is **merged** (`ec6aab0`, 2026-11-03), and #457 is closed by it; the 2026-10-30, 2026-10-31 and 2026-11-02 reviews are all addressed, and the device run is the 2026-11-03 note below. The device run covered **one** physical device (a Pixel 6a); the emulator half and the cloud half of the owed check stay open until #468 (the cloud authority) is fixed.** Steps 1–3 are merged: Step 2 (#194) via PR #304, Step 3 (#195) via PR #376 (landed through #403, `8722198`). #195 and #196 stay open for their device checks. The Step 4 implementation notes, the PR #419 review (2026-09-30) and its fixes (2026-10-04), verification and known gaps are under "Step 4 — Dashboard screen" below, and the PR #419 post-merge follow-up (the `removal_decision_v1` vector test, the mobile-parity cells) landed first on the Step 5 branch (2026-10-15). The Step 5 implementation notes are under "Step 5 — Activities list + ride detail" below.
+**Resume point — Step 4 (#196) Dashboard is merged (PR #419, 2026-10-06, `736f290`). Step 5 (#197) Activities list + ride detail is being implemented on `feature/android-client-5` (cut from `main` at `25e7220`). Step 7 (#199)'s device test is specified: the release-shape run from the internal track, gated on the force-stop/relaunch-still-paired check and the local HTTPS backend (the HTTP dev harness is unreachable from a Play build). See Step 7 item 5 below. PR #459 (#457, the credential store off `security-crypto`) is **merged** (`ec6aab0`, 2026-11-03), and #457 is closed by it; the 2026-10-30, 2026-10-31 and 2026-11-02 reviews are all addressed, and the device run is the 2026-11-03 note below. The device run covered **one** physical device (a Pixel 6a); the emulator half and the cloud half of the owed check stay open until #468 (the cloud authority) is fixed.** Steps 1–3 are merged: Step 2 (#194) via PR #304, Step 3 (#195) via PR #376 (landed through #403, `8722198`). #195 and #196 stay open for their device checks. The Step 4 implementation notes, the PR #419 review (2026-09-30) and its fixes (2026-10-04), verification and known gaps are under "Step 4 — Dashboard screen" below, and the PR #419 post-merge follow-up (the `removal_decision_v1` vector test, the mobile-parity cells) landed first on the Step 5 branch (2026-10-15). The Step 5 implementation notes are under "Step 5 — Activities list + ride detail" below.
 
 Step 3 context: merged via PR #376 (landed through #403). Cloud and local pairing, the Settings screen, and the removed state (#153, `markRemoved()`). The review findings and their resolutions are on PR #376; the durable ones are: every type holding a bearer secret (`LocalCredentials`, `LocalRequest`, `LocalResponse`, `ActiveSession`) redacts it in `toString()`; the connector-token field is a password field; a local session cookie is reused only for the origin and token it was minted for; a local 401 reports `removed`, not `unpaired`.
 
@@ -2289,6 +2289,12 @@ Code/config:
      host lands) → `bundletool build-apks`/`zip` as needed → upload to the
      internal track via the Play CLI / JSON API with the service-account or
      upload-key secrets. No manual Android Studio steps.
+   - `versionCode`/`versionName` come from the tag, not the static `1`/`"1.0"`
+     in `app/build.gradle.kts`: Play refuses a re-upload at a versionCode it
+     already has, and the update-in-place check in 5 needs a higher one.
+     Derive both from `android/v*` (e.g. the numeric part), or bump
+     explicitly per release — decide at implementation and pin it in the
+     workflow so a human never has to remember.
    - Hosted runners are ephemeral: every run pays the cold download (Gradle
      distribution, SDK 37, AndroidX — GBs). Dependency caching
      (`gradle/actions/setup-gradle`) was deliberately left out of android.yml
@@ -2296,20 +2302,89 @@ Code/config:
      call); a deliberate add-back for the release workflow is acceptable if
      build times get painful, not a regression.
 3. **Docs** (`docs/android-distribution.md`): how a rider joins the internal
-   track (invite by email, Play Install on the device, the app is sideloaded —
-   pairing still goes through the in-app pairing screens), how to promote a
-   build, how to rotate the upload key.
+   track (added by email as a tester, opt-in link, then install from Play —
+   not a sideload; pairing still goes through the in-app pairing screens), how
+   to promote a build, how to rotate the upload key.
 4. **The "pair against a real deployment" half is gated on #102 alone:**
    the deployment is an unexecuted runbook; the desktop app can already
    mint pairing codes against a deployment (#156 closed via #274,
-   2026-09-13). Nothing here blocks on that — the internal track can run
-   and riders can pair against the dev harness / local backend — but say
-   so in the PR description if the Done wording implies a deployed cloud.
+   2026-09-13). Nothing here blocks on that — but see 5: a Play-installed
+   build **cannot** use the dev harness. Say so in the PR description if the
+   Done wording implies a deployed cloud.
+
+5. **Device test, once a build is on the internal track.** This is the first
+   time the **release** shape runs on a device, so it is a separate
+   verification target, not a repeat of the debug AVD passes: R8 has
+   minified the app (the `keepRules` set is exercised at runtime for the first
+   time), Play has re-signed the bundle and delivered it as Play-generated
+   split APKs, and the shipped `network_security_config.xml` is the strict
+   one — cleartext is refused for every connection.
+
+   **Backend for this run.** The dev harness is HTTP on a loopback bind, and
+   the `debug` source set's NSC is the only thing that permits it; a Play build
+   has no such exception, so **the harness is not a usable pairing target
+   here**. Until #102 executes the only live option is the **local desktop
+   server over HTTPS** through the rider's TLS terminator —
+   `WATTRACKER_PUBLIC_HOSTS=<the phone-facing hostname>`,
+   `WATTRACKER_COOKIE_SECURE=1`, server still bound to loopback — with the
+   hostname typed into Settings, which is also the run that proves no hostname
+   is baked in. Once #102 lands, cloud pairing (a code minted by the desktop
+   app against the real deployment) becomes the second half.
+
+   **Sequence, on a physical device, with the app installed from Play:**
+   1. Install via the internal-testing opt-in link. Confirm the installed
+      version matches the uploaded one:
+      `adb shell dumpsys package com.wattracker.android` — the
+      `versionName`/`versionCode` line.
+   2. Pair to the local backend over HTTPS (Settings → local). Screenshot the
+      pairing flow.
+   3. **The credential-vault check owed from #457/#459.** `adb shell am
+      force-stop com.wattracker.android`, relaunch from Play, and confirm
+      Settings still shows the device paired and the Dashboard reads. This is
+      the only evidence that the Keystore-wrapped vault survives a real
+      process restart with the IV convention the provider actually uses: the
+      JVM suite pins the `[IV][body][tag]` layout and the round trip under a
+      software key, but it cannot reach the AndroidKeyStore. The failure mode
+      to look for is a silent unpair — safe (the device reports unpaired and
+      `StoreHealth` says why) but it must be seen.
+   4. The four data screens (Dashboard, Activities, Calendar, Volume) and
+      Settings against the local backend, plus the idiom check — phone
+      landscape and tablet portrait, the standing requirement from #171/#193.
+      Play delivers per device, so the tablet half needs a tablet tester
+      enrolled on the same track; if none is, say so and leave that half
+      owed rather than implying it passed.
+   5. Revoke the device in the desktop web UI → the next request shows
+      unpaired; then re-pair and exercise the in-app "remove this device".
+   6. Resilience: airplane mode for a while, doze, and a mid-use reader-context
+      expiry — each should land in the expected state, not a crash.
+   7. **Update in place.** Upload a higher `versionCode`, install the update
+      from the same track, relaunch, confirm the pairing survives. Play
+      preserves app data across an update; uninstall/reinstall does not, and
+      `allowBackup="false"` plus the `<device-transfer>` exclude mean there is
+      deliberately no restore — a reinstall must re-pair.
+
+   **What this run cannot show.** The vault file itself cannot be inspected
+   on a Play build: release builds are not `debuggable`, so `adb shell run-as`
+   fails. "Nothing in the clear on disk" stays a JVM-suite result, not a
+   device result. The two storage-warning strings
+   (`settings_cloud_store_unavailable_warning`,
+   `settings_cloud_vault_unreadable_warning`) are reachable only by breaking
+   storage on purpose, and remain unseen unless a run deliberately does that.
+
+   **Evidence to attach to #199:** screenshots per idiom; the paired-state
+   screenshots after the force-stop/relaunch; the revoke/re-pair log; the
+   `dumpsys package` version line; and one line stating which backend was used
+   (local HTTPS terminator, or the cloud once #102 lands). #199's Done also
+   names **both riders**, so record who installed and paired — the second
+   rider is the one that proves the vault is per-installation and that no
+   credential is shared between devices.
 
 **Done (per #199):** both riders install from the internal track and pair
-(with a code — harness/local until the deployment exists); release job runs
-from a tag with no manual steps; no signing material in the repository (diff
-inspection).
+with a code — **local backend over HTTPS until #102 executes; the HTTP dev
+harness is not reachable from a Play build** — and the device test in 5
+passes, above all the force-stop/relaunch-still-paired check; release job
+runs from a tag with no manual steps; no signing material in the repository
+(diff inspection).
 
 ---
 
@@ -2340,7 +2415,10 @@ inspection).
    actually exercises the transport decision: a **physical device against
    `https://<the phone-facing hostname>`** through the TLS terminator on a
    release-configured NSC, proving the whole local path works with cleartext
-   off and with a hostname the app has never seen before.
+   off and with a hostname the app has never seen before. **This run, not the
+   emulator one, is the shape a Play build has** — and it is the only pairing
+   target available to an internal-track install until #102 executes (Step 7,
+   item 5).
 4. **Orientation/idiom:** screenshots on `wt-phone` landscape, `wt-tablet`
    portrait + landscape (and rotated live) — the #193/#196–#198 Done
    criteria; the tablet-portrait correctness is the standing requirement.
@@ -2348,6 +2426,11 @@ inspection).
    1 h airplane mode; doze (`adb shell svc power suspend`); revoked device;
    429 (harness with a tight quota — the durable quota is application-level,
    so the harness is the 429 source).
+   **Release-shape device run (Step 7, item 5):** install from the internal
+   track, then force-stop → relaunch and confirm the device is still paired.
+   That is the only evidence the Keystore-wrapped credential vault survives a
+   real restart under the provider's IV convention; it cannot be shown on a
+   debug build, and the JVM suite cannot reach the AndroidKeyStore.
 6. **Python suite:** `.venv/bin/python -m pytest` green before any merge
    (AGENTS.md). The full-snapshot harness tests are on `main` since #240;
    the
