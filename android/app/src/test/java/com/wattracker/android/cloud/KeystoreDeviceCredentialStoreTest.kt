@@ -1,5 +1,6 @@
 package com.wattracker.android.cloud
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -9,22 +10,31 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import javax.crypto.Cipher
 import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
  * The credential store's rules, run against the real store with a software AES
  * key and a temp file.
  *
- * What this suite can pin is the store: that the file never holds a secret in
- * the clear, that a vault this key did not write is refused rather
- * than half-believed, that a refusal is reported through `health` while the
- * file stays put, that "there is no key" and "the vault is bad" stay separate
- * answers, that the key is taken before the store exists and only once, that
- * writes are all-or-nothing, and that a refused write throws. What it cannot pin
- * is the AndroidKeyStore itself -- the non-exportable key, the provider-chosen
- * IV -- which is device-only and stays a device check (the same split as
- * [DeviceKeyStore], whose JVM coverage is nil for the same reason).
+ * What this suite can pin is the store and the envelope's layout: that the file
+ * never holds a secret in the clear, that the envelope really is `[IV][body]`
+ * and decrypts through the same code path production uses, that a vault this
+ * key did not write is refused rather than half-believed, that a refusal is
+ * reported through `health` while the file stays put, that "there is no key"
+ * and "the vault is bad" stay separate answers, that a read failure is not an
+ * empty vault and may not be acted on, that a member this build cannot parse
+ * survives a rewrite, that the key is taken before the store exists and only
+ * once, that a launch reads the file once, that writes are all-or-nothing, and
+ * that a refused write throws.
+ *
+ * What it cannot pin is the AndroidKeyStore itself -- the non-exportable key,
+ * the provider-chosen IV on a real device -- which is device-only and stays a
+ * device check (the same split as [DeviceKeyStore], whose JVM coverage is nil
+ * for the same reason). The layout below is the same for both: the provider
+ * draws the IV, and the cipher writes it in front.
  */
 class KeystoreDeviceCredentialStoreTest {
 
@@ -54,13 +64,84 @@ class KeystoreDeviceCredentialStoreTest {
         file: File,
         encryptionKey: SecretKey = key(0),
         associatedData: String = "com.wattracker.android.device-credentials-v1",
+        cipher: CredentialCipher? = null,
     ): KeystoreDeviceCredentialStore = KeystoreDeviceCredentialStore(
         file,
-        AesGcmCipher(
+        cipher ?: AesGcmCipher(
             keyProvider = { encryptionKey },
             associatedData = associatedData.toByteArray(Charsets.UTF_8),
         ),
     )
+
+    // MARK: - The envelope's layout (the #459 B1 fix)
+
+    /**
+     * `doFinal` returns ciphertext and tag, not an IV: the provider draws the
+     * IV and `getIV()` is the only place it appears. The earlier cipher returned
+     * `doFinal` alone and decrypted without a `GCMParameterSpec`, so every real
+     * vault was written with no IV and every later read threw -- a silent unpair
+     * per relaunch. This pins the layout the store actually relies on.
+     */
+    @Test
+    fun theEnvelopeIsIvThenCiphertextThenTag() {
+        val cipher = AesGcmCipher(
+            keyProvider = { key(0) },
+            associatedData = "aad".toByteArray(Charsets.UTF_8),
+        )
+        val plaintext = "the vault body".toByteArray(Charsets.UTF_8)
+        val envelope = cipher.encrypt(plaintext)
+        assertEquals(
+            "the envelope is a 12-byte IV, the body, and a 16-byte tag",
+            plaintext.size + 12 + 16,
+            envelope.size,
+        )
+
+        // The leading 12 bytes really are the IV: a raw cipher that is told
+        // about them explicitly opens the rest. That is the same parameter
+        // `decrypt` supplies, so this is not a second interpretation.
+        val raw = Cipher.getInstance("AES/GCM/NoPadding")
+        raw.init(Cipher.DECRYPT_MODE, key(0), GCMParameterSpec(128, envelope.copyOfRange(0, 12)))
+        raw.updateAAD("aad".toByteArray(Charsets.UTF_8))
+        assertArrayEquals(plaintext, raw.doFinal(envelope, 12, envelope.size - 12))
+
+        assertArrayEquals(plaintext, cipher.decrypt(envelope))
+    }
+
+    @Test
+    fun theIvIsDrawnFreshForEveryEncrypt() {
+        val cipher = AesGcmCipher(
+            keyProvider = { key(0) },
+            associatedData = "aad".toByteArray(Charsets.UTF_8),
+        )
+        val plaintext = "same body every time".toByteArray(Charsets.UTF_8)
+        val first = cipher.encrypt(plaintext)
+        val second = cipher.encrypt(plaintext)
+        assertFalse(
+            "a repeated (key, IV) is the one fatal GCM failure",
+            first.copyOfRange(0, 12).contentEquals(second.copyOfRange(0, 12)),
+        )
+        assertFalse("and the ciphertext differs too", first.contentEquals(second))
+    }
+
+    @Test
+    fun anEnvelopeWithNoIvIsRefused() {
+        val cipher = AesGcmCipher(
+            keyProvider = { key(0) },
+            associatedData = "aad".toByteArray(Charsets.UTF_8),
+        )
+        val envelope = cipher.encrypt("payload".toByteArray(Charsets.UTF_8))
+        val bodyOnly = envelope.copyOfRange(12, envelope.size)
+
+        val thrown = try {
+            cipher.decrypt(bodyOnly)
+            null
+        } catch (e: Exception) {
+            e
+        }
+        assertNotNull("an envelope without its IV cannot be opened", thrown)
+    }
+
+    // MARK: - Round trip and secrecy
 
     @Test
     fun theBindingAndTheDesktopTokenRoundTripThroughOneVault() {
@@ -117,14 +198,14 @@ class KeystoreDeviceCredentialStoreTest {
     }
 
     /**
-     * The envelope is bound to the vault it was written for, so a credential
-     * file renamed over another one -- or a second vault smuggled into the same
-     * installation -- does not open even on the device whose key it would
-     * otherwise serve. That is the Auto Backup / restore / `adb push` case, and
-     * the associated data is what closes it rather than hoping the key differs.
+     * The associated data is the vault's own purpose, so an envelope written
+     * for a different purpose does not open even under the right key. That is
+     * purpose separation, not installation binding: the binding is the
+     * per-installation Keystore key, which is why a carried or restored file
+     * fails on the device that lacks it.
      */
     @Test
-    fun aVaultMeantForAnotherFileIsRefusedEvenUnderTheSameKey() {
+    fun aVaultMeantForAnotherPurposeIsRefusedEvenUnderTheSameKey() {
         val file = vaultFile()
         storeOn(file, associatedData = "com.wattracker.android.device-credentials-v1").save(device)
 
@@ -132,6 +213,8 @@ class KeystoreDeviceCredentialStoreTest {
         assertNull(renamedOver.load())
         assertEquals(StoreHealth.UnreadableVault, renamedOver.health)
     }
+
+    // MARK: - The two credentials are independent
 
     @Test
     fun clearingOneCredentialLeavesTheOtherAlone() {
@@ -191,8 +274,133 @@ class KeystoreDeviceCredentialStoreTest {
         orphan.save(replacement)
         assertEquals("the report clears once the vault opens again", StoreHealth.Durable, orphan.health)
         assertEquals(replacement, orphan.load())
-        assertNull("and the dead vault's bytes are gone, not merged in", original.load())
+        // A *fresh* store under the old key cannot open the file: the dead vault
+        // was replaced, not merged. (The `original` instance is not used here --
+        // it holds its own decoded cache, and production has one store per file.)
+        val oldKeyReader = storeOn(file, encryptionKey = key(3))
+        assertNull("the dead vault's bytes are gone, not merged in", oldKeyReader.load())
     }
+
+    // MARK: - The #459 M1 fix: a failed read is not an empty vault
+
+    /**
+     * The old shape flattened every read failure to an empty vault, and the next
+     * `clearLocal()` then deleted the file -- so one transient I/O error during
+     * a desktop 401 could take a still-valid cloud pairing with it. A read the
+     * filesystem refuses now refuses the mutation instead.
+     */
+    @Test
+    fun aReadTheFilesystemRefusesIsNotAnEmptyVault() {
+        val blocked = vaultFile("vault")
+        assertTrue(blocked.mkdirs())
+        val store = storeOn(blocked)
+
+        assertNull("this attempt answers unpaired", store.load())
+        assertEquals(
+            "a failed read is not evidence the vault is broken",
+            StoreHealth.Durable,
+            store.health,
+        )
+
+        val clearFailure = try {
+            store.clearLocal()
+            null
+        } catch (e: CredentialStoreException) {
+            e
+        }
+        assertNotNull("a clear on top of a failed read must not act", clearFailure)
+
+        val saveFailure = try {
+            store.saveLocal(local)
+            null
+        } catch (e: CredentialStoreException) {
+            e
+        }
+        assertNotNull("and neither must a save", saveFailure)
+
+        assertTrue("nothing on disk was touched", blocked.isDirectory)
+    }
+
+    @Test
+    fun aReadTheKeyRefusesIsNotAnEmptyVault() {
+        val file = vaultFile()
+        storeOn(file).save(device)
+
+        val store = KeystoreDeviceCredentialStore(file, KeyDeadCipher())
+        assertNull(store.load())
+
+        val clearFailure = try {
+            store.clear()
+            null
+        } catch (e: CredentialStoreException) {
+            e
+        }
+        assertNotNull("a clear on top of a key failure must not act", clearFailure)
+        assertTrue("and the vault is left where it is", file.exists())
+        assertEquals(StoreHealth.Unavailable, store.health)
+    }
+
+    /**
+     * An *authenticated* refusal is different: GCM has certified those bytes are
+     * not a credential this installation wrote, so a save may replace them (a
+     * fresh pairing is the only way back). A clear may not, because deleting on
+     * that signal turns "unreadable" into "gone" and recovers nothing.
+     */
+    @Test
+    fun clearingAnUnopenableVaultLeavesItOnDisk() {
+        val file = vaultFile()
+        storeOn(file, encryptionKey = key(1)).apply {
+            save(device)
+            saveLocal(local)
+        }
+
+        val orphan = storeOn(file, encryptionKey = key(2))
+        assertNull(orphan.load())
+        assertEquals(StoreHealth.UnreadableVault, orphan.health)
+
+        orphan.clearLocal()
+        assertTrue("a clear does not turn \"unreadable\" into \"gone\"", file.exists())
+
+        orphan.save(device.copy(credentialId = "cred-9"))
+        assertEquals("a save still replaces it", "cred-9", orphan.load()?.credentialId)
+    }
+
+    /**
+     * A member this build cannot parse -- a field a newer server added, or a
+     * shape it does not know -- is kept as the raw JSON it arrived as. The other
+     * member is still served, and a write re-emits the unreadable one unchanged
+     * instead of silently dropping it.
+     */
+    @Test
+    fun aMemberThisBuildCannotParseIsKeptAsRawJson() {
+        val file = vaultFile()
+        // `paired_device` is missing `subscription_key`, so this build cannot
+        // parse it; `local_credentials` is complete.
+        val json = """
+            {"format":1,
+             "paired_device":{"credential_id":"cred-1","signing_namespace":"ns-1"},
+             "local_credentials":{"serverUrl":"https://desktop.example:8443",
+                                  "token":"connector-SECRET-4c71",
+                                  "username":"rider",
+                                  "pairedAtMillis":1700000000000}}
+        """.trimIndent()
+        file.writeBytes(json.toByteArray(Charsets.UTF_8))
+
+        val store = KeystoreDeviceCredentialStore(file, PassthroughCipher())
+        assertNull("the member it cannot read is not served", store.load())
+        assertEquals("but the other member still is", local, store.loadLocal())
+        assertEquals("a vault that opens is a healthy store", StoreHealth.Durable, store.health)
+
+        store.saveLocal(local.copy(token = "connector-SECRET-new"))
+        val rewritten = file.readText(Charsets.UTF_8)
+        assertTrue(
+            "the unreadable member survives the rewrite",
+            rewritten.contains("\"signing_namespace\":\"ns-1\""),
+        )
+        assertTrue("and the written one is the new value", rewritten.contains("connector-SECRET-new"))
+    }
+
+    // MARK: - Writes
 
     /**
      * The failure the session's "cache first, credential second" ordering depends
@@ -219,11 +427,11 @@ class KeystoreDeviceCredentialStoreTest {
     }
 
     /**
-     * The other half of "reported, not ignored": a vault whose *replacement* the
-     * filesystem will not take. The temp file writes fine and the rename onto a
-     * non-empty directory cannot -- on either platform this suite runs on -- and
-     * the caller must hear about it rather than go on holding a pairing that
-     * exists only in this process.
+     * The other half of "reported, not ignored": the vault's *replacement* cannot
+     * land. The temp file writes fine and the rename onto a non-empty directory
+     * cannot -- on either platform this suite runs on -- and the caller must hear
+     * about it rather than go on holding a pairing that exists only in this
+     * process.
      */
     @Test
     fun aVaultThatCannotBeReplacedIsReportedAndLeavesNoEnvelopeBehind() {
@@ -244,6 +452,8 @@ class KeystoreDeviceCredentialStoreTest {
             File(folder.root, "vault.tmp").exists(),
         )
     }
+
+    // MARK: - Format and envelope opacity
 
     /**
      * A format this build does not describe is unreadable, not guessed at. The
@@ -270,9 +480,8 @@ class KeystoreDeviceCredentialStoreTest {
 
     /**
      * The store treats the envelope as opaque bytes: it never looks inside for an
-     * IV, a length or a magic prefix, because who writes the IV is the cipher's
-     * choice (a software key here, the Keystore in production) and the store must
-     * work with either. This cipher keeps nothing of the shape it is given.
+     * IV, a length or a magic prefix. The IV's position is the cipher's contract,
+     * not the store's.
      */
     @Test
     fun theStoreNeverLooksInsideTheEnvelope() {
@@ -283,6 +492,8 @@ class KeystoreDeviceCredentialStoreTest {
         assertEquals(device, store.load())
         assertEquals(local, store.loadLocal())
     }
+
+    // MARK: - The key and the read cache
 
     @Test
     fun theInMemoryFallbackSaysSoAboutItself() {
@@ -320,6 +531,53 @@ class KeystoreDeviceCredentialStoreTest {
         }
         assertNotNull("the store must not be built around a key that does not exist", thrown)
     }
+
+    /**
+     * `loadLocal()` is the desktop connector's per-request path, so the decoded
+     * vault is cached under the store's lock and replaced by every successful
+     * write (#459 review, L1). One launch reads the file once.
+     */
+    @Test
+    fun aLaunchReadsTheVaultOnceNoMatterHowManyReads() {
+        val file = vaultFile()
+        // A real vault on disk first, written by a store the counter does not
+        // see: the launch under test starts with something to read.
+        storeOn(file).apply {
+            save(device)
+            saveLocal(local)
+        }
+
+        val counting = CountingCipher(AesGcmCipher(
+            keyProvider = { key(0) },
+            associatedData = "com.wattracker.android.device-credentials-v1".toByteArray(Charsets.UTF_8),
+        ))
+        val store = storeOn(file, cipher = counting)
+
+        repeat(5) {
+            assertEquals(device, store.load())
+            assertEquals(local, store.loadLocal())
+        }
+        assertEquals("ten reads opened the file once", 1, counting.decrypts)
+
+        store.save(device.copy(credentialId = "cred-2"))
+        assertEquals("and a write on top of a cached vault does not re-read it", 1, counting.decrypts)
+        assertEquals("while still wrapping exactly once", 1, counting.encrypts)
+        assertEquals("cred-2", store.load()?.credentialId)
+    }
+
+    @Test
+    fun theCacheSeesEveryWrite() {
+        val store = storeOn(vaultFile())
+        assertEquals(null, store.load())
+        store.save(device)
+        assertEquals(device, store.load())
+        store.save(device.copy(credentialId = "cred-2"))
+        assertEquals("cred-2", store.load()?.credentialId)
+        store.clear()
+        assertNull(store.load())
+    }
+
+    // MARK: - Failure typing
 
     /**
      * "No key" and "bad vault" are different advice: one means pair again and
@@ -409,6 +667,22 @@ class KeystoreDeviceCredentialStoreTest {
 
         private companion object {
             val PREFIX = byteArrayOf(7, 0, 0, 42, -1)
+        }
+    }
+
+    /** Counts how often the store actually went to the cipher. */
+    private class CountingCipher(private val inner: CredentialCipher) : CredentialCipher {
+        var encrypts = 0
+        var decrypts = 0
+
+        override fun encrypt(plaintext: ByteArray): ByteArray {
+            encrypts++
+            return inner.encrypt(plaintext)
+        }
+
+        override fun decrypt(envelope: ByteArray): ByteArray {
+            decrypts++
+            return inner.decrypt(envelope)
         }
     }
 }

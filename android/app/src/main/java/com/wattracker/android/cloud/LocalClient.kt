@@ -543,7 +543,19 @@ class LocalClient(
             }
         }
         markRemoved()
-        onRevoked()
+        // The wipe is a store mutation, and a store can now refuse one (#459
+        // M1): a read failure or a missing key leaves the vault alone rather
+        // than pretending it was empty. A refused wipe must not replace the 401
+        // that caused it -- the device is already marked removed, and what
+        // survived is reported by the store's own health, not by a different
+        // error here. The credential that stays is re-read on the next request
+        // and gets its own 401 if it is still revoked.
+        try {
+            onRevoked()
+        } catch (_: Exception) {
+            // Reported through DeviceCredentialStore.health, not swallowed
+            // silently: Settings shows the reason.
+        }
     }
 
     private suspend fun sendJsonWithCookie(

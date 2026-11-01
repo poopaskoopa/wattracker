@@ -108,20 +108,42 @@ class InMemoryDeviceCredentialStore : DeviceCredentialStore {
  * is not fsynced, which can lose the rename and leave the old vault, never half
  * a new one.
  *
- * A vault that will not open -- another key, a tampered byte, a file carried in
- * from another installation -- is left exactly where it is and reported through
- * [health] as [StoreHealth.UnreadableVault]: the rider is unpaired, and the next
- * pairing overwrites the file. Deleting it would destroy a credential that may
- * yet open (one Keystore hiccup is not a credential that is gone), and answering
- * `null` in silence would look exactly like "never paired".
+ * **A read is three-way, not two.** The #459 review caught the old shape: any
+ * failure to read was flattened to an empty vault, and the next `clear()` or
+ * `save()` then rewrote the file -- so one transient I/O error during a desktop
+ * 401 could delete a still-valid cloud pairing. The distinction that matters is
+ * *why* the read failed:
  *
- * A vault that cannot be opened *because there is no key* says
- * [StoreHealth.Unavailable] instead, which is the difference between "pair again
- * and it is fixed" and "this device cannot save a pairing at all". The key is
- * taken in the constructor for that reason: [CredentialKeyStore.loadOrCreateKey]
- * has to be able to throw while the app is still choosing a store, where the
- * answer is to fall back and say so, and not on the first write after a pairing
- * code has already been spent.
+ * - **The file could not be read** (`IOException`, permission, a half-written
+ *   temp file): the vault may be perfectly good. Nothing here may act on it --
+ *   `load()` answers `null` for this attempt, and every mutation throws
+ *   [CredentialStoreException] and leaves the file exactly where it is.
+ * - **The key could not be used**: same rule, plus [StoreHealth.Unavailable],
+ *   which is the difference between "pair again and it is fixed" and "this
+ *   device cannot save a pairing at all".
+ * - **The envelope will not open** (another key, a tampered byte, a foreign
+ *   purpose, an unknown format): GCM has certified these bytes are not a
+ *   credential this installation wrote. A *save* may replace it outright, since
+ *   a fresh pairing is the only way back; a *clear* must not, because deleting
+ *   on that signal turns "unreadable" into "gone" and loses nothing recoverable
+ *   but gains nothing either. The file stays and [health] reports
+ *   [StoreHealth.UnreadableVault] until a read succeeds.
+ *
+ * A member this build cannot parse -- a field added by a newer server -- is
+ * **kept as raw JSON** rather than dropped: the other member is still served,
+ * and the next write re-emits the unreadable member unchanged instead of
+ * silently deleting it.
+ *
+ * The decoded vault is cached under [lock] and replaced on every successful
+ * write (#459 review, L1): `loadLocal()` is the desktop connector's
+ * per-request path, so a disk read plus a Keystore IPC round trip per request
+ * was waste. One writer owns one file, so the cache cannot go stale behind the
+ * store's back.
+ *
+ * The key is taken in the constructor for the fallback reason above:
+ * [CredentialKeyStore.loadOrCreateKey] has to be able to throw while the app is
+ * still choosing a store, where the answer is to fall back and say so, and not
+ * on the first write after a pairing code has already been spent.
  */
 class KeystoreDeviceCredentialStore internal constructor(
     private val file: File,
@@ -140,12 +162,14 @@ class KeystoreDeviceCredentialStore internal constructor(
             // alias is fixed for the life of the process.
             keyProvider = eagerKeyProvider { CredentialKeyStore.loadOrCreateKey() },
             associatedData = ASSOCIATED_DATA.toByteArray(Charsets.UTF_8),
-            ivSource = AesGcmCipher.IvSource.PROVIDER_GENERATED,
         ),
     )
 
     /** One vault, one file, one writer: the two credentials never race each other. */
     private val lock = Any()
+
+    /** The last vault read or written; `null` means "not looked at yet this launch". */
+    private var cachedVault: Vault? = null
 
     @Volatile
     private var vaultUnreadable = false
@@ -162,11 +186,15 @@ class KeystoreDeviceCredentialStore internal constructor(
 
     /**
      * [StoreHealth.Unavailable] if the key could not be used at all, else
-     * [StoreHealth.UnreadableVault] while the last look at [file] found
-     * something this installation's key could not open. The vault flag is set by
-     * a read and cleared by the next read that succeeds -- including the one a
-     * fresh pairing writes; the key flag is not cleared, because this launch has
-     * no second key to try.
+     * [StoreHealth.UnreadableVault] while the last look at [file] found an
+     * envelope this installation's key could not open. The vault flag is set by
+     * a read and cleared by the next read or write that succeeds; the key flag
+     * is not cleared, because this launch has no second key to try.
+     *
+     * A *transient* read failure deliberately does not change this verdict: it
+     * is a failed operation, not evidence about the vault, and the copy attached
+     * to [StoreHealth.UnreadableVault] ("pairing again will replace it") would be
+     * wrong advice for a file that may open on the next attempt.
      */
     override val health: StoreHealth
         get() = when {
@@ -175,33 +203,82 @@ class KeystoreDeviceCredentialStore internal constructor(
             else -> StoreHealth.Durable
         }
 
-    override fun load(): PairedDevice? = readVault().pairedDevice
+    override fun load(): PairedDevice? = readVault().pairedDevice.parsed
 
-    override fun loadLocal(): LocalCredentials? = readVault().localCredentials
+    override fun loadLocal(): LocalCredentials? = readVault().localCredentials.parsed
 
     // Durable by design: `commit()` was the old store's word for it, and the
     // word for it here is fsync plus a rename whose failure is thrown.
-    override fun save(device: PairedDevice) = mutateVault { it.copy(pairedDevice = device) }
+    override fun save(device: PairedDevice) =
+        mutateVault(mayReplaceUnopenable = true) { it.copy(pairedDevice = Slot.of(device)) }
 
-    override fun clear() = mutateVault { it.copy(pairedDevice = null) }
+    override fun clear() =
+        mutateVault(mayReplaceUnopenable = false) { it.copy(pairedDevice = Slot()) }
 
-    override fun saveLocal(credentials: LocalCredentials) = mutateVault { it.copy(localCredentials = credentials) }
+    override fun saveLocal(credentials: LocalCredentials) =
+        mutateVault(mayReplaceUnopenable = true) { it.copy(localCredentials = Slot.of(credentials)) }
 
-    override fun clearLocal() = mutateVault { it.copy(localCredentials = null) }
+    override fun clearLocal() =
+        mutateVault(mayReplaceUnopenable = false) { it.copy(localCredentials = Slot()) }
+
+    /** One vault member: a model this build reads, or the raw JSON it could not. */
+    private data class Slot<T>(val parsed: T? = null, val raw: JsonValue? = null) {
+        fun json(serialize: (T) -> JsonValue): JsonValue? = parsed?.let(serialize) ?: raw
+
+        companion object {
+            fun <T> of(model: T?): Slot<T> = Slot(model, null)
+        }
+    }
 
     /** The two credentials of one installation, in one envelope. */
     private data class Vault(
-        val pairedDevice: PairedDevice? = null,
-        val localCredentials: LocalCredentials? = null,
-    )
+        val pairedDevice: Slot<PairedDevice> = Slot(),
+        val localCredentials: Slot<LocalCredentials> = Slot(),
+    ) {
+        val isEmpty: Boolean
+            get() = (pairedDevice.parsed == null && pairedDevice.raw == null) &&
+                (localCredentials.parsed == null && localCredentials.raw == null)
+    }
 
-    private fun mutateVault(change: (Vault) -> Vault) {
+    /** What one look at [file] established. */
+    private sealed interface ReadResult {
+        /** The vault is there (or the file is not, which is an empty vault). */
+        data class Opened(val vault: Vault) : ReadResult
+
+        /** The envelope is on disk but this installation cannot open it. */
+        object Unopenable : ReadResult
+
+        /** The file exists and could not be read; nothing may be concluded. */
+        object ReadFailed : ReadResult
+
+        /** There is no key to ask. */
+        object NoKey : ReadResult
+    }
+
+    /**
+     * [mayReplaceUnopenable] is true only for a save: a fresh pairing is the only
+     * way back from a vault this installation cannot open, so it may replace it.
+     * A clear must not -- deleting on that signal turns "unreadable" into
+     * "gone", which recovers nothing and loses the file a later launch might
+     * still open.
+     */
+    private fun mutateVault(mayReplaceUnopenable: Boolean, change: (Vault) -> Vault) {
         synchronized(lock) {
-            // An unreadable vault changes into an empty one, so a pairing over a
-            // dead file replaces it outright. Nothing recoverable is lost: GCM
-            // has already certified that the bytes are not a credential.
-            val updated = change(readVaultLocked())
-            if (updated.pairedDevice == null && updated.localCredentials == null) {
+            val base = when (val result = readVaultLocked()) {
+                is ReadResult.Opened -> result.vault
+                // A read that failed tells us nothing about the credential, so
+                // acting on it would be inventing an empty vault and destroying
+                // whatever is actually in the file. The session handles a refused
+                // write; this is the refused read it must not mistake for empty.
+                ReadResult.ReadFailed ->
+                    throw CredentialStoreException("the credential file could not be read; nothing was changed")
+                ReadResult.NoKey ->
+                    throw CredentialStoreException("the credential key could not be used; nothing was changed")
+                ReadResult.Unopenable -> if (!mayReplaceUnopenable) return else Vault()
+            }
+
+            val updated = change(base)
+            if (updated.isEmpty) {
                 deleteVaultLocked()
             } else {
                 writeVaultLocked(updated)
@@ -209,36 +286,50 @@ class KeystoreDeviceCredentialStore internal constructor(
         }
     }
 
-    private fun readVault(): Vault = synchronized(lock) { readVaultLocked() }
+    private fun readVault(): Vault = synchronized(lock) {
+        when (val result = readVaultLocked()) {
+            is ReadResult.Opened -> result.vault
+            // Unpaired is the answer the app needs in every failure case; the
+            // reason is carried by `health`, and by the refused mutation above.
+            ReadResult.Unopenable, ReadResult.ReadFailed, ReadResult.NoKey -> Vault()
+        }
+    }
 
-    /** The caller holds [lock]. No file and an unopenable file both read as "no credential". */
-    private fun readVaultLocked(): Vault {
+    /** The caller holds [lock]. Cached after the first look, so one launch reads the file once. */
+    private fun readVaultLocked(): ReadResult {
+        cachedVault?.let { return ReadResult.Opened(it) }
+
         val envelope = try {
             if (!file.exists()) {
                 vaultUnreadable = false
-                return Vault()
+                return ReadResult.Opened(Vault().also { cachedVault = it })
             }
             file.readBytes()
         } catch (_: Exception) {
-            // The file was there and would not read. That is more often a
-            // transient I/O failure than a corrupted vault, which is why the
-            // file is left alone and this clears on the next successful read --
-            // the next pull-to-refresh answers it correctly.
-            vaultUnreadable = true
-            return Vault()
+            // Transient until proven otherwise: the file is left alone, the
+            // verdict on the vault does not change, and the next read answers
+            // again. A mutation on top of this attempt is refused, not applied.
+            return ReadResult.ReadFailed
         }
-        return try {
-            decode(envelope).also { vaultUnreadable = false }
+
+        val vault = try {
+            decode(envelope)
         } catch (_: CredentialKeyStore.CredentialKeyException) {
             // No key to ask, which is not the same message as a vault that
             // answers badly: "pair again replaces it" is a lie on a device that
             // cannot write a pairing either.
             keyUnavailable = true
-            Vault()
+            return ReadResult.NoKey
         } catch (_: Exception) {
+            // GCM said these bytes are not a credential this key wrote, or the
+            // format is not one this build describes. Either way it is a
+            // verdict about the file, not a transient failure.
             vaultUnreadable = true
-            Vault()
+            return ReadResult.Unopenable
         }
+        vaultUnreadable = false
+        cachedVault = vault
+        return ReadResult.Opened(vault)
     }
 
     private fun decode(envelope: ByteArray): Vault {
@@ -249,18 +340,26 @@ class KeystoreDeviceCredentialStore internal constructor(
         }
         // The field-level JSON stays PairedDevice's and LocalCredentials' own --
         // this file only nests it, so each encoding has exactly one author. A
-        // member this model cannot read is that member missing (the posture the
-        // store has always taken), and the other one is still served.
-        val device = json.opt("paired_device")?.let { runCatching { PairedDevice.fromJson(it.toJson()) }.getOrNull() }
-        val local = json.opt("local_credentials")?.let { runCatching { LocalCredentials.fromJson(it.toJson()) }.getOrNull() }
-        return Vault(device, local)
+        // member this model cannot read is kept as the raw JSON it arrived as
+        // (a field a newer server added), so the other member is still served and
+        // the next write re-emits it unchanged instead of dropping it.
+        return Vault(
+            pairedDevice = slot(json.opt("paired_device")) { PairedDevice.fromJson(it) },
+            localCredentials = slot(json.opt("local_credentials")) { LocalCredentials.fromJson(it) },
+        )
+    }
+
+    private fun <T> slot(raw: JsonValue?, parse: (String) -> T?): Slot<T> {
+        if (raw == null) return Slot()
+        val parsed = runCatching { parse(raw.toJson()) }.getOrNull()
+        return if (parsed == null) Slot(parsed, raw) else Slot.of(parsed)
     }
 
     private fun encode(vault: Vault): ByteArray {
         val fields = LinkedHashMap<String, JsonValue>()
         fields["format"] = JsonValue.Number(FORMAT_VERSION.toDouble())
-        vault.pairedDevice?.let { fields["paired_device"] = JsonValue.parse(it.toJson()) }
-        vault.localCredentials?.let { fields["local_credentials"] = JsonValue.parse(it.toJson()) }
+        vault.pairedDevice.json { JsonValue.parse(it.toJson()) }?.let { fields["paired_device"] = it }
+        vault.localCredentials.json { JsonValue.parse(it.toJson()) }?.let { fields["local_credentials"] = it }
         return JsonValue.Object(fields).toJson().toByteArray(Charsets.UTF_8)
     }
 
@@ -285,6 +384,7 @@ class KeystoreDeviceCredentialStore internal constructor(
                 throw CredentialStoreException("could not replace the credential file")
             }
             vaultUnreadable = false
+            cachedVault = vault
         } catch (e: CredentialStoreException) {
             throw e
         } catch (e: Exception) {
@@ -299,12 +399,14 @@ class KeystoreDeviceCredentialStore internal constructor(
     private fun deleteVaultLocked() {
         if (!file.exists()) {
             vaultUnreadable = false
+            cachedVault = Vault()
             return
         }
         if (!file.delete()) {
             throw CredentialStoreException("could not delete the credential file")
         }
         vaultUnreadable = false
+        cachedVault = Vault()
     }
 
     companion object {
@@ -312,11 +414,12 @@ class KeystoreDeviceCredentialStore internal constructor(
         const val FILE_NAME = "wattracker_device_credentials"
 
         /**
-         * Authenticated, not secret, and never shared between two files: an
-         * envelope is bound to the vault it was written for, so a credential
-         * file copied over another one -- or restored into a different
-         * installation and renamed -- does not open even on a device whose key
-         * it would otherwise serve.
+         * Authenticated, not secret, and one constant shared by every install:
+         * it separates this file's purpose from any other use of the same key,
+         * so an envelope written for something else does not open. It is **not**
+         * what binds a vault to an installation -- that is the per-installation
+         * Keystore key, which never leaves the device and is what a carried or
+         * restored file lacks.
          */
         private const val ASSOCIATED_DATA = "com.wattracker.android.device-credentials-v1"
 

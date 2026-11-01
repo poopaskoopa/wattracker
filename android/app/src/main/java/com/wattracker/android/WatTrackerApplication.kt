@@ -74,21 +74,33 @@ object WatTrackerApp {
     val isReady: Boolean
         get() = readModel != null
 
+    /**
+     * The paired credential id, or null. A read that fails (transient I/O, a
+     * Keystore hiccup) answers null for this call rather than throwing into a
+     * screen; the reason is carried by [credentialStoreHealth], and no mutation
+     * acts on the failed read (#459 M1).
+     */
     val currentCredentialId: String?
-        get() = credentialStore?.load()?.credentialId
+        get() = try {
+            credentialStore?.load()?.credentialId
+        } catch (_: Exception) {
+            null
+        }
 
     /** Where the signing key lives (StrongBox / TEE / software), for Settings. */
     val keyKind: DeviceKeyStore.KeyKind?
         get() = deviceKey?.kind
 
     /**
-     * What the credential store can promise about the next launch: [StoreHealth.Durable]
-     * normally, [StoreHealth.Unavailable] when the Keystore handed over no key (or
-     * handed over one whose bytes can be read, which this app refuses) and the
-     * in-memory store is serving, and [StoreHealth.UnreadableVault] when a vault
-     * file exists that this installation cannot open -- the key behind it is gone,
-     * or the file was carried in from another device, which is what the backup
-     * rules exist to prevent.
+     * What the credential store can promise about the next launch:
+     * [com.wattracker.android.cloud.StoreHealth.Durable] normally,
+     * [com.wattracker.android.cloud.StoreHealth.Unavailable] when the Keystore
+     * handed over no key (or handed over one whose bytes can be read, which this
+     * app refuses) and the in-memory store is serving, and
+     * [com.wattracker.android.cloud.StoreHealth.UnreadableVault] when a vault file
+     * exists that this installation cannot open -- the key behind it is gone, or
+     * the file was carried in from another device, which is what the backup rules
+     * exist to prevent.
      *
      * Pairing into the first two "succeeds" for this launch and is not a pairing
      * the rider can rely on, so #195's pairing screen must say which of the two
@@ -145,7 +157,11 @@ object WatTrackerApp {
     suspend fun listCloudDevices(context: Context): List<CloudDevice> = withContext(Dispatchers.IO) {
         ensureStarted(context).await()
         val c = client ?: return@withContext emptyList()
-        val dev = credentialStore?.load() ?: return@withContext emptyList()
+        val dev = try {
+            credentialStore?.load()
+        } catch (_: Exception) {
+            null
+        } ?: return@withContext emptyList()
         try {
             when (val res = c.devices(dev)) {
                 is CloudApiResult.Success -> res.value
@@ -182,6 +198,10 @@ object WatTrackerApp {
         val store = credentialStore ?: error("credential store unavailable")
 
         lc.reset()
+        // `clearLocal()` can refuse (#459 M1): a vault it cannot read or a key
+        // it cannot use leaves the file alone instead of deleting it. That is a
+        // `CredentialStoreException`, which Settings already renders as "could
+        // not save local credentials" rather than a silent success.
         store.clearLocal()
     }
 
