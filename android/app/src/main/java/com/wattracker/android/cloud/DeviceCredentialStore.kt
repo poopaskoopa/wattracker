@@ -122,17 +122,24 @@ class InMemoryDeviceCredentialStore : DeviceCredentialStore {
  *   which is the difference between "pair again and it is fixed" and "this
  *   device cannot save a pairing at all".
  * - **The envelope will not open** (another key, a tampered byte, a foreign
- *   purpose, an unknown format): GCM has certified these bytes are not a
- *   credential this installation wrote. A *save* may replace it outright, since
- *   a fresh pairing is the only way back; a *clear* must not, because deleting
- *   on that signal turns "unreadable" into "gone" and loses nothing recoverable
- *   but gains nothing either. The file stays and [health] reports
- *   [StoreHealth.UnreadableVault] until a read succeeds.
+ *   purpose, an unknown format): only an *authenticated* refusal counts here.
+ *   GCM has certified these bytes are not a credential this installation wrote.
+ *   A *save* may replace it outright, since a fresh pairing is the only way
+ *   back; a *clear* must not, because deleting on that signal turns
+ *   "unreadable" into "gone" and loses nothing recoverable but gains nothing
+ *   either. The file stays and [health] reports [StoreHealth.UnreadableVault]
+ *   until a read succeeds.
+ * - **The cipher could not be operated** (a provider hiccup, a transient
+ *   `init`/`doFinal` failure): nothing about the vault is established. Same rule
+ *   as a failed file read -- `load()` answers `null` for this attempt, every
+ *   mutation is refused, and `health` does not change.
  *
- * A member this build cannot parse -- a field added by a newer server -- is
- * **kept as raw JSON** rather than dropped: the other member is still served,
- * and the next write re-emits the unreadable member unchanged instead of
- * silently deleting it.
+ * A member this build cannot parse is **kept as raw JSON** rather than dropped:
+ * the other member is still served, and the next write re-emits the unreadable
+ * member unchanged instead of silently deleting it. The case that reaches this
+ * is a member missing a field this build requires; an *extra* field from a newer
+ * server is not a parse failure -- `fromJson` ignores unknown keys -- so it is
+ * dropped on the next write. Forward compatibility is per-field, not per-member.
  *
  * The decoded vault is cached under [lock] and replaced on every successful
  * write (#459 review, L1): `loadLocal()` is the desktop connector's
@@ -305,6 +312,12 @@ class KeystoreDeviceCredentialStore internal constructor(
                 return ReadResult.Opened(Vault().also { cachedVault = it })
             }
             file.readBytes()
+        } catch (_: CredentialCipherUnavailableException) {
+            // The cipher could not be operated: this is not a verdict about the
+            // vault, so the file is left alone and health is unchanged. Without
+            // this branch a provider hiccup would be reported as "the vault is
+            // bad", which is the advice M1 exists to stop.
+            return ReadResult.ReadFailed
         } catch (_: Exception) {
             // Transient until proven otherwise: the file is left alone, the
             // verdict on the vault does not change, and the next read answers
@@ -320,10 +333,17 @@ class KeystoreDeviceCredentialStore internal constructor(
             // cannot write a pairing either.
             keyUnavailable = true
             return ReadResult.NoKey
+        } catch (_: CredentialCipherUnavailableException) {
+            // The cipher could not be operated: this is not a verdict about the
+            // vault, so the file is left alone and health is unchanged. Without
+            // this branch a provider hiccup would be reported as "the vault is
+            // bad", which is the advice M1 exists to stop.
+            return ReadResult.ReadFailed
         } catch (_: Exception) {
-            // GCM said these bytes are not a credential this key wrote, or the
-            // format is not one this build describes. Either way it is a
-            // verdict about the file, not a transient failure.
+            // Only an authenticated refusal (AEADBadTagException) or this build's
+            // own format check reaches here: GCM said these bytes are not a
+            // credential this key wrote, or the format is not one this build
+            // describes. Either way it is a verdict about the file.
             vaultUnreadable = true
             return ReadResult.Unopenable
         }
@@ -340,9 +360,10 @@ class KeystoreDeviceCredentialStore internal constructor(
         }
         // The field-level JSON stays PairedDevice's and LocalCredentials' own --
         // this file only nests it, so each encoding has exactly one author. A
-        // member this model cannot read is kept as the raw JSON it arrived as
-        // (a field a newer server added), so the other member is still served and
-        // the next write re-emits it unchanged instead of dropping it.
+        // member this model cannot read -- one missing a field this build
+        // requires -- is kept as the raw JSON it arrived as, so the other member
+        // is still served and the next write re-emits it unchanged. An extra key
+        // from a newer server is not a parse failure and is dropped by fromJson.
         return Vault(
             pairedDevice = slot(json.opt("paired_device")) { PairedDevice.fromJson(it) },
             localCredentials = slot(json.opt("local_credentials")) { LocalCredentials.fromJson(it) },
@@ -372,6 +393,15 @@ class KeystoreDeviceCredentialStore internal constructor(
             // the screen can say the pairing will not outlive this launch.
             keyUnavailable = true
             throw CredentialStoreException("the credential key could not wrap the vault", e)
+        } catch (e: Exception) {
+            // Every other encrypt failure is a refused write too. Left as
+            // `CredentialCipherException`, it would escape `save()` as a type
+            // `PairingFailureMessage` does not recognise, and the rider would be
+            // told "that code did not work" after the code was already spent and
+            // the cache wiped (#459 review, finding 2). The IV check in
+            // `AesGcmCipher` is exactly this case on a device whose provider
+            // reports its IV differently, so it must not be blamed on the code.
+            throw CredentialStoreException("the credential vault could not be wrapped", e)
         }
         val temp = File(file.parentFile, file.name + TEMP_SUFFIX)
         try {
