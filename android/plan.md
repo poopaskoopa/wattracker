@@ -2050,6 +2050,34 @@ Owner-side (not code): Google Play Console developer account (**one-time $25**),
 create the app entry, create the **internal testing track** (not open/closed —
 up to 100 testers by email, no review queue, builds don't expire).
 
+**The Play API service account, 2026 workflow.** Google removed the "Setup" and
+"API access" pages from Play Console. Do not link a Cloud project from inside
+Play Console. The current flow has three steps:
+
+1. **Enable the API in Google Cloud.** Select or create a project, then
+   APIs & Services > Library, search "Google Play Android Developer API", and
+   click Enable.
+2. **Create the service account and its JSON key.** IAM & Admin > Service
+   Accounts > Create service account. Name it, for example `play-console-api`.
+   Skip the optional roles and click Done. Copy the long email address. Then
+   open the account, Keys > Add key > Create new key > JSON. The download is
+   the credentials file.
+3. **Grant access in Play Console.** Left menu > Users and permissions >
+   Invite new users. Paste the service account email. On the Account
+   permissions tab, check the permissions the upload needs (`Release apps to
+   testing tracks` and `Manage testing tracks`), then click Invite user.
+
+The old "API access" page is gone. A guide that still says to link the account
+from Play Console is stale.
+
+**Secrets (already set on this repository):** `ANDROID_UPLOAD_KEYSTORE_B64`,
+`ANDROID_UPLOAD_KEYSTORE_PASSWORD`, `ANDROID_UPLOAD_KEY_PASSWORD`,
+`ANDROID_UPLOAD_KEY_ALIAS`, `PLAY_SERVICE_ACCOUNT_JSON`. The keystore signs the
+bundle. The service account authorizes the upload. They are independent.
+
+`.gitignore` covers `*.jks` and `*.keystore`, but **not** a JSON service-account
+key. Keep that file outside the tree, or add an ignore line before creating it.
+
 Code/config:
 
 1. **App signing:** enroll in Play App Signing. Generate an **upload key**
@@ -2071,8 +2099,13 @@ Code/config:
      no self-hosted runner.
    - steps: → `./gradlew --no-daemon :app:bundleRelease` → `bundletool
      build-apks`/`zip` as needed → upload to the internal track via the Play
-     CLI / JSON API with the service-account or upload-key secrets. No manual
-     Android Studio steps.
+     Developer API with `PLAY_SERVICE_ACCOUNT_JSON` and the upload-key
+     secrets. No manual Android Studio steps.
+   - **`app/build.gradle.kts` has no `signingConfig`.** Release builds are
+     unsigned today, so `bundleRelease` cannot produce a Play-ready `.aab`.
+     Add a release `signingConfig` that reads the four upload-key values from
+     environment variables, and set those variables in the workflow from the
+     secrets.
    - **The placeholder host is retired.** `releaseCloudAuthority` in
      `app/build.gradle.kts` still defaults to `cloud.wattracker.example`, and
      the guard still refuses `assembleRelease`/`bundleRelease` without
