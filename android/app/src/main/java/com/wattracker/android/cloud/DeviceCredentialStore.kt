@@ -147,30 +147,21 @@ class InMemoryDeviceCredentialStore : DeviceCredentialStore {
  * was waste. One writer owns one file, so the cache cannot go stale behind the
  * store's back.
  *
- * The key is taken in the constructor for the fallback reason above:
+ * The key is taken -- and **driven** -- before a store exists, by [open]:
  * [CredentialKeyStore.loadOrCreateKey] has to be able to throw while the app is
  * still choosing a store, where the answer is to fall back and say so, and not
- * on the first write after a pairing code has already been spent.
+ * on the first write after a pairing code has already been spent. Holding a
+ * handle is not proof the key works, so [provisionCipher] wraps one throwaway
+ * string through the real cipher and back before handing it over. A key that
+ * cannot be operated then fails at startup, where the app can still report
+ * [StoreHealth.Unavailable] and pair into memory for the launch, rather than
+ * reporting unpaired forever and refusing every save after a code was spent --
+ * the availability finding on the #459 follow-up review.
  */
 class KeystoreDeviceCredentialStore internal constructor(
     private val file: File,
     private val cipher: CredentialCipher,
 ) : DeviceCredentialStore {
-
-    constructor(context: Context) : this(
-        File(context.filesDir, FILE_NAME),
-        AesGcmCipher(
-            // Eager, and taken once. A Keystore that will not hand over a key
-            // has to throw here, while the app is still choosing a store
-            // (WatTrackerApplication.openCredentialStore): handed to the cipher
-            // as a lazy lambda, that fallback could never fire and the failure
-            // would arrive on the write that follows a spent pairing code.
-            // One read per launch rather than one per operation because the
-            // alias is fixed for the life of the process.
-            keyProvider = eagerKeyProvider { CredentialKeyStore.loadOrCreateKey() },
-            associatedData = ASSOCIATED_DATA.toByteArray(Charsets.UTF_8),
-        ),
-    )
 
     /** One vault, one file, one writer: the two credentials never race each other. */
     private val lock = Any()
@@ -187,6 +178,13 @@ class KeystoreDeviceCredentialStore internal constructor(
      * handle, so a success after a key failure would mean the first failure was
      * an oddity, and the honest answer to that is a relaunch, not a promise of
      * durability.
+     *
+     * A provider that simply fails to answer is deliberately not in this set.
+     * [classifyOperationFailure] reports a `ProviderException` as a failed
+     * operation, which leaves [health] alone: a keystore-daemon hiccup that
+     * clears on the next request must not spend the rest of the launch telling
+     * the rider this device cannot save a pairing. A key that is genuinely dead
+     * is caught before this object exists, by [provisionCipher].
      */
     @Volatile
     private var keyUnavailable = false
@@ -312,12 +310,6 @@ class KeystoreDeviceCredentialStore internal constructor(
                 return ReadResult.Opened(Vault().also { cachedVault = it })
             }
             file.readBytes()
-        } catch (_: CredentialCipherUnavailableException) {
-            // The cipher could not be operated: this is not a verdict about the
-            // vault, so the file is left alone and health is unchanged. Without
-            // this branch a provider hiccup would be reported as "the vault is
-            // bad", which is the advice M1 exists to stop.
-            return ReadResult.ReadFailed
         } catch (_: Exception) {
             // Transient until proven otherwise: the file is left alone, the
             // verdict on the vault does not change, and the next read answers
@@ -455,6 +447,32 @@ class KeystoreDeviceCredentialStore internal constructor(
 
         private const val FORMAT_VERSION = 1
         private const val TEMP_SUFFIX = ".tmp"
+
+        /**
+         * The production store: [file], wrapped by a cipher over a Keystore key
+         * that [provisionCipher] has already proved it can operate.
+         *
+         * A function rather than a `Context` constructor because the key has to
+         * be loaded and driven before a store exists -- that is where the app is
+         * still choosing between this store and the in-memory fallback -- and a
+         * constructor cannot hand its own file to the code that provisions the
+         * cipher it passes in.
+         */
+        fun open(context: Context): KeystoreDeviceCredentialStore {
+            val file = File(context.filesDir, FILE_NAME)
+            return KeystoreDeviceCredentialStore(
+                file,
+                provisionCipher(
+                    vaultFile = file,
+                    loadKey = { CredentialKeyStore.loadOrCreateKey() },
+                    recreateKey = {
+                        CredentialKeyStore.deleteKey()
+                        CredentialKeyStore.loadOrCreateKey()
+                    },
+                    associatedData = ASSOCIATED_DATA.toByteArray(Charsets.UTF_8),
+                ),
+            )
+        }
     }
 }
 
@@ -470,6 +488,89 @@ class KeystoreDeviceCredentialStore internal constructor(
 internal fun eagerKeyProvider(load: () -> SecretKey): () -> SecretKey {
     val key = load()
     return { key }
+}
+
+/** Bytes the probe wraps and reads back. Not a secret, never on disk. */
+private val PROBE_PLAINTEXT = "wattracker credential key probe".toByteArray(Charsets.UTF_8)
+
+/**
+ * The cipher the production store runs on, provisioned before a store exists.
+ *
+ * Three rules, all of them the #459 follow-up review's availability finding.
+ *
+ * **The key is loaded eagerly.** The caller is still choosing a store at this
+ * point, and the fallback -- in memory, [StoreHealth.Unavailable], a warning on
+ * the pairing screen -- is only available to a caller that has not committed to
+ * a broken one yet.
+ *
+ * **The key is then driven, not just held.** A Keystore entry can exist, be
+ * readable and be non-exportable and still refuse to be *used*: after a corrupt
+ * key blob every `Cipher.init` throws `InvalidKeyException`. Taking the handle
+ * at face value left the app reporting unpaired on every launch, refusing every
+ * save after a pairing code had been spent, and offering the rider nothing short
+ * of clearing app data. One throwaway encrypt/decrypt through the real cipher
+ * says whether this launch can wrap anything at all. It also catches the
+ * provider that reports its IV differently -- the #459 review's named device
+ * risk -- at startup, where the answer is a warning, rather than as a vault that
+ * was written once and can never be read back.
+ *
+ * **A dead key is replaced only when nothing depends on it.** With no vault file
+ * on disk the alias is a lockout rather than a lock, so it is deleted, a fresh
+ * one is created, and the probe runs again. With a vault on disk, that file may
+ * still open under a key that works again next launch, and a new key would make
+ * a vault this launch never read permanently unreadable -- so this throws and
+ * the app falls back to memory, leaving the file exactly where it is.
+ *
+ * [vaultFile] is only ever asked whether it exists, and the probe writes no
+ * bytes anywhere.
+ */
+internal fun provisionCipher(
+    vaultFile: File,
+    loadKey: () -> SecretKey,
+    recreateKey: () -> SecretKey,
+    associatedData: ByteArray,
+): AesGcmCipher {
+    val key = loadKey()
+    val cipher = AesGcmCipher(eagerKeyProvider { key }, associatedData)
+    val probeFailure = runCatching { probe(cipher) }.exceptionOrNull()
+    if (probeFailure == null) return cipher
+
+    if (vaultFile.exists()) {
+        throw CredentialKeyStore.CredentialKeyException(
+            "the credential key could not be operated, and a vault is on disk; not replacing the key",
+            probeFailure,
+        )
+    }
+
+    // Nothing here would be lost by a new key, and the old one is not usable.
+    val replacement = try {
+        eagerKeyProvider { recreateKey() }
+    } catch (failure: Exception) {
+        throw CredentialKeyStore.CredentialKeyException("the credential key could not be recreated", failure)
+    }
+    val fresh = AesGcmCipher(replacement, associatedData)
+    try {
+        probe(fresh)
+    } catch (failure: Exception) {
+        throw CredentialKeyStore.CredentialKeyException(
+            "a new credential key was created and still could not be operated",
+            failure,
+        )
+    }
+    return fresh
+}
+
+/**
+ * One encrypt/decrypt of a throwaway string through the real cipher. The handle
+ * alone cannot prove any of the three things this does: that the key operates,
+ * that the provider reports an IV, and that the envelope the provider writes is
+ * one this class can read back.
+ */
+private fun probe(cipher: AesGcmCipher) {
+    val roundTrip = cipher.decrypt(cipher.encrypt(PROBE_PLAINTEXT))
+    if (!roundTrip.contentEquals(PROBE_PLAINTEXT)) {
+        throw CredentialCipherUnavailableException("the credential cipher did not round-trip its own envelope")
+    }
 }
 
 fun LocalCredentials.toJson(): String {

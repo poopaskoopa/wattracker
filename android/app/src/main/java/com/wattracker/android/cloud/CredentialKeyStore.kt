@@ -113,8 +113,13 @@ object CredentialKeyStore {
      * file is sitting in memory the whole time, and the premise is gone -- so
      * the store refuses to use such a key rather than quietly being weaker than
      * it claims.
+     *
+     * internal rather than private because the JVM suite cannot reach [KeyStore]
+     * under the `AndroidKeyStore` provider at all, while this half of the
+     * premise is a plain check on a [SecretKey]: deleting it has to redden
+     * something.
      */
-    private fun assertNonExportable(key: SecretKey) {
+    internal fun assertNonExportable(key: SecretKey) {
         val encoded: ByteArray? = try {
             key.encoded
         } catch (_: Exception) {
@@ -122,6 +127,34 @@ object CredentialKeyStore {
         }
         if (encoded != null) {
             throw CredentialKeyException("the credential key is exportable; refusing to use it")
+        }
+    }
+
+    /**
+     * Removes the alias, so the next [loadOrCreateKey] mints a fresh key.
+     *
+     * Destructive in exactly one way: any vault that key wrapped can never open
+     * again. That is why the only caller is the store's recovery path
+     * (`provisionCipher` in [DeviceCredentialStore]), which reaches here only
+     * after proving the key cannot be operated *and* finding no vault file that
+     * key was protecting. Deleting a key over a vault nobody read would turn
+     * "this launch could not look at the credential" into "the credential is
+     * gone", which is the M1 mistake in a new place.
+     *
+     * Returns whether there was an entry to remove.
+     */
+    internal fun deleteKey(): Boolean {
+        val keyStore = try {
+            KeyStore.getInstance(KEYSTORE).apply { load(null) }
+        } catch (e: Exception) {
+            throw CredentialKeyException("the Android Keystore is unavailable", e)
+        }
+        return try {
+            if (!keyStore.containsAlias(ALIAS)) return false
+            keyStore.deleteEntry(ALIAS)
+            true
+        } catch (e: Exception) {
+            throw CredentialKeyException("the credential key could not be removed", e)
         }
     }
 

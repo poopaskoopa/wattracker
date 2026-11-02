@@ -10,6 +10,9 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.security.InvalidKeyException
+import java.security.ProviderException
+import java.security.UnrecoverableKeyException
 import javax.crypto.Cipher
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
@@ -24,11 +27,12 @@ import javax.crypto.spec.SecretKeySpec
  * and decrypts through the same code path production uses, that a vault this
  * key did not write is refused rather than half-believed, that a refusal is
  * reported through `health` while the file stays put, that "there is no key"
- * and "the vault is bad" stay separate answers, that a read failure is not an
- * empty vault and may not be acted on, that a member this build cannot parse
- * survives a rewrite, that the key is taken before the store exists and only
- * once, that a launch reads the file once, that writes are all-or-nothing, and
- * that a refused write throws.
+ * and "the vault is bad" stay separate answers and which provider exceptions
+ * belong to each, that a read failure is not an empty vault and may not be
+ * acted on, that a member this build cannot parse survives a rewrite, that the
+ * key is taken before the store exists, driven once, and only replaced when no
+ * vault depends on it, that a launch reads the file once, that writes are
+ * all-or-nothing, and that a refused write throws.
  *
  * What it cannot pin is the AndroidKeyStore itself -- the non-exportable key,
  * the provider-chosen IV on a real device -- which is device-only and stays a
@@ -57,6 +61,9 @@ class KeystoreDeviceCredentialStoreTest {
     )
 
     private fun vaultFile(name: String = "vault"): File = File(folder.root, name)
+
+    /** The same associated data production uses, so a probe here is a probe there. */
+    private val ASSOCIATED = "com.wattracker.android.device-credentials-v1".toByteArray(Charsets.UTF_8)
 
     private fun key(seed: Int): SecretKey = SecretKeySpec(ByteArray(32) { (it + seed).toByte() }, "AES")
 
@@ -139,6 +146,41 @@ class KeystoreDeviceCredentialStoreTest {
             e
         }
         assertNotNull("an envelope without its IV cannot be opened", thrown)
+        assertTrue(
+            "and it is refused as a bad file, not reported as a cipher that could not be operated",
+            thrown is CredentialCipherException,
+        )
+    }
+
+    /**
+     * A file too short to hold an IV and a tag is evidence about the **file**.
+     * Without the cipher's own length check the bytes reach `init`, the provider
+     * objects to an IV of the wrong size, and that comes back as "the cipher
+     * could not be operated" -- which the store reads as a failed read, so every
+     * later save is refused over a file that was simply never an envelope. The
+     * #459 follow-up review caught this test asserting only that *some* exception
+     * was thrown: SunJCE throws on a short body anyway, so the check could go
+     * missing and nothing went red.
+     */
+    @Test
+    fun anEnvelopeTooShortToBeOneIsRefusedAsABadFile() {
+        val cipher = AesGcmCipher(
+            keyProvider = { key(0) },
+            associatedData = "aad".toByteArray(Charsets.UTF_8),
+        )
+
+        for (size in listOf(0, 1, 11, 12, 27)) {
+            val thrown = try {
+                cipher.decrypt(ByteArray(size) { it.toByte() })
+                null
+            } catch (e: Exception) {
+                e
+            }
+            assertTrue(
+                "a $size-byte file is a verdict about the file, not about the cipher",
+                thrown is CredentialCipherException,
+            )
+        }
     }
 
     // MARK: - Round trip and secrecy
@@ -785,6 +827,208 @@ class KeystoreDeviceCredentialStoreTest {
         }
         assertNotNull("the session has to learn the pairing did not persist", thrown)
         assertEquals(StoreHealth.Unavailable, store.health)
+    }
+
+    // MARK: - The failure taxonomy, at the point where it is decided
+
+    /**
+     * A JVM test cannot make a real Keystore provider fail on purpose, so the
+     * mapping is pinned where the mapping lives. Both halves matter: an unusable
+     * key is a key failure (the store must not blame the vault, and must refuse
+     * the mutation), and a provider that merely failed to answer is a failed
+     * operation, which must not stick to the rest of the launch (#459 follow-up
+     * review, availability finding -- a brief keystore-daemon error used to be
+     * recorded as a dead key for the whole process).
+     */
+    @Test
+    fun aProviderThatFailedToAnswerIsAFailedOperationNotADeadKey() {
+        assertTrue(
+            "init: the daemon, not the key",
+            classifyInitFailure(ProviderException("keystore daemon shrugged"))
+                is CredentialCipherUnavailableException,
+        )
+        assertTrue(
+            "and the same at doFinal",
+            classifyOperationFailure("could not encrypt the credential vault", ProviderException("shrugged"))
+                is CredentialCipherUnavailableException,
+        )
+    }
+
+    @Test
+    fun aKeyThatCannotBeUsedIsAKeyFailureAtEitherStage() {
+        assertTrue(
+            classifyInitFailure(InvalidKeyException("the key is not usable"))
+                is CredentialKeyStore.CredentialKeyException,
+        )
+        assertTrue(
+            classifyInitFailure(UnrecoverableKeyException("the entry is corrupt"))
+                is CredentialKeyStore.CredentialKeyException,
+        )
+        assertTrue(
+            classifyOperationFailure("could not encrypt the credential vault", InvalidKeyException("the key is not usable"))
+                is CredentialKeyStore.CredentialKeyException,
+        )
+    }
+
+    @Test
+    fun anythingElseAtTheProviderIsAFailedOperation() {
+        for (failure in listOf(IllegalStateException("cipher is in the wrong state"), NullPointerException())) {
+            assertTrue(
+                "init: $failure",
+                classifyInitFailure(failure) is CredentialCipherUnavailableException,
+            )
+            assertTrue(
+                "doFinal: $failure",
+                classifyOperationFailure("could not operate", failure) is CredentialCipherUnavailableException,
+            )
+        }
+        // A failure already named by the Keystore keeps its own name.
+        val named = CredentialKeyStore.CredentialKeyException("the credential key could not be read")
+        assertTrue(classifyInitFailure(named) === named)
+        assertTrue(classifyOperationFailure("could not operate", named) === named)
+    }
+
+    // MARK: - Provisioning the key before a store exists (the availability fix)
+
+    /**
+     * The stuck device the review described: a Keystore entry that exists, is
+     * readable and is non-exportable, and cannot be *used*. Reading the handle as
+     * proof of a working key left the app reporting unpaired on every launch and
+     * refusing every save after a pairing code had been spent, with nothing
+     * shorter of clearing app data to fix it. Provisioning drives the key once,
+     * through the real cipher, before a store exists.
+     */
+    @Test
+    fun aHealthyKeyIsTakenOnceAndNeverRecreated() {
+        val file = vaultFile()
+        var loads = 0
+        var recreations = 0
+
+        val cipher = provisionCipher(
+            vaultFile = file,
+            loadKey = { loads++; key(0) },
+            recreateKey = { recreations++; key(1) },
+            associatedData = ASSOCIATED,
+        )
+
+        assertEquals("one Keystore round trip for the whole launch", 1, loads)
+        assertEquals("a working key is not replaced", 0, recreations)
+        assertArrayEquals(
+            "and the cipher it hands over is the production one",
+            "body".toByteArray(Charsets.UTF_8),
+            cipher.decrypt(cipher.encrypt("body".toByteArray(Charsets.UTF_8))),
+        )
+        assertFalse("the probe wrote nothing anywhere", file.exists())
+        assertEquals(
+            "the probe wrote nothing anywhere, not even a temp file",
+            0,
+            folder.root.listFiles()?.size ?: 0,
+        )
+    }
+
+    /**
+     * A dead key over *no vault* is a lockout rather than a lock: nothing would
+     * be lost by a fresh key, and the alternative is a device that can never
+     * pair. The DES key is the honest failure -- `init` rejects it for
+     * AES/GCM with the real `InvalidKeyException`.
+     */
+    @Test
+    fun aDeadKeyWithNoVaultOnDiskIsReplacedOnce() {
+        val file = vaultFile()
+        var loads = 0
+        var recreations = 0
+
+        val cipher = provisionCipher(
+            vaultFile = file,
+            loadKey = { loads++; SecretKeySpec(ByteArray(8) { 1 }, "DES") },
+            recreateKey = { recreations++; key(5) },
+            associatedData = ASSOCIATED,
+        )
+
+        assertEquals("the dead key was probed, not trusted", 1, loads)
+        assertEquals("and replaced exactly once", 1, recreations)
+        assertArrayEquals(
+            "the recovered store wraps and unwraps",
+            "body".toByteArray(Charsets.UTF_8),
+            cipher.decrypt(cipher.encrypt("body".toByteArray(Charsets.UTF_8))),
+        )
+        assertFalse("and recovery wrote no vault of its own", file.exists())
+    }
+
+    /**
+     * A dead key over a vault that is *there* is a different device: that file
+     * may open again under a key that works next launch, and a new key would
+     * make a vault this launch never read permanently unreadable. So the alias
+     * stays, the bytes stay, and the caller falls back to memory and says so.
+     */
+    @Test
+    fun aDeadKeyWithAVaultOnDiskNeverReplacesTheKey() {
+        val file = vaultFile()
+        storeOn(file).apply {
+            save(device)
+            saveLocal(local)
+        }
+        val bytesBefore = file.readBytes()
+        var recreations = 0
+
+        val thrown = try {
+            provisionCipher(
+                vaultFile = file,
+                loadKey = { SecretKeySpec(ByteArray(8) { 1 }, "DES") },
+                recreateKey = { recreations++; key(5) },
+                associatedData = ASSOCIATED,
+            )
+            null
+        } catch (e: CredentialKeyStore.CredentialKeyException) {
+            e
+        }
+        assertNotNull("a key that cannot be operated has to fail before a store exists", thrown)
+        assertEquals("and no vault may pay for it", 0, recreations)
+        assertArrayEquals("the vault is byte for byte what it was", bytesBefore, file.readBytes())
+
+        val reader = storeOn(file)
+        assertEquals("and it still opens under its own key", device, reader.load())
+        assertEquals("both halves of it", local, reader.loadLocal())
+    }
+
+    @Test
+    fun aReplacementKeyThatAlsoCannotBeOperatedStillFailsAtProvisioning() {
+        val file = vaultFile()
+        var recreations = 0
+
+        val thrown = try {
+            provisionCipher(
+                vaultFile = file,
+                loadKey = { SecretKeySpec(ByteArray(8) { 1 }, "DES") },
+                recreateKey = { recreations++; SecretKeySpec(ByteArray(8) { 2 }, "DES") },
+                associatedData = ASSOCIATED,
+            )
+            null
+        } catch (e: CredentialKeyStore.CredentialKeyException) {
+            e
+        }
+        assertNotNull("two unusable keys are not a usable store", thrown)
+        assertEquals("and the alias was replaced exactly once, not retried forever", 1, recreations)
+        assertFalse("and nothing was written while trying", file.exists())
+    }
+
+    @Test
+    fun aKeystoreThatWillNotRecreateAKeyIsAKeyFailureToo() {
+        val thrown = try {
+            provisionCipher(
+                vaultFile = vaultFile(),
+                loadKey = { SecretKeySpec(ByteArray(8) { 1 }, "DES") },
+                recreateKey = { throw CredentialKeyStore.CredentialKeyException("the Keystore will not delete the entry") },
+                associatedData = ASSOCIATED,
+            )
+            null
+        } catch (e: CredentialKeyStore.CredentialKeyException) {
+            e
+        }
+        assertNotNull(
+            "the caller's fallback is chosen on a key exception, so that is what has to arrive",
+            thrown,
+        )
     }
 
     /** A cipher whose key is gone: no key to ask, rather than a bad envelope. */

@@ -285,10 +285,17 @@ object WatTrackerApp {
     private fun openCredentialStore(context: Context): DeviceCredentialStore {
         dropLegacyEncryptedStore(context)
         return try {
-            // The store's constructor takes the Keystore key, so a Keystore
-            // that will not hand one over throws right here rather than on the
-            // first write after a pairing code has been spent.
-            KeystoreDeviceCredentialStore(context)
+            // `open` loads the Keystore key and then *drives* it -- one
+            // throwaway encrypt/decrypt through the production cipher -- before
+            // a store exists. So both ways a key fails to arrive reach this
+            // catch: no key at all, and a key the Keystore will not let anyone
+            // use (a corrupt key blob after an OEM update, say). The second one
+            // used to slip through, because holding a handle looked like having
+            // a key: the app reported unpaired, refused every save after a
+            // pairing code had been spent, and nothing short of clearing app
+            // data helped. Where there is no vault on disk to lose, the store
+            // replaces the dead alias first and only then gives up here.
+            KeystoreDeviceCredentialStore.open(context)
         } catch (_: Exception) {
             // The Keystore itself will not take part: it hands over no AES key,
             // or it hands over one whose bytes can be read, which this app

@@ -1,7 +1,6 @@
 package com.wattracker.android.cloud
 
 import java.security.InvalidKeyException
-import java.security.ProviderException
 import java.security.UnrecoverableKeyException
 import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
@@ -95,7 +94,7 @@ class AesGcmCipher(
             cipher.init(Cipher.ENCRYPT_MODE, key)
             cipher.updateAAD(associatedData)
         } catch (e: Exception) {
-            throw initFailure(e)
+            throw classifyInitFailure(e)
         }
 
         // The provider chose it; the envelope has to carry it. A provider that
@@ -108,7 +107,7 @@ class AesGcmCipher(
         val body = try {
             cipher.doFinal(plaintext)
         } catch (e: Exception) {
-            throw operationFailure("could not encrypt the credential vault", e)
+            throw classifyOperationFailure("could not encrypt the credential vault", e)
         }
         return iv + body
     }
@@ -125,7 +124,7 @@ class AesGcmCipher(
             cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
             cipher.updateAAD(associatedData)
         } catch (e: Exception) {
-            throw initFailure(e)
+            throw classifyInitFailure(e)
         }
 
         return try {
@@ -136,7 +135,7 @@ class AesGcmCipher(
             // file.
             throw CredentialCipherException("the credential vault is not one this key wrote", e)
         } catch (e: Exception) {
-            throw operationFailure("the credential vault could not be decrypted", e)
+            throw classifyOperationFailure("the credential vault could not be decrypted", e)
         }
     }
 
@@ -147,38 +146,6 @@ class AesGcmCipher(
         throw CredentialCipherUnavailableException("the credential cipher is unavailable", e)
     }
 
-    /**
-     * What a failure at `init` means.
-     *
-     * The #459 review caught the earlier version classifying only
-     * [UnrecoverableKeyException] here. `init` never throws that -- it comes from
-     * `KeyStore.getKey` -- and a key the Keystore cannot use arrives as
-     * [InvalidKeyException] or [ProviderException]. Left as a cipher failure, the
-     * store read it as "the vault won't open", told the rider pairing again
-     * would fix it, and let a save replace the file: the M1 data loss again.
-     * Those are key failures. Anything else at `init` (a provider hiccup, an
-     * unusable algorithm) establishes nothing about the envelope and is treated
-     * as a failed operation.
-     */
-    private fun initFailure(failure: Exception): Exception = when (failure) {
-        is CredentialKeyStore.CredentialKeyException -> failure
-        is UnrecoverableKeyException,
-        is InvalidKeyException,
-        is ProviderException -> keyFailure(failure)
-        else -> CredentialCipherUnavailableException("could not initialise the credential cipher", failure)
-    }
-
-    /** A key problem stays a key problem, wherever it surfaces. */
-    private fun operationFailure(message: String, failure: Exception): Exception = when (failure) {
-        is CredentialKeyStore.CredentialKeyException -> failure
-        is InvalidKeyException,
-        is ProviderException -> keyFailure(failure)
-        else -> CredentialCipherUnavailableException(message, failure)
-    }
-
-    private fun keyFailure(failure: Exception): Exception =
-        CredentialKeyStore.CredentialKeyException("the credential key could not be used", failure)
-
     companion object {
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val GCM_IV_BYTES = 12
@@ -187,4 +154,53 @@ class AesGcmCipher(
         /** An IV and a tag and nothing else is already impossible payload. */
         private const val MIN_ENVELOPE_BYTES = GCM_IV_BYTES + GCM_TAG_BITS / 8
     }
+}
+
+/**
+ * What a failure at `Cipher.init` establishes, and what the store may conclude
+ * from it.
+ *
+ * The mapping is a top-level function rather than a private method because the
+ * JVM cannot make a real Keystore provider fail on purpose: the taxonomy is the
+ * thing that has been got wrong twice, and a taxonomy no test can redden is a
+ * taxonomy that changes quietly. [AesGcmCipher] routes its own `init` and
+ * `doFinal` failures through these two, and the genuine ones it can produce (a
+ * key of the wrong algorithm at `init`) are tested through the cipher itself.
+ *
+ * The #459 review's first round caught the original version classifying only
+ * [UnrecoverableKeyException] -- which `init` never throws, it comes from
+ * [java.security.KeyStore.getKey] -- so an unusable key read as "the vault won't
+ * open", the rider was told pairing again would fix it, and a save was allowed
+ * to replace the file. That is the M1 data loss with better manners. So
+ * [InvalidKeyException] and [UnrecoverableKeyException] **are** key failures.
+ *
+ * [java.security.ProviderException] is not, and this is the part the follow-up
+ * review pushed on: it is the Keystore daemon failing to answer, which says
+ * nothing durable about the key and nothing at all about the envelope. A key
+ * that is genuinely dead is caught at store construction, where a throwaway
+ * encrypt/decrypt drives this same cipher (see `provisionCipher` in
+ * [DeviceCredentialStore]); a provider that throws mid-launch has therefore
+ * already been told it is not the key, and treating it as one would block every
+ * write for the rest of the launch on an error that may clear by itself. It
+ * comes back as a failed operation: the file is left exactly where it is, the
+ * mutation is refused, and [StoreHealth] does not change.
+ */
+internal fun classifyInitFailure(failure: Exception): Exception = when (failure) {
+    is CredentialKeyStore.CredentialKeyException -> failure
+    is UnrecoverableKeyException,
+    is InvalidKeyException,
+    -> CredentialKeyStore.CredentialKeyException("the credential key could not be used", failure)
+
+    else -> CredentialCipherUnavailableException("could not initialise the credential cipher", failure)
+}
+
+/**
+ * The same question asked of a failure at `doFinal`. A key problem stays a key
+ * problem wherever it surfaces; anything else establishes only that this
+ * operation did not happen.
+ */
+internal fun classifyOperationFailure(message: String, failure: Exception): Exception = when (failure) {
+    is CredentialKeyStore.CredentialKeyException -> failure
+    is InvalidKeyException -> CredentialKeyStore.CredentialKeyException("the credential key could not be used", failure)
+    else -> CredentialCipherUnavailableException(message, failure)
 }
