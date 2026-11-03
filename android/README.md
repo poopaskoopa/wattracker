@@ -202,8 +202,10 @@ This is the reason the Android dev loop never wants `--lan` or
 
 ## Dependencies
 
-Only AndroidX, Kotlin stdlib, and the two AndroidX extras the plan names:
-Room and Tink (`security-crypto`). The shell adds navigation-compose (AndroidX)
+Only AndroidX, Kotlin stdlib, and the AndroidX extra the plan names: Room.
+`security-crypto` and its Tink tree left the app with #457 -- the credential
+store is wrapped by an Android Keystore AES-GCM key directly, so no crypto
+library sits in the graph at all. The shell adds navigation-compose (AndroidX)
 The five nav icons are vendored as `ImageVector`s in `ui/theme/Icons.kt`
 (Material Design path data). Only `Settings` comes from `material-icons-core`;
 the other four are hand-vendored to avoid the 50 MB `material-icons-extended`

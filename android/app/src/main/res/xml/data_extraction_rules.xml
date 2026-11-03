@@ -9,8 +9,14 @@
 
     The app's entire on-disk state is excluded across all domains (root,
     database, sharedpref, file, external), including the Room cache (database)
-    and EncryptedSharedPreferences (sharedpref). The signing key itself is in
-    the Keystore, which no transfer mechanism can carry. See AndroidManifest.xml.
+    and the Keystore-wrapped credential vault (file). That last exclude is load
+    bearing rather than tidy: the vault and the Keystore key that opens it are
+    two halves of one installation, so a vault carried to another device (by
+    Auto Backup, a restore, or a D2D transfer) is undecryptable there by
+    construction, and transferring it buys a permanently broken pairing state.
+    The associated data on the envelope refuses even a renamed copy (#457).
+    The keys themselves live in the Keystore, which no transfer mechanism can
+    carry. See AndroidManifest.xml.
 -->
 <data-extraction-rules>
     <cloud-backup />
