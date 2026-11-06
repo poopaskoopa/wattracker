@@ -181,7 +181,7 @@ final class SessionGate {
     private(set) var lastSuccess: Date?
     /// The other backend when the selected backend is unpaired and the other
     /// one is paired. This lets PairingScreen offer a way back to a working
-    /// session when a Settings override leads here.
+    /// session when the selected backend is unpaired.
     private(set) var pairedFallback: Backend?
     private(set) var pairingInFlight = false
 
@@ -208,8 +208,7 @@ final class SessionGate {
     }
 
     var canCancelPairing: Bool {
-        phase == .unpaired && manualOverride != nil && pairedFallback != nil
-            && !pairingInFlight
+        phase == .unpaired && pairedFallback != nil && !pairingInFlight
     }
 
     init(
@@ -452,11 +451,11 @@ final class SessionGate {
 
     /// Leave the pairing screen for the backend that is already paired.
     func cancelPairing() async {
-        guard phase == .unpaired, manualOverride != nil, !pairingInFlight else { return }
+        guard phase == .unpaired, pairedFallback != nil, !pairingInFlight else { return }
         let generation = selectionGeneration
         let fallback = pairedFallback
         let fallbackIsPaired = await isPaired(fallback)
-        guard generation == selectionGeneration, manualOverride != nil,
+        guard generation == selectionGeneration, phase == .unpaired,
               !pairingInFlight else { return }
         if !fallbackIsPaired {
             pairedFallback = nil
