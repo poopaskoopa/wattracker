@@ -231,17 +231,19 @@ def _activity_rows(
         workout_columns = {
             item["name"] for item in conn.execute(f"PRAGMA table_info({table})")
         }
-        if not {"user_id", "completed_activity_id", "rpe"} <= workout_columns:
+        if not {
+            "id", "user_id", "completed_activity_id", "rpe",
+        } <= workout_columns:
             continue
         for workout in conn.execute(
             f"SELECT completed_activity_id, rpe FROM {table} "
             "WHERE user_id = ? AND completed_activity_id IS NOT NULL "
-            "AND rpe IS NOT NULL",
+            "ORDER BY id ASC",
             (user_id,),
         ):
-            workout_rpe_by_activity.setdefault(
-                int(workout["completed_activity_id"]), workout["rpe"],
-            )
+            activity_id = int(workout["completed_activity_id"])
+            if activity_id not in workout_rpe_by_activity:
+                workout_rpe_by_activity[activity_id] = workout["rpe"]
     ids = [int(row["id"]) for row in rows]
     ranges = {}
     if decode and ids and _correction_schema_available(conn):
@@ -255,9 +257,12 @@ def _activity_rows(
             for key in _ACTIVITY_FIELDS
             if key in row.keys() and row[key] is not None
         }
-        if "rpe" not in summary:
-            workout_rpe = workout_rpe_by_activity.get(int(row["id"]))
-            if workout_rpe is not None:
+        activity_id = int(row["id"])
+        if activity_id in workout_rpe_by_activity:
+            workout_rpe = workout_rpe_by_activity[activity_id]
+            if workout_rpe is None:
+                summary.pop("rpe", None)
+            else:
                 summary["rpe"] = workout_rpe
         summary["id"] = int(row["id"])
         streams = (

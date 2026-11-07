@@ -301,12 +301,75 @@ def test_plan_workout_rpe_precedes_standalone_rpe_on_collision(tmp_path):
     assert activity.data["rpe"] == 6
 
 
-def test_activity_rpe_takes_precedence_over_linked_workout(tmp_path):
+def test_linked_workout_rpe_takes_precedence_over_activity_rpe(tmp_path):
     path, user_id = _fixture_db(tmp_path)
     activity_id = _activity(
         path, user_id, 32, "2026-08-22T10:00:00", seconds=10,
     )
     _completed_plan_workout(path, user_id, activity_id, 4)
+    assert db.set_activity_rpe(user_id, activity_id, 7, path=str(path))
+
+    activity = next(
+        obj for obj in snapshot_objects(path, user_id)
+        if obj.object_id == f"activity-{activity_id}"
+    )
+
+    assert activity.data["rpe"] == 4
+
+
+def test_linked_plan_without_rpe_suppresses_activity_rpe(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = _activity(
+        path, user_id, 37, "2026-08-22T10:00:00", seconds=10,
+    )
+    _completed_plan_workout(path, user_id, activity_id, None)
+    assert db.set_activity_rpe(user_id, activity_id, 7, path=str(path))
+
+    activity = next(
+        obj for obj in snapshot_objects(path, user_id)
+        if obj.object_id == f"activity-{activity_id}"
+    )
+
+    assert "rpe" not in activity.data
+
+
+def test_null_plan_link_owns_over_rated_standalone_link(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = _activity(
+        path, user_id, 38, "2026-08-22T10:00:00", seconds=10,
+    )
+    _completed_plan_workout(path, user_id, activity_id, None)
+    standalone_id = db.add_standalone_workout(
+        user_id, f"null-plan-collision-{activity_id}", "2026-08-20",
+        "Recovery", "recovery", 1800, 20, "{}", 200, path=str(path),
+    )
+    conn = db.connect(str(path))
+    try:
+        conn.execute(
+            "UPDATE standalone_workouts SET completed_activity_id = ?, "
+            "completed_date = ? WHERE user_id = ? AND id = ?",
+            (activity_id, "2026-08-20", user_id, standalone_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert db.set_standalone_rpe(
+        user_id, standalone_id, 6, path=str(path),
+    )
+
+    activity = next(
+        obj for obj in snapshot_objects(path, user_id)
+        if obj.object_id == f"activity-{activity_id}"
+    )
+
+    assert "rpe" not in activity.data
+
+
+def test_unlinked_activity_keeps_activity_rpe(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = _activity(
+        path, user_id, 39, "2026-08-22T10:00:00", seconds=10,
+    )
     assert db.set_activity_rpe(user_id, activity_id, 7, path=str(path))
 
     activity = next(
