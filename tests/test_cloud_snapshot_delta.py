@@ -156,6 +156,42 @@ def test_changed_object_and_local_deletion_emit_one_delta_each(tmp_path):
     assert snapshot_batch(path, user_id, include_derived=False) is None
 
 
+def test_linked_workout_rpe_change_emits_activity_delta(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = 1
+    plan_id = db.create_plan(
+        user_id, "RPE delta", "2026-08-20", 1,
+        recipe={"goal": "ftp"}, path=str(path),
+    )
+    workout_id = db.add_plan_workout(
+        plan_id, user_id, "2026-08-20", "Endurance", "endurance", 3600, 50,
+        "{}", path=str(path),
+    )
+    assert db.mark_plan_workout_completed(
+        user_id, workout_id, activity_id, "2026-08-20", path=str(path),
+    )
+
+    initial = snapshot_batch(path, user_id, include_derived=False)
+    assert initial is not None
+    initial_activity = next(
+        obj for obj in initial.objects
+        if obj.object_id == f"activity-{activity_id}"
+    )
+    assert "rpe" not in initial_activity.data
+    commit_snapshot_batch(path, user_id, initial)
+
+    assert db.set_plan_workout_rpe(
+        user_id, workout_id, 5, path=str(path),
+    )
+    changed = snapshot_batch(path, user_id, include_derived=False)
+
+    assert changed is not None
+    assert [obj.object_id for obj in changed.objects] == [
+        f"activity-{activity_id}",
+    ]
+    assert changed.objects[0].data["rpe"] == 5
+
+
 def test_explicit_paged_batches_keep_their_identity_and_revision(tmp_path):
     path, user_id = _fixture_db(tmp_path, count=2)
     page_one = snapshot_batch(

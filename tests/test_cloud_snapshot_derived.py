@@ -14,6 +14,7 @@ from wattracker.cloud.models import (
     PUBLISHED_OBJECT_KINDS,
     SyncBatch,
 )
+from wattracker.cloud import snapshot as snapshot_module
 from wattracker.cloud.snapshot import (
     MAX_STREAM_DECODED,
     SnapshotError,
@@ -153,6 +154,41 @@ def _fixture_db(tmp_path):
     return path, user_id
 
 
+def _completed_plan_workout(path, user_id, activity_id, rpe):
+    plan_id = db.create_plan(
+        user_id, "RPE test", "2026-08-20", 1,
+        recipe={"goal": "ftp"}, path=str(path),
+    )
+    workout_id = db.add_plan_workout(
+        plan_id, user_id, "2026-08-20", "Endurance", "endurance", 3600, 50,
+        "{}", path=str(path),
+    )
+    assert db.mark_plan_workout_completed(
+        user_id, workout_id, activity_id, "2026-08-20", path=str(path),
+    )
+    if rpe is not None:
+        assert db.set_plan_workout_rpe(
+            user_id, workout_id, rpe, path=str(path),
+        )
+    return workout_id
+
+
+def _completed_standalone_workout(path, user_id, activity_id, rpe):
+    workout_id = db.add_standalone_workout(
+        user_id, f"rpe-{activity_id}", "2026-08-20", "Recovery", "recovery",
+        1800, 20, "{}", 200, path=str(path),
+    )
+    assert db.mark_standalone_completed(
+        user_id, workout_id, activity_id, "2026-08-20", None, None,
+        path=str(path),
+    )
+    if rpe is not None:
+        assert db.set_standalone_rpe(
+            user_id, workout_id, rpe, path=str(path),
+        )
+    return workout_id
+
+
 def test_derived_snapshot_round_trips_all_kinds_with_explicit_stream_selection(tmp_path):
     path, user_id = _fixture_db(tmp_path)
 
@@ -194,6 +230,149 @@ def test_derived_snapshot_round_trips_all_kinds_with_explicit_stream_selection(t
     assert [obj.object_id for obj in round_tripped.objects] == [
         obj.object_id for obj in objects
     ]
+
+
+def test_plan_workout_rpe_falls_back_into_activity_and_detail(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = _activity(
+        path, user_id, 30, "2026-08-22T10:00:00", seconds=10,
+    )
+    _completed_plan_workout(path, user_id, activity_id, 6)
+
+    objects = snapshot_objects(path, user_id)
+    activity = next(
+        obj for obj in objects if obj.object_id == f"activity-{activity_id}"
+    )
+    detail = next(
+        obj for obj in objects
+        if obj.object_id == f"activity-detail-{activity_id}"
+    )
+
+    assert activity.data["rpe"] == 6
+    assert detail.data["rpe"] == 6
+
+
+def test_standalone_workout_rpe_falls_back_to_activity(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = _activity(
+        path, user_id, 31, "2026-08-22T10:00:00", seconds=10,
+    )
+    _completed_standalone_workout(path, user_id, activity_id, 4)
+
+    activity = next(
+        obj for obj in snapshot_objects(path, user_id)
+        if obj.object_id == f"activity-{activity_id}"
+    )
+
+    assert activity.data["rpe"] == 4
+
+
+def test_plan_workout_rpe_precedes_standalone_rpe_on_collision(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = _activity(
+        path, user_id, 36, "2026-08-22T10:00:00", seconds=10,
+    )
+    _completed_plan_workout(path, user_id, activity_id, 6)
+    standalone_id = db.add_standalone_workout(
+        user_id, f"collision-{activity_id}", "2026-08-20", "Recovery",
+        "recovery", 1800, 20, "{}", 200, path=str(path),
+    )
+    # The public completion setters prevent duplicate activity links; model a
+    # pre-existing collision so the snapshot preserves the documented order.
+    conn = db.connect(str(path))
+    try:
+        conn.execute(
+            "UPDATE standalone_workouts SET completed_activity_id = ?, "
+            "completed_date = ? WHERE user_id = ? AND id = ?",
+            (activity_id, "2026-08-20", user_id, standalone_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert db.set_standalone_rpe(
+        user_id, standalone_id, 9, path=str(path),
+    )
+
+    activity = next(
+        obj for obj in snapshot_objects(path, user_id)
+        if obj.object_id == f"activity-{activity_id}"
+    )
+
+    assert activity.data["rpe"] == 6
+
+
+def test_activity_rpe_takes_precedence_over_linked_workout(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = _activity(
+        path, user_id, 32, "2026-08-22T10:00:00", seconds=10,
+    )
+    _completed_plan_workout(path, user_id, activity_id, 4)
+    assert db.set_activity_rpe(user_id, activity_id, 7, path=str(path))
+
+    activity = next(
+        obj for obj in snapshot_objects(path, user_id)
+        if obj.object_id == f"activity-{activity_id}"
+    )
+
+    assert activity.data["rpe"] == 7
+
+
+def test_unmatched_unrated_activity_omits_rpe(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = _activity(
+        path, user_id, 33, "2026-08-22T10:00:00", seconds=10,
+    )
+
+    activity = next(
+        obj for obj in snapshot_objects(path, user_id)
+        if obj.object_id == f"activity-{activity_id}"
+    )
+
+    assert "rpe" not in activity.data
+
+
+def test_workout_rpe_is_scoped_to_activity_owner(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = _activity(
+        path, user_id, 34, "2026-08-22T10:00:00", seconds=10,
+    )
+    other_user_id = db.create_user(
+        "other-rider", "not-a-password", path=str(path),
+    )
+    _completed_standalone_workout(path, other_user_id, activity_id, 9)
+
+    activity = next(
+        obj for obj in snapshot_objects(path, user_id)
+        if obj.object_id == f"activity-{activity_id}"
+    )
+
+    assert "rpe" not in activity.data
+
+
+def test_activity_snapshot_builds_when_workout_tables_are_missing(
+    tmp_path, monkeypatch,
+):
+    path, user_id = _fixture_db(tmp_path)
+    activity_id = _activity(
+        path, user_id, 35, "2026-08-22T10:00:00", seconds=10,
+    )
+    original_tables = snapshot_module._tables
+    monkeypatch.setattr(
+        snapshot_module,
+        "_tables",
+        lambda conn: original_tables(conn) - {
+            "plan_workouts", "standalone_workouts",
+        },
+    )
+
+    activity = next(
+        obj for obj in snapshot_objects(
+            path, user_id, include_derived=False,
+        )
+        if obj.object_id == f"activity-{activity_id}"
+    )
+
+    assert "rpe" not in activity.data
 
 
 def _stream_contract_db(tmp_path):

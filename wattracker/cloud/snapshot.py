@@ -223,6 +223,25 @@ def _activity_rows(
         f"{duplicate_filter} ORDER BY {order_by}",
         (user_id,),
     ).fetchall()
+    workout_rpe_by_activity: dict[int, Any] = {}
+    tables = _tables(conn)
+    for table in ("plan_workouts", "standalone_workouts"):
+        if table not in tables:
+            continue
+        workout_columns = {
+            item["name"] for item in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if not {"user_id", "completed_activity_id", "rpe"} <= workout_columns:
+            continue
+        for workout in conn.execute(
+            f"SELECT completed_activity_id, rpe FROM {table} "
+            "WHERE user_id = ? AND completed_activity_id IS NOT NULL "
+            "AND rpe IS NOT NULL",
+            (user_id,),
+        ):
+            workout_rpe_by_activity.setdefault(
+                int(workout["completed_activity_id"]), workout["rpe"],
+            )
     ids = [int(row["id"]) for row in rows]
     ranges = {}
     if decode and ids and _correction_schema_available(conn):
@@ -236,6 +255,10 @@ def _activity_rows(
             for key in _ACTIVITY_FIELDS
             if key in row.keys() and row[key] is not None
         }
+        if "rpe" not in summary:
+            workout_rpe = workout_rpe_by_activity.get(int(row["id"]))
+            if workout_rpe is not None:
+                summary["rpe"] = workout_rpe
         summary["id"] = int(row["id"])
         streams = (
             _decode_streams(row["streams"], ranges.get(int(row["id"]), []))
