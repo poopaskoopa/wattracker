@@ -187,15 +187,14 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#464: iOS, no Cancel on PairingScreen after a revoked backend when Data
-   source is Automatic.** Follow-up from the #463 review (the #460 fix); same
-   trap, different route. **Blocked until #463 merges** (same three files:
-   `SessionGate.swift`, `PairingScreen.swift`, `SessionGateTests.swift`), so
-   start from `main` after the merge and reuse #463's live-fallback check
-   rather than adding a second generation counter. Flip #463's "not offered"
-   test to the new contract with a local mutation proof, and say whether it
-   ran on a device or only in the simulator. `Android: n/a <reason>` in the PR
-   body. Report "ready to merge".
+1. **#466: iOS shows "—" for RPE on rides matched to a workout.** Root cause
+   (confirmed read-only on the live DB: 33 plan-matched rides): the web app
+   stores a matched ride's RPE on `plan_workouts`/`standalone_workouts`, while
+   `wattracker/cloud/snapshot.py::_activity_rows` reads only `activities.rpe`.
+   The full spec, test list and verification protocol are in the second
+   comment on #466; follow it. #473 was closed as a duplicate. Server-side
+   only: `Android: n/a` in the PR body, say it was not run on a device, no
+   closing keyword for #473. Report "ready to merge".
 
 2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
@@ -205,14 +204,14 @@ states on `main` when the PR is merge-committed. Four such commits are on
    runs on it.
 
 **Done (landed, off the active list):** #427 via #441, #429 via #439 and #442,
-#437 via #440, #438, and #443 (closed), and #451 via #453 (rolling
-preview verified on `preview-latest` 2026-10-27).
+#437 via #440, #438, and #443 (closed), #451 via #453 (rolling
+preview verified on `preview-latest` 2026-10-27), and #464 via #471.
 
 **An item with an open PR stays on this list until the PR merges**, marked with
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**#249 stays skipped** pending taksmon's log and invocation, so once #464 is
+**#249 stays skipped** pending taksmon's log and invocation, so once #466 is
 done the queue is empty. Do not pick up unlabelled issues or anything
 below on your own. Say the queue ran out rather than inventing scope.
 
