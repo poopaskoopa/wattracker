@@ -171,6 +171,54 @@ class RideDisplayTest {
         assertTrue(ZoneGroup.extract(null).isEmpty())
     }
 
+    @Test
+    fun zoneColorsByNumberAndClampPastZ6() {
+        assertEquals(0x8a94a0, ZoneStyle.rgb(1)) // gray (Palette.muted)
+        assertEquals(0x4a90d9, ZoneStyle.rgb(2)) // blue
+        assertEquals(0x4caf7d, ZoneStyle.rgb(3)) // green (Palette.ok)
+        assertEquals(0xf08c2e, ZoneStyle.rgb(4)) // orange
+        assertEquals(0xe05252, ZoneStyle.rgb(5)) // red (Palette.alert)
+        assertEquals(0xa82828, ZoneStyle.rgb(6)) // dark red
+        assertEquals(ZoneStyle.rgb(6), ZoneStyle.rgb(7))
+        assertEquals(ZoneStyle.rgb(1), ZoneStyle.rgb(0))
+        assertEquals(6, (1..6).map { ZoneStyle.rgb(it) }.toSet().size)
+        assertEquals(Palette.muted, ZoneStyle.color(1))
+        assertEquals(Palette.ok, ZoneStyle.color(3))
+        assertEquals(Palette.alert, ZoneStyle.color(5))
+    }
+
+    @Test
+    fun zoneNumberComesFromLabelThenPosition() {
+        assertEquals(3, ZoneStyle.zoneNumber("Z3", 0))
+        assertEquals(6, ZoneStyle.zoneNumber("Z6", 1))
+        assertEquals(2, ZoneStyle.zoneNumber("Recovery", 1))
+        assertEquals(5, ZoneStyle.zoneNumber(null, 4))
+
+        val zones = JsonValue.parse(
+            """{"heart_rate":{"zones":[
+                {"label":"Z1","seconds":0},
+                {"label":"Z2","seconds":60,"percent":25},
+                {"seconds":180,"percent":75}
+            ]}}""",
+        )
+        val rows = ZoneGroup.extract(zones).firstOrNull()?.rows
+            ?: throw AssertionError("expected the heart-rate group")
+        // The dropped zero-time Z1 must not shift the zones behind it.
+        assertEquals(listOf(2, 3), rows.map { it.zone })
+    }
+
+    @Test
+    fun zoneBarFractionClampsAndTreatsMissingAsZero() {
+        assertEquals(0.45f, ZoneStyle.barFraction(45.0), 1e-6f)
+        assertEquals(1f, ZoneStyle.barFraction(100.0), 0f)
+        assertEquals(0f, ZoneStyle.barFraction(0.0), 0f)
+        assertEquals(1f, ZoneStyle.barFraction(140.0), 0f)
+        assertEquals(0f, ZoneStyle.barFraction(-5.0), 0f)
+        assertEquals(0f, ZoneStyle.barFraction(null), 0f)
+        assertEquals(0f, ZoneStyle.barFraction(Double.NaN), 0f)
+        assertEquals(0f, ZoneStyle.barFraction(Double.POSITIVE_INFINITY), 0f)
+    }
+
     // MARK: - Stream series
 
     @Test

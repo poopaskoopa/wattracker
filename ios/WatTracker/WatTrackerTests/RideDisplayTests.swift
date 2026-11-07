@@ -64,6 +64,47 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertEqual(ZoneFormatting.duration(rows[0].seconds), "0:02")
     }
 
+    func testZoneColorsByNumberAndClampPastZ6() {
+        XCTAssertEqual(ZoneStyle.rgb(zone: 1), 0x8a94a0)  // gray (Palette.muted)
+        XCTAssertEqual(ZoneStyle.rgb(zone: 2), 0x4a90d9)  // blue
+        XCTAssertEqual(ZoneStyle.rgb(zone: 3), 0x4caf7d)  // green (Palette.ok)
+        XCTAssertEqual(ZoneStyle.rgb(zone: 4), 0xf08c2e)  // orange
+        XCTAssertEqual(ZoneStyle.rgb(zone: 5), 0xe05252)  // red (Palette.alert)
+        XCTAssertEqual(ZoneStyle.rgb(zone: 6), 0xa82828)  // dark red
+        XCTAssertEqual(ZoneStyle.rgb(zone: 7), ZoneStyle.rgb(zone: 6))
+        XCTAssertEqual(ZoneStyle.rgb(zone: 0), ZoneStyle.rgb(zone: 1))
+        XCTAssertEqual(Set((1...6).map { ZoneStyle.rgb(zone: $0) }).count, 6)
+    }
+
+    func testZoneNumberComesFromLabelThenPosition() throws {
+        XCTAssertEqual(ZoneStyle.zoneNumber(label: "Z3", index: 0), 3)
+        XCTAssertEqual(ZoneStyle.zoneNumber(label: "Z6", index: 1), 6)
+        XCTAssertEqual(ZoneStyle.zoneNumber(label: "Recovery", index: 1), 2)
+        XCTAssertEqual(ZoneStyle.zoneNumber(label: nil, index: 4), 5)
+
+        let zones: JSONValue = .object([
+            "heart_rate": .object(["zones": .array([
+                .object(["label": .string("Z1"), "seconds": .number(0)]),
+                .object(["label": .string("Z2"), "seconds": .number(60), "percent": .number(25)]),
+                .object(["seconds": .number(180), "percent": .number(75)])
+            ])])
+        ])
+        let rows = try XCTUnwrap(ZoneGroup.extract(from: zones).first?.rows)
+        // The dropped zero-time Z1 must not shift the zones behind it.
+        XCTAssertEqual(rows.map(\.zone), [2, 3])
+    }
+
+    func testZoneBarFractionClampsAndTreatsMissingAsZero() {
+        XCTAssertEqual(ZoneStyle.barFraction(percent: 45), 0.45, accuracy: 1e-9)
+        XCTAssertEqual(ZoneStyle.barFraction(percent: 100), 1)
+        XCTAssertEqual(ZoneStyle.barFraction(percent: 0), 0)
+        XCTAssertEqual(ZoneStyle.barFraction(percent: 140), 1)
+        XCTAssertEqual(ZoneStyle.barFraction(percent: -5), 0)
+        XCTAssertEqual(ZoneStyle.barFraction(percent: nil), 0)
+        XCTAssertEqual(ZoneStyle.barFraction(percent: .nan), 0)
+        XCTAssertEqual(ZoneStyle.barFraction(percent: .infinity), 0)
+    }
+
     func testStreamsDropGapsAndUseTimeChannelWhenPresent() {
         let channels = ActivityStreams.Channels(
             time: nil, power: [0, nil, .infinity],

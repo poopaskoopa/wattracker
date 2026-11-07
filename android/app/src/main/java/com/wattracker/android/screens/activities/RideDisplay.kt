@@ -152,12 +152,54 @@ object ZoneFormatting {
     }
 }
 
+/**
+ * Zone-row colour and bar width. Power has Z1-Z6, heart rate Z1-Z5; both
+ * share the Z1-Z5 hues. Anything past Z6 clamps to Z6's dark red.
+ * Mirrors the iOS `ZoneStyle` in `ActivitiesModel.swift`.
+ */
+object ZoneStyle {
+    /** Fill opacity of the bar behind a zone row, low enough that the row's
+     * text stays readable over it. */
+    const val BAR_ALPHA = 0.22f
+
+    /** The number in a "Z<n>" label; the row's position (index + 1) when the
+     * label is missing or carries no number. */
+    fun zoneNumber(label: String?, index: Int): Int {
+        val digits = (label ?: "").dropWhile { !it.isDigit() }.takeWhile { it.isDigit() }
+        val parsed = digits.toIntOrNull()
+        if (parsed != null && parsed > 0) return parsed
+        return max(1, index + 1)
+    }
+
+    /** 0xRRGGBB for a zone: gray, blue, green, orange, red, dark red. Gray,
+     * green and red are the palette's `muted`, `ok` and `alert`. */
+    fun rgb(zone: Int): Int = when {
+        zone <= 1 -> 0x8a94a0
+        zone == 2 -> 0x4a90d9
+        zone == 3 -> 0x4caf7d
+        zone == 4 -> 0xf08c2e
+        zone == 5 -> 0xe05252
+        else -> 0xa82828
+    }
+
+    fun color(zone: Int): Color = Color(rgb(zone).toLong() or 0xFF000000L)
+
+    /** A zone's percent as the bar's fraction of the row width, clamped to
+     * 0..1; a null or non-finite percent draws no bar. */
+    fun barFraction(percent: Double?): Float {
+        if (percent == null || !percent.isFinite()) return 0f
+        return (percent / 100).coerceIn(0.0, 1.0).toFloat()
+    }
+}
+
 data class ZoneRow(
     val id: String,
     val label: String,
     val seconds: Double,
     val percent: Double,
     val duration: String?,
+    /** 1-based zone number, from the label ("Z3") or else the row's position. */
+    val zone: Int = ZoneStyle.zoneNumber(label, 0),
 ) {
     /** The server's string when published, the local formatter otherwise. */
     val durationText: String
@@ -194,6 +236,7 @@ data class ZoneGroup(
                             seconds = seconds,
                             percent = row.optDouble("percent") ?: 0.0,
                             duration = row.optString("duration"),
+                            zone = ZoneStyle.zoneNumber(row.optString("label"), index),
                         )
                     }
                     if (rows.isEmpty()) return@mapNotNull null
