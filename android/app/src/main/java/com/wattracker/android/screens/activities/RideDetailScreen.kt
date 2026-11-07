@@ -339,7 +339,7 @@ private fun ZoneSection(zones: JsonValue?) {
                     style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
                 )
                 group.rows.forEach { row ->
-                    val zoneColor = ZoneStyle.color(row.zone)
+                    val barColor = ZoneStyle.barColor(row.zone)
                     val fraction = ZoneStyle.barFraction(row.percent)
                     Row(
                         modifier = Modifier
@@ -349,7 +349,7 @@ private fun ZoneSection(zones: JsonValue?) {
                             .drawBehind {
                                 val barWidth = size.width * fraction
                                 drawRoundRect(
-                                    color = zoneColor.copy(alpha = ZoneStyle.BAR_ALPHA),
+                                    color = barColor.copy(alpha = ZoneStyle.BAR_ALPHA),
                                     topLeft = Offset(size.width - barWidth, 0f),
                                     size = Size(barWidth, size.height),
                                     cornerRadius = CornerRadius(3.dp.toPx()),
@@ -360,7 +360,11 @@ private fun ZoneSection(zones: JsonValue?) {
                     ) {
                         Text(
                             text = row.label,
-                            style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = zoneColor),
+                            style = TextStyle(
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = ZoneStyle.labelColor(row.zone),
+                            ),
                         )
                         Spacer(modifier = Modifier.weight(1f))
                         Text(

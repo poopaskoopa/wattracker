@@ -65,15 +65,57 @@ final class RideDisplayTests: XCTestCase {
     }
 
     func testZoneColorsByNumberAndClampPastZ6() {
-        XCTAssertEqual(ZoneStyle.rgb(zone: 1), 0x8a94a0)  // gray (Palette.muted)
-        XCTAssertEqual(ZoneStyle.rgb(zone: 2), 0x4a90d9)  // blue
-        XCTAssertEqual(ZoneStyle.rgb(zone: 3), 0x4caf7d)  // green (Palette.ok)
-        XCTAssertEqual(ZoneStyle.rgb(zone: 4), 0xf08c2e)  // orange
-        XCTAssertEqual(ZoneStyle.rgb(zone: 5), 0xe05252)  // red (Palette.alert)
-        XCTAssertEqual(ZoneStyle.rgb(zone: 6), 0xa82828)  // dark red
-        XCTAssertEqual(ZoneStyle.rgb(zone: 7), ZoneStyle.rgb(zone: 6))
-        XCTAssertEqual(ZoneStyle.rgb(zone: 0), ZoneStyle.rgb(zone: 1))
-        XCTAssertEqual(Set((1...6).map { ZoneStyle.rgb(zone: $0) }).count, 6)
+        XCTAssertEqual(ZoneStyle.barRgb(zone: 1), 0x8a94a0)  // gray (Palette.muted)
+        XCTAssertEqual(ZoneStyle.barRgb(zone: 2), 0x4a90d9)  // blue
+        XCTAssertEqual(ZoneStyle.barRgb(zone: 3), 0x4caf7d)  // green (Palette.ok)
+        XCTAssertEqual(ZoneStyle.barRgb(zone: 4), 0xf08c2e)  // orange
+        XCTAssertEqual(ZoneStyle.barRgb(zone: 5), 0xe05252)  // red (Palette.alert)
+        XCTAssertEqual(ZoneStyle.barRgb(zone: 6), 0xa82828)  // dark red
+        XCTAssertEqual(ZoneStyle.barRgb(zone: 7), ZoneStyle.barRgb(zone: 6))
+        XCTAssertEqual(ZoneStyle.barRgb(zone: 0), ZoneStyle.barRgb(zone: 1))
+        XCTAssertEqual(Set((1...6).map { ZoneStyle.barRgb(zone: $0) }).count, 6)
+
+        XCTAssertEqual(ZoneStyle.labelRgb(zone: 6), 0xff7a8a)  // bright rose red
+        XCTAssertEqual(ZoneStyle.labelRgb(zone: 7), ZoneStyle.labelRgb(zone: 6))
+        XCTAssertEqual(ZoneStyle.labelRgb(zone: 0), ZoneStyle.labelRgb(zone: 1))
+        XCTAssertEqual(Set((1...6).map { ZoneStyle.labelRgb(zone: $0) }).count, 6)
+        // The Z6+ label must not be the dark-red bar fill (2.34:1 on the panel).
+        XCTAssertNotEqual(ZoneStyle.labelRgb(zone: 6), ZoneStyle.barRgb(zone: 6))
+        XCTAssertNotEqual(ZoneStyle.labelRgb(zone: 7), ZoneStyle.barRgb(zone: 7))
+    }
+
+    /// WCAG 2.x: every label clears 4.5:1 on `Palette.panel` and on its own
+    /// bar's tint composited over the panel (a 100% bar sits behind the label).
+    func testZoneLabelsMeetContrastOnPanelAndBarTint() {
+        let panel: UInt32 = 0x1a2028
+        func channel(_ value: UInt32, _ shift: UInt32) -> Double { Double((value >> shift) & 0xff) }
+        func luminance(_ rgb: UInt32) -> Double {
+            func linear(_ c: Double) -> Double {
+                let s = c / 255
+                return s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * linear(channel(rgb, 16)) + 0.7152 * linear(channel(rgb, 8))
+                + 0.0722 * linear(channel(rgb, 0))
+        }
+        func over(_ fg: UInt32, _ bg: UInt32, alpha: Double) -> UInt32 {
+            [16, 8, 0].reduce(UInt32(0)) { out, shift in
+                let mixed = channel(fg, UInt32(shift)) * alpha
+                    + channel(bg, UInt32(shift)) * (1 - alpha)
+                return out | (UInt32(mixed.rounded()) << UInt32(shift))
+            }
+        }
+        func contrast(_ a: UInt32, _ b: UInt32) -> Double {
+            let (la, lb) = (luminance(a), luminance(b))
+            return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+        }
+
+        XCTAssertEqual(contrast(0xa82828, panel), 2.34, accuracy: 0.01)  // the review finding
+        for zone in 1...7 {
+            let label = ZoneStyle.labelRgb(zone: zone)
+            let tint = over(ZoneStyle.barRgb(zone: zone), panel, alpha: ZoneStyle.barOpacity)
+            XCTAssertGreaterThanOrEqual(contrast(label, panel), 4.5, "Z\(zone) on panel")
+            XCTAssertGreaterThanOrEqual(contrast(label, tint), 4.5, "Z\(zone) on its bar")
+        }
     }
 
     func testZoneNumberComesFromLabelThenPosition() throws {
