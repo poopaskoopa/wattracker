@@ -149,6 +149,23 @@ final class SessionGateTests: XCTestCase {
         }
     }
 
+    private actor GatedPairedStateReader {
+        let gate = RequestGate()
+        private var blocksNextRead = false
+
+        func blockNextRead() {
+            blocksNextRead = true
+        }
+
+        func read(_ session: any ReadSession) async -> CloudSession.DeviceState {
+            if blocksNextRead {
+                blocksNextRead = false
+                await gate.wait()
+            }
+            return await session.deviceState
+        }
+    }
+
     private final class StaggeredLocalProbeTransport: LocalTransport, @unchecked Sendable {
         let firstProbeGate = RequestGate()
         let secondProbeGate = RequestGate()
@@ -967,7 +984,7 @@ final class SessionGateTests: XCTestCase {
         XCTAssertNil(preference.backend)
     }
 
-    func testCancelAfterFallbackRevocationReevaluatesToRemovedCloud() async {
+    func testStaleCancelAfterFallbackRevocationLeavesManualPairing() async {
         let clock = TestClock()
         let preference = MemoryPreferenceStore()
         let cloud = harness(paired: true, clock: clock) { _, _ in
@@ -998,13 +1015,16 @@ final class SessionGateTests: XCTestCase {
         XCTAssertNil(gate.pairedFallback)
         XCTAssertFalse(gate.canCancelPairing)
 
-        // Exercise a tap that raced the update which hid the button.
+        // Exercise a tap that raced the update which hid the button. The
+        // selected local pairing flow stays visible, with Cancel gone.
         await gate.cancelPairing()
 
-        XCTAssertEqual(gate.phase, .removed)
-        XCTAssertEqual(gate.backend, .cloud)
-        XCTAssertEqual(gate.selection, .automatic)
-        XCTAssertNil(preference.backend)
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(gate.selection, .local)
+        XCTAssertNil(gate.pairedFallback)
+        XCTAssertFalse(gate.canCancelPairing)
+        XCTAssertEqual(preference.backend, .local)
     }
 
     func testCancelRechecksFallbackIfCloudIsRemovedBeforeGateRefresh() async {
@@ -1045,7 +1065,7 @@ final class SessionGateTests: XCTestCase {
         XCTAssertNil(preference.backend)
     }
 
-    func testAutomaticPairingWithPairedFallbackDoesNotOfferCancel() async {
+    func testAutomaticPairingWithPairedFallbackCanCancelToFallback() async {
         let clock = TestClock()
         let preference = MemoryPreferenceStore()
         let cloud = harness(paired: true, clock: clock) { _, _ in
@@ -1072,16 +1092,22 @@ final class SessionGateTests: XCTestCase {
         await gate.start()
         await gate.automaticReevaluate()
         XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.phase, .paired)
         XCTAssertEqual(gate.selection, .automatic)
+        let localState = await local.deviceState
+        XCTAssertEqual(localState, .paired)
 
-        // Keep Cloud selected for the pairing screen without writing a
-        // Settings override. The owner is handling this route separately.
-        await gate.selectBackend(.cloud)
-        await gate.probe()
+        // Revoke cloud during a screen load, then refresh only the gate's
+        // phase. Automatic selection must not run before Pair again is tapped.
+        _ = try? await cloud.session.readerContext()
         clock.advance(400)
-        await gate.probe()
+        _ = try? await cloud.session.readerContext()
         let revokedState = await cloud.session.deviceState
         XCTAssertEqual(revokedState, .removed)
+        await gate.refresh()
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.phase, .removed)
+        XCTAssertEqual(gate.selection, .automatic)
 
         await gate.startOver()
 
@@ -1089,7 +1115,167 @@ final class SessionGateTests: XCTestCase {
         XCTAssertEqual(gate.backend, .cloud)
         XCTAssertEqual(gate.selection, .automatic)
         XCTAssertEqual(gate.pairedFallback, .local)
+        XCTAssertTrue(gate.canCancelPairing)
+        XCTAssertNil(preference.backend)
+
+        await gate.cancelPairing()
+
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertNil(gate.pairedFallback)
+        XCTAssertNil(preference.backend)
+
+        await gate.automaticReevaluate()
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertNil(preference.backend)
+    }
+
+    func testAutomaticCancelRechecksFallbackRevokedBeforeTap() async {
+        let clock = TestClock()
+        let preference = MemoryPreferenceStore()
+        let cloud = harness(paired: true, clock: clock) { _, _ in
+            .refused(404, serverDate: clock.now)
+        }
+        let localTransport = LocalProbeTransport()
+        localTransport.setReachable(false)
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!, token: value.token,
+                    transport: localTransport
+                )
+            }
+        )
+        let stateReader = GatedStateReader()
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference, pathMonitor: FakePathMonitor(),
+            stateReader: { session in await stateReader.read(session) }
+        )
+
+        await gate.start()
+        await gate.automaticReevaluate()
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertEqual(gate.selection, .automatic)
+        let localStateAfterStart = await local.deviceState
+        XCTAssertEqual(localStateAfterStart, .paired)
+
+        // Revoke CloudSession while the screen is loading, then refresh its
+        // state without running automatic backend selection. This leaves the
+        // issue's exact state: cloud selected, removed, local still paired.
+        _ = try? await cloud.session.readerContext()
+        clock.advance(400)
+        _ = try? await cloud.session.readerContext()
+        let revokedState = await cloud.session.deviceState
+        XCTAssertEqual(revokedState, .removed)
+        await gate.refresh()
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.phase, .removed)
+        XCTAssertEqual(gate.selection, .automatic)
+        let localStateAfterRefresh = await local.deviceState
+        XCTAssertEqual(localStateAfterRefresh, .paired)
+
+        await gate.startOver()
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertEqual(gate.pairedFallback, .local)
+        XCTAssertTrue(gate.canCancelPairing)
+        XCTAssertNil(preference.backend)
+
+        // Revoke the stale fallback after Cancel becomes visible but before
+        // the rider taps it. Re-evaluation returns to cloud pairing.
+        await local.signOut()
+        XCTAssertTrue(gate.canCancelPairing)
+
+        await stateReader.blockNextRead()
+        let cancellation = Task { await gate.cancelPairing() }
+        guard await stateReader.gate.waitForArrival(timeout: 1) else {
+            return XCTFail("automatic refresh did not reach its gated state read")
+        }
+        XCTAssertNil(gate.pairedFallback)
+        await stateReader.gate.openGate()
+        await cancellation.value
+
+        XCTAssertNil(gate.pairedFallback)
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
         XCTAssertFalse(gate.canCancelPairing)
+        XCTAssertNil(preference.backend)
+    }
+
+    func testCancelPairingDoesNotOverrideSelectionChangedDuringFallbackCheck() async {
+        let clock = TestClock()
+        let preference = MemoryPreferenceStore()
+        let cloud = harness(paired: true, clock: clock) { _, _ in
+            .refused(404, serverDate: clock.now)
+        }
+        let localTransport = LocalProbeTransport()
+        localTransport.setReachable(false)
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!, token: value.token,
+                    transport: localTransport
+                )
+            }
+        )
+        let pairedStateReader = GatedPairedStateReader()
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference, pathMonitor: FakePathMonitor(),
+            pairedStateReader: { session in await pairedStateReader.read(session) }
+        )
+
+        await gate.start()
+        await gate.automaticReevaluate()
+        _ = try? await cloud.session.readerContext()
+        clock.advance(400)
+        _ = try? await cloud.session.readerContext()
+        await gate.refresh()
+        await gate.startOver()
+
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.pairedFallback, .local)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertTrue(gate.canCancelPairing)
+        XCTAssertNil(preference.backend)
+
+        await pairedStateReader.blockNextRead()
+        let cancellation = Task { await gate.cancelPairing() }
+        guard await pairedStateReader.gate.waitForArrival(timeout: 1) else {
+            return XCTFail("cancel did not reach its fallback liveness check")
+        }
+
+        await gate.selectBackend(.cloud)
+        await pairedStateReader.gate.openGate()
+        await cancellation.value
+
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.pairedFallback, .local)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertTrue(gate.canCancelPairing)
+        XCTAssertNil(preference.backend)
+
+        // The temporary pairing selection remains in force across a later
+        // automatic reevaluation.
+        await gate.automaticReevaluate()
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertTrue(gate.canCancelPairing)
         XCTAssertNil(preference.backend)
     }
 
@@ -1121,6 +1307,13 @@ final class SessionGateTests: XCTestCase {
         XCTAssertNil(gate.activeSession)
         XCTAssertEqual(gate.phase, .unpaired)
         XCTAssertEqual(gate.pairedFallback, .local)
+        XCTAssertTrue(gate.canCancelPairing)
+
+        await gate.cancelPairing()
+
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertNil(gate.pairedFallback)
         XCTAssertFalse(gate.canCancelPairing)
     }
 
