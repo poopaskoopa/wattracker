@@ -152,12 +152,75 @@ object ZoneFormatting {
     }
 }
 
+/**
+ * Zone-row colours and bar width. Power has Z1-Z6, heart rate Z1-Z5; both
+ * share the Z1-Z5 hues. Anything past Z6 clamps to Z6.
+ * Mirrors the iOS `ZoneStyle` in `ActivitiesModel.swift`.
+ *
+ * Each zone has two colours: the bar fill, drawn at [BAR_ALPHA] behind the
+ * row, and a lighter label foreground. The fills are not legible as text
+ * (Z6's dark red is 2.34:1 on `Palette.panel`), so every label colour is
+ * chosen to clear 4.5:1 against both the panel and its own bar's tint
+ * composited over the panel -- at 100% the whole row sits on the tint.
+ */
+object ZoneStyle {
+    /** Fill opacity of the bar behind a zone row, low enough that the row's
+     * text stays readable over it. */
+    const val BAR_ALPHA = 0.22f
+
+    /** The number in a "Z<n>" label; the row's position (index + 1) when the
+     * label is missing or carries no number. */
+    fun zoneNumber(label: String?, index: Int): Int {
+        val digits = (label ?: "").dropWhile { !it.isDigit() }.takeWhile { it.isDigit() }
+        val parsed = digits.toIntOrNull()
+        if (parsed != null && parsed > 0) return parsed
+        return max(1, index + 1)
+    }
+
+    /** 0xRRGGBB bar fill for a zone: gray, blue, green, orange, red, dark
+     * red. Gray, green and red are the palette's `muted`, `ok` and `alert`. */
+    fun barRgb(zone: Int): Int = when {
+        zone <= 1 -> 0x8a94a0
+        zone == 2 -> 0x4a90d9
+        zone == 3 -> 0x4caf7d
+        zone == 4 -> 0xf08c2e
+        zone == 5 -> 0xe05252
+        else -> 0xa82828
+    }
+
+    /** 0xRRGGBB label foreground for a zone: a lighter tone of its bar hue,
+     * Z6+ a bright rose red rather than the bar's dark red. */
+    fun labelRgb(zone: Int): Int = when {
+        zone <= 1 -> 0xa8b1bc
+        zone == 2 -> 0x7ab4f0
+        zone == 3 -> 0x6cc898
+        zone == 4 -> 0xf5a35a
+        zone == 5 -> 0xf78b7b
+        else -> 0xff7a8a
+    }
+
+    fun barColor(zone: Int): Color = opaque(barRgb(zone))
+
+    fun labelColor(zone: Int): Color = opaque(labelRgb(zone))
+
+    private fun opaque(rgb: Int): Color = Color(rgb.toLong() or 0xFF000000L)
+
+    /** A zone's percent as the bar's fraction of the row width, clamped to
+     * 0..1; a null or non-finite percent draws no bar. */
+    fun barFraction(percent: Double?): Float {
+        if (percent == null || !percent.isFinite()) return 0f
+        return (percent / 100).coerceIn(0.0, 1.0).toFloat()
+    }
+}
+
 data class ZoneRow(
     val id: String,
     val label: String,
     val seconds: Double,
     val percent: Double,
     val duration: String?,
+    /** 1-based zone number, from the label ("Z3") or else the row's position. */
+    val zone: Int = ZoneStyle.zoneNumber(label, 0),
 ) {
     /** The server's string when published, the local formatter otherwise. */
     val durationText: String
@@ -194,6 +257,7 @@ data class ZoneGroup(
                             seconds = seconds,
                             percent = row.optDouble("percent") ?: 0.0,
                             duration = row.optString("duration"),
+                            zone = ZoneStyle.zoneNumber(row.optString("label"), index),
                         )
                     }
                     if (rows.isEmpty()) return@mapNotNull null

@@ -317,7 +317,8 @@ struct ZoneGroup: Identifiable {
                     label: value["label"]?.stringValue ?? "Z\(index + 1)",
                     seconds: seconds,
                     percent: value["percent"]?.doubleValue ?? 0,
-                    duration: value["duration"]?.stringValue
+                    duration: value["duration"]?.stringValue,
+                    zone: ZoneStyle.zoneNumber(label: value["label"]?.stringValue, index: index)
                 )
             }
             return rows.isEmpty ? nil : ZoneGroup(id: key, title: title, rows: rows)
@@ -331,13 +332,17 @@ struct ZoneRow: Identifiable {
     let seconds: Double
     let percent: Double
     let duration: String?
+    /// 1-based zone number, from the label ("Z3") or else the row's position.
+    let zone: Int
 
-    init(id: String, label: String, seconds: Double, percent: Double, duration: String? = nil) {
+    init(id: String, label: String, seconds: Double, percent: Double, duration: String? = nil,
+         zone: Int? = nil) {
         self.id = id
         self.label = label
         self.seconds = seconds
         self.percent = percent
         self.duration = duration
+        self.zone = zone ?? ZoneStyle.zoneNumber(label: label, index: 0)
     }
 
     var durationText: String { duration ?? ZoneFormatting.duration(seconds) }
@@ -351,6 +356,65 @@ enum ZoneFormatting {
         let minutes = (total % 3_600) / 60, remainder = total % 60
         return hours > 0 ? String(format: "%d:%02d:%02d", hours, minutes, remainder)
             : String(format: "%d:%02d", minutes, remainder)
+    }
+}
+
+/// Zone-row colours and bar width. Power has Z1-Z6, heart rate Z1-Z5; both
+/// share the Z1-Z5 hues. Anything past Z6 clamps to Z6.
+/// Mirrors Android `ZoneStyle` in `RideDisplay.kt`.
+///
+/// Each zone has two colours: the bar fill, drawn at `barOpacity` behind the
+/// row, and a lighter label foreground. The fills are not legible as text
+/// (Z6's dark red is 2.34:1 on `Palette.panel`), so every label colour is
+/// chosen to clear 4.5:1 against both the panel and its own bar's tint
+/// composited over the panel -- at 100% the whole row sits on the tint.
+enum ZoneStyle {
+    /// Fill opacity of the bar behind a zone row, low enough that the row's
+    /// text stays readable over it.
+    static let barOpacity = 0.22
+
+    /// The number in a "Z<n>" label; the row's position (index + 1) when the
+    /// label is missing or carries no number.
+    static func zoneNumber(label: String?, index: Int) -> Int {
+        let digits = (label ?? "").drop { !$0.isNumber }.prefix { $0.isNumber }
+        if let parsed = Int(digits), parsed > 0 { return parsed }
+        return max(1, index + 1)
+    }
+
+    /// 0xRRGGBB bar fill for a zone: gray, blue, green, orange, red, dark
+    /// red. Gray, green and red are the palette's `muted`, `ok` and `alert`.
+    static func barRgb(zone: Int) -> UInt32 {
+        switch zone {
+        case ...1: return 0x8a94a0
+        case 2: return 0x4a90d9
+        case 3: return 0x4caf7d
+        case 4: return 0xf08c2e
+        case 5: return 0xe05252
+        default: return 0xa82828
+        }
+    }
+
+    /// 0xRRGGBB label foreground for a zone: a lighter tone of its bar hue,
+    /// Z6+ a bright rose red rather than the bar's dark red.
+    static func labelRgb(zone: Int) -> UInt32 {
+        switch zone {
+        case ...1: return 0xa8b1bc
+        case 2: return 0x7ab4f0
+        case 3: return 0x6cc898
+        case 4: return 0xf5a35a
+        case 5: return 0xf78b7b
+        default: return 0xff7a8a
+        }
+    }
+
+    static func barColor(zone: Int) -> Color { Palette.hex(barRgb(zone: zone)) }
+    static func labelColor(zone: Int) -> Color { Palette.hex(labelRgb(zone: zone)) }
+
+    /// A zone's percent as the bar's fraction of the row width, clamped to
+    /// 0...1; a nil or non-finite percent draws no bar.
+    static func barFraction(percent: Double?) -> Double {
+        guard let percent, percent.isFinite else { return 0 }
+        return min(max(percent / 100, 0), 1)
     }
 }
 

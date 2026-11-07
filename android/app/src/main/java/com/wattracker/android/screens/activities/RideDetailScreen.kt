@@ -31,6 +31,10 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
@@ -335,13 +339,32 @@ private fun ZoneSection(zones: JsonValue?) {
                     style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
                 )
                 group.rows.forEach { row ->
+                    val barColor = ZoneStyle.barColor(row.zone)
+                    val fraction = ZoneStyle.barFraction(row.percent)
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            // Time-in-zone bar: anchored at the right edge
+                            // (0%), growing left to full width at 100%.
+                            .drawBehind {
+                                val barWidth = size.width * fraction
+                                drawRoundRect(
+                                    color = barColor.copy(alpha = ZoneStyle.BAR_ALPHA),
+                                    topLeft = Offset(size.width - barWidth, 0f),
+                                    size = Size(barWidth, size.height),
+                                    cornerRadius = CornerRadius(3.dp.toPx()),
+                                )
+                            }
+                            .padding(horizontal = 4.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
                             text = row.label,
-                            style = TextStyle(fontSize = 14.sp, color = Palette.text),
+                            style = TextStyle(
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = ZoneStyle.labelColor(row.zone),
+                            ),
                         )
                         Spacer(modifier = Modifier.weight(1f))
                         Text(

@@ -433,8 +433,10 @@ private struct ZoneSection: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(group.title).font(.headline).foregroundStyle(Palette.textBright)
                     ForEach(group.rows) { row in
+                        let barColor = ZoneStyle.barColor(zone: row.zone)
                         HStack {
-                            Text(row.label).foregroundStyle(Palette.text)
+                            Text(row.label).fontWeight(.semibold)
+                                .foregroundStyle(ZoneStyle.labelColor(zone: row.zone))
                             Spacer()
                             Text(row.durationText)
                                 .monospacedDigit().foregroundStyle(Palette.muted)
@@ -443,6 +445,20 @@ private struct ZoneSection: View {
                                 .foregroundStyle(Palette.text)
                         }
                         .font(.callout)
+                        .padding(.vertical, 3)
+                        .padding(.horizontal, 4)
+                        // Time-in-zone bar: anchored at the right edge (0%),
+                        // growing left to the row's full width at 100%.
+                        .background(alignment: .trailing) {
+                            GeometryReader { geo in
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(barColor.opacity(ZoneStyle.barOpacity))
+                                    .frame(width: geo.size.width
+                                           * ZoneStyle.barFraction(percent: row.percent))
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity,
+                                           alignment: .trailing)
+                            }
+                        }
                     }
                 }
             }

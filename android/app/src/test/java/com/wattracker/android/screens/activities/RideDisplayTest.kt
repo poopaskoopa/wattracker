@@ -9,6 +9,7 @@ import com.wattracker.android.json.JsonValue
 import com.wattracker.android.ui.theme.Palette
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -169,6 +170,96 @@ class RideDisplayTest {
         assertEquals(listOf(600.0), groups[1].rows.map { it.seconds })
         assertEquals(listOf("Z1"), groups[1].rows.map { it.label })
         assertTrue(ZoneGroup.extract(null).isEmpty())
+    }
+
+    @Test
+    fun zoneColorsByNumberAndClampPastZ6() {
+        assertEquals(0x8a94a0, ZoneStyle.barRgb(1)) // gray (Palette.muted)
+        assertEquals(0x4a90d9, ZoneStyle.barRgb(2)) // blue
+        assertEquals(0x4caf7d, ZoneStyle.barRgb(3)) // green (Palette.ok)
+        assertEquals(0xf08c2e, ZoneStyle.barRgb(4)) // orange
+        assertEquals(0xe05252, ZoneStyle.barRgb(5)) // red (Palette.alert)
+        assertEquals(0xa82828, ZoneStyle.barRgb(6)) // dark red
+        assertEquals(ZoneStyle.barRgb(6), ZoneStyle.barRgb(7))
+        assertEquals(ZoneStyle.barRgb(1), ZoneStyle.barRgb(0))
+        assertEquals(6, (1..6).map { ZoneStyle.barRgb(it) }.toSet().size)
+        assertEquals(Palette.muted, ZoneStyle.barColor(1))
+        assertEquals(Palette.ok, ZoneStyle.barColor(3))
+        assertEquals(Palette.alert, ZoneStyle.barColor(5))
+
+        assertEquals(0xff7a8a, ZoneStyle.labelRgb(6)) // bright rose red
+        assertEquals(ZoneStyle.labelRgb(6), ZoneStyle.labelRgb(7))
+        assertEquals(ZoneStyle.labelRgb(1), ZoneStyle.labelRgb(0))
+        assertEquals(6, (1..6).map { ZoneStyle.labelRgb(it) }.toSet().size)
+        // The Z6+ label must not be the dark-red bar fill (2.34:1 on the panel).
+        assertNotEquals(ZoneStyle.barRgb(6), ZoneStyle.labelRgb(6))
+        assertNotEquals(ZoneStyle.barRgb(7), ZoneStyle.labelRgb(7))
+        assertNotEquals(ZoneStyle.barColor(6), ZoneStyle.labelColor(6))
+    }
+
+    /** WCAG 2.x: every label clears 4.5:1 on `Palette.panel` and on its own
+     * bar's tint composited over the panel (a 100% bar sits behind the label). */
+    @Test
+    fun zoneLabelsMeetContrastOnPanelAndBarTint() {
+        val panel = 0x1a2028
+        fun channel(rgb: Int, shift: Int): Double = ((rgb shr shift) and 0xff).toDouble()
+        fun luminance(rgb: Int): Double {
+            fun linear(c: Double): Double {
+                val s = c / 255
+                return if (s <= 0.04045) s / 12.92 else Math.pow((s + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * linear(channel(rgb, 16)) + 0.7152 * linear(channel(rgb, 8)) +
+                0.0722 * linear(channel(rgb, 0))
+        }
+        fun over(fg: Int, bg: Int, alpha: Double): Int = listOf(16, 8, 0).fold(0) { out, shift ->
+            val mixed = channel(fg, shift) * alpha + channel(bg, shift) * (1 - alpha)
+            out or (Math.round(mixed).toInt() shl shift)
+        }
+        fun contrast(a: Int, b: Int): Double {
+            val la = luminance(a)
+            val lb = luminance(b)
+            return (maxOf(la, lb) + 0.05) / (minOf(la, lb) + 0.05)
+        }
+
+        assertEquals(2.34, contrast(0xa82828, panel), 0.01) // the review finding
+        for (zone in 1..7) {
+            val label = ZoneStyle.labelRgb(zone)
+            val tint = over(ZoneStyle.barRgb(zone), panel, ZoneStyle.BAR_ALPHA.toDouble())
+            assertTrue("Z$zone on panel", contrast(label, panel) >= 4.5)
+            assertTrue("Z$zone on its bar", contrast(label, tint) >= 4.5)
+        }
+    }
+
+    @Test
+    fun zoneNumberComesFromLabelThenPosition() {
+        assertEquals(3, ZoneStyle.zoneNumber("Z3", 0))
+        assertEquals(6, ZoneStyle.zoneNumber("Z6", 1))
+        assertEquals(2, ZoneStyle.zoneNumber("Recovery", 1))
+        assertEquals(5, ZoneStyle.zoneNumber(null, 4))
+
+        val zones = JsonValue.parse(
+            """{"heart_rate":{"zones":[
+                {"label":"Z1","seconds":0},
+                {"label":"Z2","seconds":60,"percent":25},
+                {"seconds":180,"percent":75}
+            ]}}""",
+        )
+        val rows = ZoneGroup.extract(zones).firstOrNull()?.rows
+            ?: throw AssertionError("expected the heart-rate group")
+        // The dropped zero-time Z1 must not shift the zones behind it.
+        assertEquals(listOf(2, 3), rows.map { it.zone })
+    }
+
+    @Test
+    fun zoneBarFractionClampsAndTreatsMissingAsZero() {
+        assertEquals(0.45f, ZoneStyle.barFraction(45.0), 1e-6f)
+        assertEquals(1f, ZoneStyle.barFraction(100.0), 0f)
+        assertEquals(0f, ZoneStyle.barFraction(0.0), 0f)
+        assertEquals(1f, ZoneStyle.barFraction(140.0), 0f)
+        assertEquals(0f, ZoneStyle.barFraction(-5.0), 0f)
+        assertEquals(0f, ZoneStyle.barFraction(null), 0f)
+        assertEquals(0f, ZoneStyle.barFraction(Double.NaN), 0f)
+        assertEquals(0f, ZoneStyle.barFraction(Double.POSITIVE_INFINITY), 0f)
     }
 
     // MARK: - Stream series
