@@ -109,10 +109,17 @@ final class SessionGate {
     }
 
     /// Reads a backend's state for `refresh`. Tests can suspend this seam to
-    /// force a backend switch across the actor awaits.
+    /// force a backend switch across the refresh actor awaits.
     typealias StateReader = @Sendable (
         any ReadSession
     ) async -> (CloudSession.DeviceState, Date?)
+
+    /// Reads only the paired-state check used before leaving the pairing flow.
+    /// Kept separate so tests can suspend that liveness read without changing
+    /// refresh's state-reader contract.
+    typealias PairedStateReader = @Sendable (
+        any ReadSession
+    ) async -> CloudSession.DeviceState
 
     struct KeychainPreferenceStore: PreferenceStore, Sendable {
         private let service: String
@@ -188,6 +195,7 @@ final class SessionGate {
     private let makeSession: @Sendable () throws -> CloudSession
     private let makeLocalSession: @Sendable () throws -> LocalSession
     private let stateReader: StateReader
+    private let pairedStateReader: PairedStateReader
     private let preferences: PreferenceStore
     private let pathMonitor: SessionPathMonitor
     private var manualOverride: Backend?
@@ -218,11 +226,15 @@ final class SessionGate {
         pathMonitor: SessionPathMonitor = SystemSessionPathMonitor(),
         stateReader: @escaping StateReader = { session in
             (await session.deviceState, await session.lastSuccess)
+        },
+        pairedStateReader: @escaping PairedStateReader = { session in
+            await session.deviceState
         }
     ) {
         self.makeSession = makeSession
         self.makeLocalSession = makeLocalSession
         self.stateReader = stateReader
+        self.pairedStateReader = pairedStateReader
         self.preferences = preferences
         self.pathMonitor = pathMonitor
         let storedBackend = preferences.loadBackendOverride()
@@ -467,9 +479,11 @@ final class SessionGate {
         guard let backend else { return false }
         switch backend {
         case .cloud:
-            return await session?.deviceState == .paired
+            guard let session else { return false }
+            return await pairedStateReader(session) == .paired
         case .local:
-            return await localSession?.deviceState == .paired
+            guard let localSession else { return false }
+            return await pairedStateReader(localSession) == .paired
         }
     }
 
