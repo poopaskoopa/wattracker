@@ -72,6 +72,7 @@ struct RootView: View {
                 .listRowBackground(Palette.bg)
             }
             .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 240)
             .scrollContentBackground(.hidden)
             .background(Palette.bg)
             .navigationTitle("wattracker")
