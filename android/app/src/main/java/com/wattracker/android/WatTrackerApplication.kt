@@ -5,6 +5,8 @@ import android.content.Context
 import androidx.room.Room
 import com.wattracker.android.cache.RoomSnapshotCache
 import com.wattracker.android.cache.WatTrackerDatabase
+import com.wattracker.android.cloud.BackendObservation
+import com.wattracker.android.cloud.BackendSelection
 import com.wattracker.android.cloud.CloudApiResult
 import com.wattracker.android.cloud.CloudClient
 import com.wattracker.android.cloud.CloudDevice
@@ -20,6 +22,10 @@ import com.wattracker.android.cloud.LocalCredentials
 import com.wattracker.android.cloud.ReadModel
 import com.wattracker.android.cloud.RemoveDeviceResult
 import com.wattracker.android.cloud.SharedPreferencesRemovalGate
+import com.wattracker.android.cloud.keepOverride
+import com.wattracker.android.cloud.observeCloudBackend
+import com.wattracker.android.cloud.observeLocalBackend
+import com.wattracker.android.cloud.resolveBackend
 import com.wattracker.android.cloud.StoreHealth
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -67,8 +73,16 @@ object WatTrackerApp {
     @Volatile private var readModel: ReadModel? = null
     @Volatile private var deviceKey: DeviceKeyStore.DeviceKey? = null
     @Volatile private var credentialStore: DeviceCredentialStore? = null
+    @Volatile private var cloudFailure: Throwable? = null
+
+    private val _selectionFlow = MutableStateFlow(BackendSelection.Automatic)
+
+    /** What the rider asked for. It is not what the screens read. */
+    val selectionFlow: StateFlow<BackendSelection> = _selectionFlow.asStateFlow()
 
     private val _dataSourceFlow = MutableStateFlow(DataSource.Cloud)
+
+    /** The backend the screens are reading, resolved from [selectionFlow]. */
     val dataSourceFlow: StateFlow<DataSource> = _dataSourceFlow.asStateFlow()
 
     val isReady: Boolean
@@ -90,6 +104,21 @@ object WatTrackerApp {
     /** Where the signing key lives (StrongBox / TEE / software), for Settings. */
     val keyKind: DeviceKeyStore.KeyKind?
         get() = deviceKey?.kind
+
+    /**
+     * Why this launch has no cloud session, or null while it has one.
+     *
+     * A build failure is not a read result, so it is never thrown into a
+     * screen: [ReadModel] answers the cloud as unpaired and this is where the
+     * reason waits, so the app-level gate (A1) can tell "not paired yet" from
+     * "this device cannot be paired". It is also what B2's release refusal
+     * will report, and it must stay reportable without taking the local
+     * desktop backend down with it. Whatever shows it renders a summary of the
+     * failure, never `toString()`: the message belongs to the Keystore and the
+     * provider, not to the rider.
+     */
+    val cloudStartFailure: Throwable?
+        get() = cloudFailure
 
     /**
      * What the credential store can promise about the next launch:
@@ -121,9 +150,10 @@ object WatTrackerApp {
         return readModel ?: error("read model unavailable")
     }
 
-    suspend fun session(context: Context): CloudSession {
+    /** The cloud session, or null when this launch could not build one. */
+    suspend fun cloudSessionOrNull(context: Context): CloudSession? {
         ensureStarted(context).await()
-        return session ?: error("session unavailable")
+        return session
     }
 
     suspend fun localClient(context: Context): LocalClient {
@@ -131,26 +161,76 @@ object WatTrackerApp {
         return localClient ?: error("local client unavailable")
     }
 
-    fun setDataSource(context: Context, source: DataSource) {
-        _dataSourceFlow.value = source
+    /**
+     * Record the rider's choice and re-resolve what that means to read.
+     *
+     * `Automatic` stores nothing: clearing the preference and selecting it are
+     * the same act, so there is no stored `Automatic` to tell apart from a
+     * first run. Only an explicit backend is persisted.
+     */
+    fun setSelection(context: Context, selection: BackendSelection) {
+        _selectionFlow.value = selection
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString(KEY_DATA_SOURCE, source.name).apply()
+        if (selection.isOverride) {
+            prefs.edit().putString(KEY_BACKEND_OVERRIDE, selection.name).apply()
+        } else {
+            prefs.edit().remove(KEY_BACKEND_OVERRIDE).apply()
+        }
+        applySelection()
+    }
+
+    /**
+     * Re-resolve the backend after pairing or removal changed what is paired.
+     *
+     * An explicit override stands untouched, including when the backend it
+     * names is the one that just went away: that is the state A2's Cancel
+     * exists to get out of, and quietly moving the rider to the other backend
+     * would hide it. iOS keeps `.unpaired` and sets `pairedFallback` instead
+     * (`Shell/SessionGate.swift:434`).
+     */
+    fun refreshBackend() {
+        if (_selectionFlow.value.isOverride) return
+        applySelection()
+    }
+
+    /**
+     * Recompute the resolved backend from what is paired right now.
+     *
+     * Called from the init dispatcher, from the main thread on a Settings
+     * change, and from the IO context of a pairing or removal. Nothing here is
+     * a counter or a sequence: the value is recomputed from live fields and
+     * written whole, so the worst a race can cost is one refresh -- a write
+     * based on a pairing a moment older, immediately corrected by the next
+     * [refreshBackend]. No screen reads a torn value, because each writes one
+     * complete [DataSource] into a `StateFlow`.
+     */
+    private fun applySelection() {
+        _dataSourceFlow.value = resolveBackend(_selectionFlow.value, session?.isPaired == true, localClient?.isPaired == true)
     }
 
     suspend fun pairCloud(context: Context, code: String, label: String?) = withContext(Dispatchers.IO) {
         ensureStarted(context).await()
-        val s = session ?: error("session unavailable")
-        s.pair(code, label)
+        // NotPaired is what every screen already renders as "pair first", and it
+        // is close enough here: with no session there is nothing to pair against
+        // this launch. Why there is none is not a pairing failure -- it waits in
+        // [cloudStartFailure], and A1's gate is what refuses the attempt before a
+        // screen can offer one.
+        val s = session ?: throw CloudSession.Failure.NotPaired()
+        s.pair(code, label).also { refreshBackend() }
     }
 
     suspend fun removeCloudDevice(context: Context): RemoveDeviceResult = withContext(Dispatchers.IO) {
         ensureStarted(context).await()
-        val s = session ?: error("session unavailable")
+        // As in [pairCloud]: no session means no device to remove, and the reason
+        // belongs to [cloudStartFailure], not to this call's failure.
+        val s = session ?: throw CloudSession.Failure.NotPaired()
         try {
             s.removeDevice()
         } catch (e: CloudSession.Failure.DeviceRemoved) {
             s.signOut()
             RemoveDeviceResult.LocalFallback
+        } finally {
+            refreshBackend()
         }
     }
 
@@ -185,8 +265,11 @@ object WatTrackerApp {
         try {
             lc.authenticate(creds)
             store.saveLocal(creds)
+            refreshBackend()
             creds
         } catch (e: Exception) {
+            // A pairing that did not work persists nothing (iOS test 37):
+            // `refreshBackend` stays on the success path only.
             lc.reset()
             throw e
         }
@@ -203,6 +286,7 @@ object WatTrackerApp {
         // `CredentialStoreException`, which Settings already renders as "could
         // not save local credentials" rather than a silent success.
         store.clearLocal()
+        refreshBackend()
     }
 
     private fun ensureStarted(context: Context): CompletableDeferred<Unit> = synchronized(lock) {
@@ -224,41 +308,96 @@ object WatTrackerApp {
 
     private fun doInit(context: Context) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val savedSourceStr = prefs.getString(KEY_DATA_SOURCE, DataSource.Cloud.name)
-        val savedSource = runCatching { DataSource.valueOf(savedSourceStr!!) }.getOrDefault(DataSource.Cloud)
-        _dataSourceFlow.value = savedSource
+        cloudFailure = null
+
+        // The rider's choice, from the A2 key. `active_data_source` held a
+        // DataSource name and was the only choice ever stored; like iOS's
+        // `consumeLegacyBackend` (`SessionGate.swift:153-156`) the old value is
+        // read, deleted, and never selects a backend. No release build ever
+        // shipped the picker, so what is on disk is a developer or emulator
+        // choice -- the same class of waiver the owner accepted for #457's
+        // missing migration: drop it, and say so.
+        prefs.edit().remove(KEY_LEGACY_DATA_SOURCE).apply()
+        val storedName = prefs.getString(KEY_BACKEND_OVERRIDE, null)
+        val storedOverride = storedName?.let { name ->
+            BackendSelection.entries.firstOrNull { it.name == name && it.isOverride }
+        }
 
         val db = openDatabase(context)
         val credentials = openCredentialStore(context)
-        val key = openSigner()
-        val cloudClient = CloudClient(
-            baseScheme = BuildConfig.WATTRACKER_CLOUD_SCHEME,
-            baseAuthority = BuildConfig.WATTRACKER_CLOUD_AUTHORITY,
-            signer = key.signer,
-            transport = HttpUrlCloudTransport(),
-        )
-        val cloudSession = CloudSession(
-            client = cloudClient,
-            credentials = credentials,
-            cache = RoomSnapshotCache(db),
-            removalGate = SharedPreferencesRemovalGate(context),
-        )
-
         val local = LocalClient(
             credentialsProvider = { credentials.loadLocal() },
             onRevoked = { credentials.clearLocal() },
         )
+
+        // The cloud is one backend, not the app. Building it needs a signing
+        // key, and a Keystore that will not hand one over is a cloud that
+        // cannot serve -- not a reason to lose the desktop pairing, the cache
+        // or the vault this launch did open. iOS splits it the same way
+        // (`SessionGate.swift:292-301`): a local credential store is an
+        // optional second backend, and the cloud failure is what survives as
+        // the launch error only when both are unusable.
+        var cloudSession: CloudSession? = null
+        var cloudClient: CloudClient? = null
+        var signingKey: DeviceKeyStore.DeviceKey? = null
+        try {
+            val key = openSigner()
+            val client = CloudClient(
+                baseScheme = BuildConfig.WATTRACKER_CLOUD_SCHEME,
+                baseAuthority = BuildConfig.WATTRACKER_CLOUD_AUTHORITY,
+                signer = key.signer,
+                transport = HttpUrlCloudTransport(),
+            )
+            signingKey = key
+            cloudClient = client
+            cloudSession = CloudSession(
+                client = client,
+                credentials = credentials,
+                cache = RoomSnapshotCache(db),
+                removalGate = SharedPreferencesRemovalGate(context),
+            )
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            cloudFailure = t
+        }
 
         database = db
         this.client = cloudClient
         this.session = cloudSession
         this.localClient = local
         this.credentialStore = credentials
-        this.deviceKey = key
+        this.deviceKey = signingKey
         this.readModel = ReadModel(
             cloud = cloudSession,
             local = local,
             source = { _dataSourceFlow.value },
+        )
+
+        // What this launch can claim about each backend. A cloud that was never
+        // built, and a vault the Keystore would not open, are `Unknown` rather
+        // than `Unpaired`: nothing saw them, so nothing proved the stored choice
+        // wrong, and a bad launch must not delete a rider's pick.
+        val cloudObservation =
+            observeCloudBackend(sessionBuilt = cloudSession != null, paired = cloudSession?.isPaired == true)
+        val localObservation = observeLocalBackend(vaultHealth = credentials.health, paired = local.isPaired)
+
+        // An override for a backend that was *seen* unpaired is dropped here,
+        // once, so it cannot pin the app to a pairing screen while the other
+        // backend works (`SessionGate.swift:305-312`). Anything stored that is
+        // not being kept is deleted, including a value this build does not
+        // recognise: it can only have been edited by hand, and leaving it would
+        // mean re-reading the same garbage every launch.
+        val selection = if (storedOverride != null && keepOverride(storedOverride, cloudObservation, localObservation)) {
+            storedOverride
+        } else {
+            if (storedName != null) prefs.edit().remove(KEY_BACKEND_OVERRIDE).apply()
+            BackendSelection.Automatic
+        }
+        _selectionFlow.value = selection
+        _dataSourceFlow.value = resolveBackend(
+            selection,
+            cloudPaired = cloudObservation == BackendObservation.Paired,
+            localPaired = localObservation == BackendObservation.Paired,
         )
     }
 
@@ -336,15 +475,22 @@ object WatTrackerApp {
     }
 
     private fun openSigner(): DeviceKeyStore.DeviceKey {
-        // A missing key is generated on first run. If the Keystore itself is
-        // unusable this throws and init fails, surfaced to the caller rather
-        // than crashing -- a cloud session cannot sign without a key, so
-        // there is no graceful unpaired fallback for this one.
+        // A missing key is generated on first run. If the Keystore itself will
+        // not hand one over this throws, and the caller treats it as a cloud
+        // that cannot serve for this launch: nothing can be signed, so nothing
+        // can be read from the cloud or paired to it. The desktop backend, the
+        // vault and the cache stay open -- only the app-level gate (A1) gets
+        // to turn this into "this device cannot be paired".
         return DeviceKeyStore().loadOrCreate()
     }
 
     private const val PREFS_NAME = "wattracker_app_prefs"
-    private const val KEY_DATA_SOURCE = "active_data_source"
+
+    /** The A2 rider choice. Absent means `Automatic`, and `Automatic` is never written. */
+    private const val KEY_BACKEND_OVERRIDE = "active_backend_selection"
+
+    /** What the pre-A2 picker stored: a [DataSource] name. Consumed and deleted. */
+    private const val KEY_LEGACY_DATA_SOURCE = "active_data_source"
     private const val KEY_LEGACY_STORE_DROPPED = "legacy_credential_store_dropped"
 
     /** The prefs file the security-crypto store wrote; see [dropLegacyEncryptedStore]. */
