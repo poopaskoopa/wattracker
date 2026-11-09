@@ -45,6 +45,11 @@ and `>` writes `gh`'s raw UTF-8 bytes to a file.
 - **Multi-paragraph commit messages:** write the message to an LF-terminated,
   BOM-less file and use `git commit -F file`. Repeated `-m` paragraphs are
   stored as single unwrapped lines (hundreds of characters long), not wrapped.
+- **GitHub text is not a git message.** Wrapping is for commit messages, because
+  `git commit -F` cannot rewrap them. PR bodies, issues and comments are not
+  wrapped: one line per paragraph, per bullet and per table row, and no break
+  inside a sentence. GitHub soft-wraps, so a hard break only makes a ragged page.
+  The LF, no-BOM, `--body-file` rules above still apply.
 
 **Disable the git pager.** The shell runs in a pseudo-terminal, so `git show`,
 `git log`, `git diff` and friends open the pager and hang until the command
