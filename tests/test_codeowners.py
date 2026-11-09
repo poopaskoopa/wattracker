@@ -12,6 +12,12 @@ implements only the subset of CODEOWNERS syntax the file uses (a leading `/`
 anchor, a trailing `/` for a directory, and `*` within one path segment) and
 rejects anything else, so a new kind of pattern forces this test to be
 extended rather than misread.
+
+Within that subset it follows GitHub's gitignore-style semantics: a pattern
+without a trailing `/` matches a file *or a directory* at that path, and a
+matched directory covers everything beneath it. So `/ios` owns (or, with no
+owner, disowns) the whole `ios/` tree, exactly like `/ios/`; the trailing `/`
+only stops the pattern from matching a plain file named `ios`.
 """
 
 from fnmatch import fnmatchcase
@@ -59,15 +65,20 @@ UNOWNED = [
 ]
 
 
-def _rules():
+def _rules(text=None):
+    if text is None:
+        text = CODEOWNERS.read_text(encoding="utf-8")
     rules = []
-    for lineno, raw in enumerate(CODEOWNERS.read_text(encoding="utf-8").splitlines(), 1):
+    for lineno, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         pattern, *owners = line.split()
         assert re.fullmatch(r"/[A-Za-z0-9._*/-]+", pattern), (
             f"line {lineno}: {pattern!r} uses syntax this test does not model"
+        )
+        assert "//" not in pattern and pattern.strip("/"), (
+            f"line {lineno}: {pattern!r} has an empty path segment"
         )
         assert "**" not in pattern and "*" not in pattern.rstrip("/").rsplit("/", 1)[0], (
             f"line {lineno}: {pattern!r} - only a final-segment `*` is modelled"
@@ -81,21 +92,27 @@ def _rules():
 
 
 def _matches(pattern, path):
+    """Whether an anchored CODEOWNERS pattern covers the file at `path`.
+
+    gitignore semantics: the pattern's segments must match a leading run of the
+    path's segments. If they match the whole path, the pattern names the file
+    itself; if they match a proper prefix, the pattern names a directory the
+    file sits in, which covers it. A trailing `/` restricts the pattern to
+    directories, so it never names the file itself.
+    """
     segments = pattern.strip("/").split("/")
     parts = path.split("/")
     if pattern.endswith("/"):
-        # A directory pattern owns everything beneath it.
-        return len(parts) > len(segments) and all(
-            fnmatchcase(p, s) for p, s in zip(parts, segments)
-        )
-    return len(parts) == len(segments) and all(
-        fnmatchcase(p, s) for p, s in zip(parts, segments)
-    )
+        if len(parts) <= len(segments):
+            return False
+    elif len(parts) < len(segments):
+        return False
+    return all(fnmatchcase(p, s) for p, s in zip(parts, segments))
 
 
-def _owners(path):
+def _owners(path, rules=None):
     owners = []
-    for pattern, rule_owners in _rules():
+    for pattern, rule_owners in _rules() if rules is None else rules:
         if _matches(pattern, path):
             owners = rule_owners  # last match wins
     return owners
@@ -122,3 +139,69 @@ def test_every_workflow_is_owned():
     assert workflows
     for path in workflows:
         assert _owners(path.relative_to(ROOT).as_posix()) == [OWNER], path
+
+
+@pytest.mark.parametrize(
+    "pattern, path, expected",
+    [
+        # No trailing slash: the path itself, and everything beneath it when
+        # it is a directory.
+        ("/ios", "ios", True),
+        ("/ios", "ios/README.md", True),
+        ("/ios", "ios/WatTracker/Config/Release.xcconfig", True),
+        ("/.github", ".github/CODEOWNERS", True),
+        ("/.github", ".github/workflows/ios-release.yml", True),
+        ("/ios", "iosapp/README.md", False),
+        ("/ios", "ios.md", False),
+        ("/ios", "android/ios/README.md", False),
+        ("/ios", "README.md", False),
+        # Trailing slash: descendants only, never a file of that name.
+        ("/ios/", "ios/README.md", True),
+        ("/ios/", "ios/WatTracker/Config/Release.xcconfig", True),
+        ("/ios/", "ios", False),
+        ("/ios/", "iosapp/README.md", False),
+        # A file-shaped pattern is still exact for files, and anchored.
+        ("/AGENTS.md", "AGENTS.md", True),
+        ("/AGENTS.md", "android/AGENTS.md", False),
+        ("/AGENTS.md", "AGENTS.md.bak", False),
+        ("/docs/CODEOWNERS", "docs/CODEOWNERS", True),
+        ("/docs/CODEOWNERS", "docs/mobile-parity.md", False),
+        # `*` stays within one segment.
+        ("/Dockerfile*", "Dockerfile", True),
+        ("/Dockerfile*", "Dockerfile.cloud", True),
+        ("/Dockerfile*", "docker-compose.yml", False),
+        ("/Dockerfile*", "scripts/Dockerfile", False),
+        # A deeper directory pattern covers its own subtree only.
+        ("/.github/workflows", ".github/workflows/cloud.yml", True),
+        ("/.github/workflows", ".github/CODEOWNERS", False),
+    ],
+)
+def test_matcher_follows_gitignore_directory_semantics(pattern, path, expected):
+    assert _matches(pattern, path) is expected
+
+
+@pytest.mark.parametrize("pattern", ["/ios", "/ios/", "/.github", "/.github/"])
+def test_appended_ownerless_directory_rule_is_caught(pattern):
+    # GitHub resolves the last match, so an ownerless directory rule at the end
+    # strips ownership from the whole tree whether or not it ends in `/`.
+    text = CODEOWNERS.read_text(encoding="utf-8") + f"\n{pattern}\n"
+    rules = _rules(text)
+    disowned = [path for path in OWNED if _owners(path, rules) != [OWNER]]
+    tree = pattern.strip("/") + "/"
+    assert disowned and all(path.startswith(tree) for path in disowned), disowned
+    assert all(_owners(path, rules) == [OWNER] for path in OWNED if not path.startswith(tree))
+
+
+def test_last_match_wins_in_both_directions():
+    rules = _rules("/ios @a\n/ios/WatTracker\n")
+    assert _owners("ios/README.md", rules) == ["@a"]
+    assert _owners("ios/WatTracker/Config/Release.xcconfig", rules) == []
+    rules = _rules("/ios\n/ios/WatTracker/ @a\n")
+    assert _owners("ios/README.md", rules) == []
+    assert _owners("ios/WatTracker/Config/Release.xcconfig", rules) == ["@a"]
+
+
+@pytest.mark.parametrize("pattern", ["//", "/ios//WatTracker", "ios/", "/**/ios", "/*/ios"])
+def test_unmodelled_pattern_is_rejected(pattern):
+    with pytest.raises(AssertionError):
+        _rules(f"{pattern} @a\n")
