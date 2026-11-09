@@ -387,4 +387,167 @@ final class DashboardTssAndRecentRidesTests: XCTestCase {
         XCTAssertTrue(model.isReady)
         XCTAssertTrue(model.recentRides.isEmpty)
     }
+
+    // MARK: - The strip belongs to one read session (PR #480 review)
+
+    /// The dashboard metrics every scripted session returns.
+    nonisolated private static func dashboardSnapshot(_ route: CloudRoute) -> CloudSnapshot {
+        CloudSnapshot(
+            route: route, revision: 1,
+            items: [CloudItem(id: "lp", kind: .loadPoint, revision: 1,
+                              payload: .loadPoint(LoadPoint(date: "2026-11-01", tss: 80, ctl: 50, atl: 60, tsb: -10)))],
+            source: .network, asOf: Date()
+        )
+    }
+
+    /// A paired session whose activities replies are scripted in order (the
+    /// last one repeats), and which can hold its first reply until released.
+    private actor ScriptedSession: ReadSession {
+        enum Reply: Sendable {
+            case rides(CloudSnapshot)
+            case fail(CloudSession.Failure)
+        }
+
+        private let cachedActivities: CloudSnapshot?
+        private var replies: [Reply]
+        private var holding: Bool
+        private var release: CheckedContinuation<Void, Never>?
+        private(set) var activitiesRequested = false
+
+        init(cachedActivities: CloudSnapshot? = nil, replies: [Reply], hold: Bool = false) {
+            self.cachedActivities = cachedActivities
+            self.replies = replies
+            self.holding = hold
+        }
+
+        var deviceState: CloudSession.DeviceState { .paired }
+        var lastSuccess: Date? { nil }
+        nonisolated func cached(_ route: CloudRoute) -> CloudSnapshot? {
+            route == .activities ? cachedActivities : nil
+        }
+
+        func load(_ route: CloudRoute) async throws -> CloudSnapshot {
+            guard route == .activities else { return DashboardTssAndRecentRidesTests.dashboardSnapshot(route) }
+            let reply = replies.count > 1 ? replies.removeFirst() : replies[0]
+            activitiesRequested = true
+            if holding {
+                await withCheckedContinuation { release = $0 }
+            }
+            switch reply {
+            case let .rides(snapshot): return snapshot
+            case let .fail(failure): throw failure
+            }
+        }
+
+        func releaseActivities() {
+            holding = false
+            release?.resume()
+            release = nil
+        }
+
+        func activityDetail(_ activityID: Int) async throws -> ActivityDetail { throw CloudSession.Failure.offline }
+        func activityStreams(_ activityID: Int) async throws -> ActivityStreams { throw CloudSession.Failure.offline }
+    }
+
+    private func rides(_ ids: Int...) -> CloudSnapshot {
+        snapshot(.activities, ids.map { ride($0, String(format: "2026-11-%02dT08:00:00Z", $0)) })
+    }
+
+    private func waitUntilActivitiesRequested(_ session: ScriptedSession) async {
+        while !(await session.activitiesRequested) { await Task.yield() }
+    }
+
+    /// The review's reproduction: B's metrics must never be shown beside A's
+    /// rides when B has no activities cache and its activities read fails.
+    func testNewSessionWithoutCacheAndFailedActivitiesShowsNoPreviousSessionRides() async {
+        let model = DashboardModel()
+        await model.start(session: ScriptedSession(replies: [.rides(rides(1, 2))]))
+        XCTAssertEqual(model.recentRides.map(\.activityID), [2, 1])
+
+        await model.start(session: ScriptedSession(replies: [.fail(.offline)]))
+        XCTAssertTrue(model.isReady)
+        XCTAssertEqual(model.recentRides.map(\.activityID), [])
+    }
+
+    func testSameSessionRefreshKeepsItsRidesWhenActivitiesFail() async {
+        let model = DashboardModel()
+        let session = ScriptedSession(replies: [.rides(rides(1, 2)), .fail(.offline)])
+        await model.start(session: session)
+        XCTAssertEqual(model.recentRides.map(\.activityID), [2, 1])
+
+        await model.start(session: session, userInitiated: true)
+        XCTAssertTrue(model.isReady)
+        XCTAssertEqual(model.recentRides.map(\.activityID), [2, 1])
+    }
+
+    func testNewSessionCachedRidesReplacePreviousOnesBeforeTheNetworkAnswers() async {
+        let model = DashboardModel()
+        await model.start(session: ScriptedSession(replies: [.rides(rides(1, 2))]))
+
+        let next = ScriptedSession(cachedActivities: rides(7, 8), replies: [.rides(rides(9))], hold: true)
+        let task = Task { await model.start(session: next) }
+        await waitUntilActivitiesRequested(next)
+        XCTAssertTrue(model.isReady)
+        XCTAssertEqual(model.recentRides.map(\.activityID), [8, 7])
+
+        await next.releaseActivities()
+        await task.value
+        XCTAssertEqual(model.recentRides.map(\.activityID), [9])
+    }
+
+    func testSuccessfulEmptyActivitiesReplyClearsTheStrip() async {
+        let model = DashboardModel()
+        let session = ScriptedSession(replies: [.rides(rides(1, 2)), .rides(rides())])
+        await model.start(session: session)
+        XCTAssertEqual(model.recentRides.map(\.activityID), [2, 1])
+
+        await model.start(session: session, userInitiated: true)
+        XCTAssertTrue(model.isReady)
+        XCTAssertEqual(model.recentRides.map(\.activityID), [])
+    }
+
+    func testDelayedPreviousSessionActivitiesCannotOverwriteTheNewSession() async {
+        let model = DashboardModel()
+        let old = ScriptedSession(replies: [.rides(rides(1, 2))], hold: true)
+        let oldTask = Task { await model.start(session: old) }
+        await waitUntilActivitiesRequested(old)
+
+        await model.start(session: ScriptedSession(replies: [.rides(rides(5))]))
+        XCTAssertEqual(model.recentRides.map(\.activityID), [5])
+
+        await old.releaseActivities()
+        await oldTask.value
+        XCTAssertTrue(model.isReady)
+        XCTAssertEqual(model.recentRides.map(\.activityID), [5])
+    }
+
+    func testDelayedPreviousSessionTerminalFailureCannotEndTheNewSessionsScreen() async {
+        let model = DashboardModel()
+        let old = ScriptedSession(replies: [.fail(.deviceRemoved)], hold: true)
+        let oldTask = Task { await model.start(session: old) }
+        await waitUntilActivitiesRequested(old)
+
+        await model.start(session: ScriptedSession(replies: [.rides(rides(5))]))
+        await old.releaseActivities()
+        await oldTask.value
+        XCTAssertTrue(model.isReady)
+        XCTAssertEqual(model.recentRides.map(\.activityID), [5])
+    }
+
+    func testTerminalActivitiesFailuresClearTheStripAndEndThePairedScreen() async {
+        for (failure, expectRemoved) in [(CloudSession.Failure.notPaired, false), (.deviceRemoved, true)] {
+            let model = DashboardModel()
+            let session = ScriptedSession(replies: [.rides(rides(1, 2)), .fail(failure)])
+            await model.start(session: session)
+            XCTAssertEqual(model.recentRides.map(\.activityID), [2, 1])
+
+            await model.start(session: session, userInitiated: true)
+            XCTAssertTrue(model.recentRides.isEmpty)
+            switch model.state {
+            case .removed: XCTAssertTrue(expectRemoved)
+            case .unpaired: XCTAssertFalse(expectRemoved)
+            default: XCTFail("expected a terminal state, got \(model.state)")
+            }
+        }
+    }
 }

@@ -89,6 +89,11 @@ final class DashboardModel {
     /// failure here never takes the dashboard down with it.
     private(set) var recentRides: [RideSummary] = []
     static let recentRideLimit = 5
+    /// The session `recentRides` came from. The strip is scoped to it.
+    @ObservationIgnored private var ridesSession: (any ReadSession)?
+    /// Bumped by every `start`, so a read a newer start has superseded drops
+    /// its answer instead of overwriting the newer one's.
+    @ObservationIgnored private var requestGeneration = 0
     var selectedWindow: LoadWindow = .sixWeeks
     let wake = CloudWakeNotice()
 
@@ -106,6 +111,8 @@ final class DashboardModel {
     /// holding one that still believes it is paired, rendering a signed-out
     /// rider's numbers until something forces a reload.
     func start(session: (any ReadSession)?, userInitiated: Bool = false) async {
+        requestGeneration += 1
+        let generation = requestGeneration
         state = .starting
         // No session means the gate has not produced one: no credential yet,
         // or the signing key could not be read. Both are the shell's to
@@ -113,10 +120,23 @@ final class DashboardModel {
         guard let session else {
             state = .unpaired
             recentRides = []
+            ridesSession = nil
             return
         }
 
-        switch await session.deviceState {
+        // The view keeps this model while `.task(id: gate.backend)` restarts
+        // it on a backend switch, so the strip must be cleared here, before
+        // anything of the new backend's is shown. Otherwise a new backend
+        // with no activities cache and a failed activities read would show
+        // its own metrics beside the previous backend's rides.
+        if !Self.isSameSession(ridesSession, session) {
+            recentRides = []
+            ridesSession = session
+        }
+
+        let deviceState = await session.deviceState
+        guard generation == requestGeneration else { return }
+        switch deviceState {
         case .unpaired:
             state = .unpaired
             recentRides = []
@@ -139,9 +159,14 @@ final class DashboardModel {
 
         if userInitiated { await session.retryNowIfWaking() }
         do {
-            apply(try await wake.during(session) { try await session.load(.dashboard) })
-            await refreshRecentRides(session)
+            let dashboard = try await wake.during(session) { try await session.load(.dashboard) }
+            guard generation == requestGeneration else { return }
+            apply(dashboard)
+            await refreshRecentRides(session, generation: generation)
         } catch let failure as CloudSession.Failure {
+            // A read that a newer start has superseded (a backend switch, or
+            // a later refresh) must not touch what that newer start shows.
+            guard generation == requestGeneration else { return }
             switch failure {
             case .notPaired:
                 state = .unpaired
@@ -159,18 +184,23 @@ final class DashboardModel {
                 state = .error(failure.description)
             }
         } catch {
+            guard generation == requestGeneration else { return }
             if case .ready = state { return }
             state = .error(error.localizedDescription)
         }
     }
 
     /// Best effort: the strip is a bonus on top of a dashboard that has
-    /// already loaded. An ordinary failure leaves whatever rides are showing;
+    /// already loaded. An ordinary failure leaves whatever rides are showing,
+    /// which are always this session's (`start` clears them on a switch);
     /// a revoked or unpaired device clears them with the rest of the screen.
-    private func refreshRecentRides(_ session: any ReadSession) async {
+    private func refreshRecentRides(_ session: any ReadSession, generation: Int) async {
         do {
-            applyRecentRides(try await session.load(.activities))
+            let activities = try await session.load(.activities)
+            guard generation == requestGeneration else { return }
+            applyRecentRides(activities)
         } catch let failure as CloudSession.Failure {
+            guard generation == requestGeneration else { return }
             switch failure {
             case .notPaired:
                 state = .unpaired
@@ -187,6 +217,16 @@ final class DashboardModel {
     private func applyRecentRides(_ snapshot: CloudSnapshot?) {
         guard let snapshot else { return }
         recentRides = Self.recentRides(from: snapshot)
+    }
+
+    /// Both production sessions (`CloudSession`, `LocalSession`) are actors,
+    /// so this is object identity. The model holds the session it compares
+    /// against, so a deallocated session's address cannot be reused by a new
+    /// one and pass as the same. A value-type conformer would never compare
+    /// equal, which only costs a refresh its strip, never shows a stale one.
+    private static func isSameSession(_ lhs: (any ReadSession)?, _ rhs: any ReadSession) -> Bool {
+        guard let lhs else { return false }
+        return (lhs as AnyObject) === (rhs as AnyObject)
     }
 
     static func recentRides(from snapshot: CloudSnapshot) -> [RideSummary] {
