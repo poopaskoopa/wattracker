@@ -59,20 +59,83 @@ fun resolveBackend(selection: BackendSelection, cloudPaired: Boolean, localPaire
 }
 
 /**
+ * What one launch actually learned about one backend's pairing.
+ *
+ * The three states exist because "not paired" and "could not look" pull in
+ * opposite directions. A backend this launch could not inspect is not known to
+ * be unpaired, and treating it as such lets one bad launch delete a choice the
+ * rider made on a good one.
+ */
+enum class BackendObservation {
+    /** No look was possible: no signing key, so no cloud session; a Keystore that would not open the vault, so no local read. */
+    Unknown,
+
+    /** Looked, and found nothing usable: no pairing, or a vault file this installation can never open again. */
+    Unpaired,
+
+    Paired,
+    ;
+
+    /** Only a seen [Unpaired] is evidence against an override. */
+    val contradictsOverride: Boolean
+        get() = this == Unpaired
+}
+
+/**
+ * What this launch may claim about the desktop.
+ *
+ * [StoreHealth.Unavailable] is the Keystore refusing the vault outright: the
+ * in-memory store that stands in never opens the file on disk, so a pairing may
+ * be sitting in it unread and nothing about it has been seen.
+ * [StoreHealth.UnreadableVault] is the opposite -- the file was opened, and the
+ * key behind it is gone -- so the pairing behind it is genuinely gone, and that
+ * is a look that says unpaired.
+ */
+fun observeLocalBackend(vaultHealth: StoreHealth, paired: Boolean): BackendObservation = when {
+    vaultHealth == StoreHealth.Unavailable -> BackendObservation.Unknown
+    paired -> BackendObservation.Paired
+    else -> BackendObservation.Unpaired
+}
+
+/**
+ * What this launch may claim about the cloud. No signing key means no session,
+ * and no session means nobody looked: [BackendObservation.Unknown].
+ */
+fun observeCloudBackend(sessionBuilt: Boolean, paired: Boolean): BackendObservation = when {
+    !sessionBuilt -> BackendObservation.Unknown
+    paired -> BackendObservation.Paired
+    else -> BackendObservation.Unpaired
+}
+
+/**
  * Whether a stored override may survive startup.
  *
- * An override naming a backend that is not paired would pin the app to a
- * pairing screen while the other backend was working, so it is dropped and its
- * preference goes with it (`SessionGate.swift:305-312`). `Automatic` is never
- * dropped: it names no backend in particular.
+ * An override naming a backend that was *seen* unpaired is dropped, and its
+ * preference goes with it (`SessionGate.swift:305-312`): left standing it would
+ * pin the app to a pairing screen while the other backend worked. `Automatic`
+ * is never dropped -- it names no backend in particular -- and an override
+ * naming a backend this launch could not inspect is kept, because nothing ever
+ * proved it wrong. A dead Keystore is a bad launch, not a rider's change of
+ * mind.
+ *
+ * The local half follows the same rule, state by state. [BackendObservation.Unknown]
+ * when the Keystore refused the vault outright: the in-memory store never opens
+ * the file on disk, so a pairing may be sitting in it unread. [BackendObservation.Unpaired]
+ * when the vault file was opened and this installation cannot use it -- the key
+ * behind it is gone, the pairing with it, and Settings already says so. That one
+ * is dropped.
  *
  * This is a startup rule only. At runtime an override stands even when the
  * backend it names is unpaired -- that is the case A2's Cancel exists for, and
  * iOS reaches `.unpaired` with `pairedFallback` set rather than silently
  * switching back (`:434`, `:455-463`).
  */
-fun keepOverride(selection: BackendSelection, cloudPaired: Boolean, localPaired: Boolean): Boolean = when (selection) {
+fun keepOverride(
+    selection: BackendSelection,
+    cloud: BackendObservation,
+    local: BackendObservation,
+): Boolean = when (selection) {
     BackendSelection.Automatic -> true
-    BackendSelection.Cloud -> cloudPaired
-    BackendSelection.Local -> localPaired
+    BackendSelection.Cloud -> !cloud.contradictsOverride
+    BackendSelection.Local -> !local.contradictsOverride
 }

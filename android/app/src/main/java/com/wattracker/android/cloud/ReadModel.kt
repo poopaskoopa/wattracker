@@ -96,8 +96,13 @@ private object AbsentCloud : ReadSession {
     override val isPaired: Boolean
         get() = false
 
+    /**
+     * No identity. A real backend's first identity is 0 on both sides, so this
+     * one takes a value no backend can ever hold: an `identity` read across a
+     * backend change must never look unchanged.
+     */
     override val identity: Int
-        get() = 0
+        get() = -1
 
     override val lastSuccess: Long?
         get() = null
