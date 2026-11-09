@@ -280,3 +280,111 @@ final class PullToRefreshModelTests: XCTestCase {
         XCTAssertEqual(refreshedCalls, 1)
     }
 }
+
+/// The dashboard's two Android-parity additions (#475 B5): TSS bars on the
+/// load chart and the Recent rides strip.
+@MainActor
+final class DashboardTssAndRecentRidesTests: XCTestCase {
+    private func ride(_ id: Int, _ start: String?, np: Double? = nil, tss: Double? = nil) -> CloudItem {
+        CloudItem(
+            id: "activity-\(id)", kind: .activity, revision: 1,
+            payload: .activity(ActivitySummary(
+                id: Double(id), startTime: start, durationS: 3_600,
+                distanceM: 30_000, avgPower: nil, avgHr: nil, np: np,
+                intensityFactor: nil, tss: tss, rpe: nil
+            ))
+        )
+    }
+
+    private func snapshot(_ route: CloudRoute, _ items: [CloudItem]) -> CloudSnapshot {
+        CloudSnapshot(route: route, revision: 1, items: items, source: .network, asOf: Date())
+    }
+
+    private actor Session: ReadSession {
+        let activities: CloudSnapshot
+        let failActivities: Bool
+        init(activities: CloudSnapshot, failActivities: Bool = false) {
+            self.activities = activities
+            self.failActivities = failActivities
+        }
+        var deviceState: CloudSession.DeviceState { .paired }
+        var lastSuccess: Date? { nil }
+        nonisolated func cached(_ route: CloudRoute) -> CloudSnapshot? { nil }
+        func load(_ route: CloudRoute) async throws -> CloudSnapshot {
+            if route == .activities {
+                if failActivities { throw CloudSession.Failure.offline }
+                return activities
+            }
+            return CloudSnapshot(
+                route: route, revision: 1,
+                items: [CloudItem(id: "lp", kind: .loadPoint, revision: 1,
+                                  payload: .loadPoint(LoadPoint(date: "2026-11-01", tss: 80, ctl: 50, atl: 60, tsb: -10)))],
+                source: .network, asOf: Date()
+            )
+        }
+        func activityDetail(_ activityID: Int) async throws -> ActivityDetail { throw CloudSession.Failure.offline }
+        func activityStreams(_ activityID: Int) async throws -> ActivityStreams { throw CloudSession.Failure.offline }
+    }
+
+    func testTssBarsKeepOnlyPositiveFiniteDatedDays() {
+        let points = [
+            LoadPoint(date: "2026-11-01", tss: 80, ctl: nil, atl: nil, tsb: nil),
+            LoadPoint(date: "2026-11-02", tss: 0, ctl: 1, atl: 1, tsb: 1),
+            LoadPoint(date: "2026-11-03", tss: -5, ctl: nil, atl: nil, tsb: nil),
+            LoadPoint(date: "2026-11-04", tss: nil, ctl: 1, atl: 1, tsb: 1),
+            LoadPoint(date: "2026-11-05", tss: .infinity, ctl: nil, atl: nil, tsb: nil),
+            LoadPoint(date: nil, tss: 40, ctl: nil, atl: nil, tsb: nil),
+            LoadPoint(date: "2026-11-06", tss: 120.5, ctl: nil, atl: nil, tsb: nil),
+        ]
+        let bars = DashboardData.tssBars(points)
+        XCTAssertEqual(bars.map(\.tss), [80, 120.5])
+    }
+
+    func testRecentRidesAreNewestFirstAndCappedAtFive() {
+        let items = (1...7).map { ride($0, String(format: "2026-11-%02dT08:00:00Z", $0)) }
+            + [CloudItem(id: "activity-99", kind: .activity, revision: 2, deleted: true,
+                         payload: .activity(ActivitySummary(
+                            id: 99, startTime: "2026-12-01T08:00:00Z", durationS: nil, distanceM: nil,
+                            avgPower: nil, avgHr: nil, np: nil, intensityFactor: nil, tss: nil, rpe: nil)))]
+        let rides = DashboardModel.recentRides(from: snapshot(.activities, items))
+        XCTAssertEqual(rides.map(\.activityID), [7, 6, 5, 4, 3])
+    }
+
+    func testRowUsesParsedDateNotARawSlice() {
+        let line = RecentRideLine(ActivitySummary(
+            id: 1, startTime: "2026-11-03T14:30:00Z", durationS: 3_725, distanceM: 40_250,
+            avgPower: nil, avgHr: nil, np: 212.4, intensityFactor: nil, tss: 71.6, rpe: nil
+        ))
+        XCTAssertEqual(line.date, RideFormatting.date("2026-11-03T14:30:00Z"))
+        XCTAssertNotEqual(line.date, "2026-11-03")
+        XCTAssertEqual(line.detail, "1:02:05 · 40.2 km")
+        XCTAssertEqual(line.load, "212 W NP · 72 TSS")
+    }
+
+    func testRowOmitsMissingLoadFigures() {
+        let line = RecentRideLine(ActivitySummary(
+            id: 1, startTime: nil, durationS: nil, distanceM: nil,
+            avgPower: nil, avgHr: nil, np: nil, intensityFactor: nil, tss: nil, rpe: nil
+        ))
+        XCTAssertEqual(line.date, "Unknown date")
+        XCTAssertEqual(line.load, "")
+    }
+
+    func testModelFillsStripFromActivitiesRouteAfterDashboardLoads() async {
+        let session = Session(activities: snapshot(.activities, [
+            ride(1, "2026-11-01T08:00:00Z"), ride(2, "2026-11-02T08:00:00Z"),
+        ]))
+        let model = DashboardModel()
+        await model.start(session: session)
+        XCTAssertTrue(model.isReady)
+        XCTAssertEqual(model.recentRides.map(\.activityID), [2, 1])
+    }
+
+    func testActivitiesFailureLeavesDashboardReadyWithoutStrip() async {
+        let session = Session(activities: snapshot(.activities, []), failActivities: true)
+        let model = DashboardModel()
+        await model.start(session: session)
+        XCTAssertTrue(model.isReady)
+        XCTAssertTrue(model.recentRides.isEmpty)
+    }
+}
