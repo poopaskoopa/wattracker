@@ -25,8 +25,8 @@
 
     <!-- Settings & Pairing Strings -->
     <string name="settings_backend_title">Backend Source</string>
-    <string name="settings_tab_cloud">Cloud Backend</string>
-    <string name="settings_tab_local">Local Desktop</string>
+    <string name="settings_tab_cloud">Cloud</string>
+    <string name="settings_tab_local">Local</string>
     <string name="settings_active_badge">ACTIVE BACKEND</string>
     <string name="settings_set_active">Set as Active Backend</string>
 
@@ -35,23 +35,23 @@
     <string name="settings_cloud_unpaired_sub">Enter the 12-symbol pairing code shown in the desktop app or cloud settings.</string>
     <!-- Two storage failures, not one: the first cannot save a pairing at all,
          the second is holding one it can no longer read (#457). -->
-    <string name="settings_cloud_store_unavailable_warning">Warning: this device cannot protect a saved pairing, so pairing here lasts only until the app closes.</string>
-    <string name="settings_cloud_vault_unreadable_warning">Warning: the pairing saved on this device could not be read, so it is not in use. Pairing again replaces it.</string>
+    <string name="settings_cloud_store_unavailable_warning">Warning: this device cannot protect a saved pairing, so pairing is temporary until the app closes.</string>
+    <string name="settings_cloud_vault_unreadable_warning">Warning: the pairing saved on this device could not be read. Pairing again will replace it.</string>
 
     <string name="settings_local_paired_title">Local Desktop Paired</string>
     <string name="settings_local_unpaired_title">Pair Local Desktop</string>
-    <string name="settings_local_unpaired_sub">Connect to your desktop server over HTTPS. Open the desktop web UI -> Settings -> pair a device -> copy token.</string>
-    <string name="settings_local_revoke_notice">To revoke server access completely, open desktop web settings -> pair a device -> Revoke.</string>
+    <string name="settings_local_unpaired_sub">Connect to your desktop over HTTPS. Open the desktop web UI ➡️ Settings ➡️ pair a device ➡️ copy token.</string>
+    <string name="settings_local_revoke_notice">To revoke server access, open desktop web settings ➡️ pair a device ➡️ Revoke.</string>
 
     <string name="settings_paired_at">Paired: %1$s</string>
     <string name="settings_remove_device">Remove this device</string>
-    <string name="settings_removing">Removing...</string>
+    <string name="settings_removing">Removing…</string>
     <string name="settings_pair_button">Pair Device</string>
-    <string name="settings_pairing">Pairing...</string>
+    <string name="settings_pairing">Pairing…</string>
     <string name="settings_pair_local_button">Pair Local Desktop</string>
-    <string name="settings_connecting">Connecting...</string>
+    <string name="settings_connecting">Connecting…</string>
 
-    <string name="settings_cloud_remove_fallback_notice">Could not confirm with the server; the pairing may already be gone — the device list will settle it.</string>
+    <string name="settings_cloud_remove_fallback_notice">Could not confirm removal, check device list.</string>
     <string name="settings_local_remove_failed">Could not clear local credentials. Try again.</string>
 
     <string name="settings_code_label">Pairing Code (XXXX-XXXX-XXXX)</string>
@@ -77,13 +77,13 @@
     <string name="dashboard_cached_data_banner">Cached data · last synced %1$s</string>
     <string name="dashboard_syncing">Syncing dashboard…</string>
     <string name="dashboard_starting">Loading dashboard…</string>
-    <string name="dashboard_start_failed">The app could not finish starting up. Close and reopen it.</string>
+    <string name="dashboard_start_failed">Could not complete startup. Close and reopen this app.</string>
     <string name="dashboard_sync_failed">Failed to sync dashboard</string>
     <string name="dashboard_throttled_notice">Rate limited — retry in %1$d seconds</string>
     <string name="dashboard_waking_title">Waking up the cloud…</string>
-    <string name="dashboard_waking_notice">The cloud is still waking up. It usually takes under a minute; try again shortly.</string>
+    <string name="dashboard_waking_notice">The cloud is still waking up. Please try again in 1 minute.</string>
     <string name="dashboard_unpaired_title">No backend paired</string>
-    <string name="dashboard_unpaired_note">Pair a cloud code or local desktop server in Settings to view training status and load.</string>
+    <string name="dashboard_unpaired_note">Pair with a cloud code or local desktop in Settings to view training status and load.</string>
     <string name="dashboard_removed_title">Device removed</string>
     <string name="dashboard_removed_note">This device was removed from the backend. Re-pair in Settings to continue.</string>
     <string name="dashboard_pair_cta">Open Settings</string>
@@ -114,7 +114,7 @@
     <string name="activities_offline_badge">Offline</string>
     <string name="activities_syncing">Syncing activities…</string>
     <string name="activities_unpaired_title">No backend paired</string>
-    <string name="activities_unpaired_note">Pair a cloud code or local desktop server in Settings to see your rides.</string>
+    <string name="activities_unpaired_note">Pair with a cloud code or local desktop in Settings to see your rides.</string>
     <string name="activities_removed_title">Device removed</string>
     <string name="activities_removed_note">This device was removed from the backend. Re-pair in Settings to continue.</string>
     <string name="activities_unavailable">Activities unavailable</string>
@@ -130,7 +130,7 @@
 
     <!-- Ride graphs chart -->
     <string name="ride_graphs_title">Ride graphs</string>
-    <string name="ride_graphs_caption">Time (min). Altitude is a faint background without an axis.</string>
+    <string name="ride_graphs_caption">Time (min). Altitude (background).</string>
 
     <!-- Calendar (#198) -->
     <string name="calendar_updated">Plan, rides and races · updated %1$s</string>

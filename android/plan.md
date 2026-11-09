@@ -4,44 +4,28 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
-## Agent tooling notes (PowerShell + `gh`, git pager)
+## Agent tooling, machine facts and working rules
 
-**Using `gh` from PowerShell.** The IDE's shell tool runs
-`powershell.exe -Command <cmd>`; PowerShell's native-argument handling and
-stdout capture both get in the way:
+These live in [`AGENTS.md`](AGENTS.md) in this directory: the PowerShell/`gh`
+and git-pager notes, the toolchain and device facts for this machine, the repo
+hygiene rules, the build/verify commands, the dependency rule, the verification
+requirements, the BOM API ground truth, and the scope boundaries. They are
+standing rules, not part of this plan, so they are not repeated here. The
+repo-root `AGENTS.md` still governs everything repo-wide.
 
-- Prefer the `cmd` shell for `gh` calls: arguments pass through unharmed,
-  and `>` redirection writes `gh`'s raw UTF-8 bytes to a file.
-- Keep `--jq` trivial in PowerShell (a bare `--jq .field`, or no `--jq`
-  with `--json a,b,c`): a double-quoted jq expression arrives mangled (one
-  session turned `--jq "title, headRefName"` into a PowerShell
-  expression). Parse the JSON output yourself if you need more.
-- Never capture `gh` output containing non-ASCII into a PowerShell
-  variable: native stdout is decoded with the console code page, and a PR
-  body comes back mojibake (`WΓÇ▓` where `W′` was). Redirect to a file in
-  cmd (`gh pr view N --json body --jq .body > body.txt`), then process it
-  with .NET UTF-8: `[System.IO.File]::ReadAllText($p,
-  [Text.Encoding]::UTF8)` and `WriteAllText(..., New-Object
-  Text.UTF8Encoding($false))` (no BOM), then `gh pr edit N --body-file
-  body.txt`.
-- `;` is the command separator in PowerShell, `&` in cmd; neither stops on
-  failure, so verify intermediate results when a later step depends on an
-  earlier one (a failed `git reset` still lets the queued `git commit`
-  run, and stacks junk on the old history).
-- `String.Replace` that swaps same-length text cannot be verified by
-  comparing lengths; check with `Contains`.
-- For multi-paragraph commit messages, write the message to an
-  LF-terminated, BOM-less file and use `git commit -F file`: repeated `-m`
-  paragraphs are stored as single unwrapped lines (hundreds of characters
-  long), not wrapped.
+`plan.md` below carries only what is specific to the epic: the decisions, the
+ground truth, the per-step implementation notes, the reviews and their fixes,
+and the validation sequence.
 
-**Git: disable the pager.** The shell runs in a pseudo-terminal, so
-`git show`, `git log`, `git diff` and friends open the pager and hang
-until the command timeout kills them. Always prefix `git --no-pager`, e.g.
-`git --no-pager log --oneline -5`; for a whole session, set `GIT_PAGER=`
-to empty instead.
+**Resume point (2026-11-03). Steps 1–6 are merged, and #457's credential-store work is merged too (PR #459, `ec6aab0`). Step 7 (#199) is the only step left, and the only work in this directory that is not yet on `main`.**
 
-**Resume point — Step 4 (#196) Dashboard is merged (PR #419, 2026-10-06, `736f290`). Step 5 (#197) Activities list + ride detail is being implemented on `feature/android-client-5` (cut from `main` at `25e7220`). PR #459 (#457, the credential store off `security-crypto`) is **merged** (`ec6aab0`, 2026-11-03), and #457 is closed by it; the 2026-10-30, 2026-10-31 and 2026-11-02 reviews are all addressed, and the device run is the 2026-11-03 note below. The device run covered **one** physical device (a Pixel 6a); the emulator half and the cloud half of the owed check stay open until #468 (the cloud authority) is fixed.** Steps 1–3 are merged: Step 2 (#194) via PR #304, Step 3 (#195) via PR #376 (landed through #403, `8722198`). #195 and #196 stay open for their device checks. The Step 4 implementation notes, the PR #419 review (2026-09-30) and its fixes (2026-10-04), verification and known gaps are under "Step 4 — Dashboard screen" below, and the PR #419 post-merge follow-up (the `removal_decision_v1` vector test, the mobile-parity cells) landed first on the Step 5 branch (2026-10-15). The Step 5 implementation notes are under "Step 5 — Activities list + ride detail" below.
+- **Merged:** Step 1 (#193, PR #257), Step 2 (#194, PR #304), Step 3 (#195, PR #376, landed through #403), Step 4 (#196, PR #419, `736f290`), Step 5 (#197, PR #450, 2026-10-25), Step 6 (#198, PR #456, 2026-10-27), and PR #459 (#457, `ec6aab0`, 2026-11-03) — the credential store on the Keystore instead of `security-crypto`, which closed #457. All three of its review rounds (2026-10-30, 2026-10-31, 2026-11-02) are addressed, and its device run is the 2026-11-03 note further down.
+- **Open issues:** #194, #195, #196, #197 and #198 stay open only for their device checks. #193 is closed. #192 (the epic) is open.
+- **Remaining device work on #459:** one physical device (a Pixel 6a) covered the desktop-token half of the vault. The emulator half and the **cloud** half stay open until #468 (the cloud authority is unset and the release path can still ship a placeholder host) is fixed.
+- **This branch:** `feature/android-client-7`, which carries only documentation. Step 7 is the next work, and its device test is specified — the release-shape run from the internal track, gated on the force-stop/relaunch-still-paired check and the local HTTPS backend (the HTTP dev harness is unreachable from a Play build). See Step 7 item 5 below.
+- **#102 is CLOSED (2026-10-27).** The cloud is deployed and serving since 2026-09-19. The placeholder host and the `-PallowPlaceholderHost` flag are therefore retired requirements, not open gates. See Step 7.
+
+The Step 4 and Step 5 implementation notes, the PR #419 review and its fixes, verification and known gaps are under "Step 4 — Dashboard screen" and "Step 5 — Activities list + ride detail" below.
 
 Step 3 context: merged via PR #376 (landed through #403). Cloud and local pairing, the Settings screen, and the removed state (#153, `markRemoved()`). The review findings and their resolutions are on PR #376; the durable ones are: every type holding a bearer secret (`LocalCredentials`, `LocalRequest`, `LocalResponse`, `ActiveSession`) redacts it in `toString()`; the connector-token field is a password field; a local session cookie is reused only for the origin and token it was minted for; a local 401 reports `removed`, not `unpaired`.
 
@@ -104,9 +88,9 @@ The desktop server for the run was started with `WATTRACKER_DB` pointed at a scr
 Verification of the code above: `:app:testDebugUnitTest` -- **365 green** (353 before, 12 new); `:app:assembleDebug` green. Mutation-proved one at a time: deleting the envelope length check reddened only the short-envelope test; naming `ProviderException` a key failure reddened only the init half of the taxonomy test at `init` and only its doFinal half at `doFinal`; skipping the probe reddened exactly the four provisioning tests and left the healthy-key one green; dropping the "a vault is on disk" guard reddened only its own test; neutering `assertNonExportable` reddened only its test. No mutation commit is on the branch (AGENTS.md).
 
 Step-1 context: #266 landed via **#294 (`ff1f2aa`)**; #193 is closed
-(tablet-in-portrait screenshot confirmed), #156 closed via #274; #102 (the
-hosting decision) remains an unexecuted runbook and alone gates the "real
-deployment" half of #199. Android CI (PR #262) compiles and unit-tests
+(tablet-in-portrait screenshot confirmed), #156 closed via #274. **#102 is now
+closed (2026-10-27)** -- the cloud is deployed and serving since 2026-09-19, so
+the "real deployment" half of #199 is no longer gated. Android CI (PR #262) compiles and unit-tests
 `android/` on hosted `ubuntu-latest`; the full-snapshot dev harness (PR
 #240) is what runs. Verified on both AVDs (`medium_phone` API 36,
 `medium_tablet` API 35): rail in landscape, bottom bar in portrait, drawer
@@ -267,8 +251,8 @@ The one blocker for Step 2 has landed:
    of it.**
 2. **#193 is closed** (2026-09-14) — the owner confirmed the
    tablet-in-portrait screenshot; the Step 1 chain is fully out. **#194 is
-   the next startable Android issue and is labelled `ready`** (verified
-   2026-09-14); #195–#199 remain `blocked` as labelled.
+   the next startable Android issue and is labeled `ready`** (verified
+   2026-09-14); #195–#199 remain `blocked` as labeled.
 3. **The shared queue has moved** (AGENTS.md refreshed at #267). Top item
    is #277's two defects (open PR `agent2/277-cloud-sync-followups`); then
    #156's third product answer, #280 (legacy completions), #281 (iOS
@@ -280,10 +264,10 @@ The one blocker for Step 2 has landed:
    for the device run and the `Location` follow-up.
 4. **#156 is closed** (merged 2026-09-13 via #274): the desktop app
    enrolls, pairs, manages devices and pushes on a background scheduler —
-   per AGENTS.md, "cloud sync is on". What still gates the "real
-   deployment" half of #199 is #102 alone (the unexecuted hosting
-   runbook). #264 (one device-validation procedure, cross-cutting) is
-   unassigned; its Android half is taksmon's — ask before taking it.
+   per AGENTS.md, "cloud sync is on". **#102 closed 2026-10-27 and the cloud is
+   deployed and serving**, so the "real deployment" half of #199 is no longer
+   gated. #264 (one device-validation procedure, cross-cutting) is unassigned;
+   its Android half is taksmon's — ask before taking it.
 
 **Revised 2026-09-09 — local transport settled.** The #257 review's open
 transport question and the tailnet requirement recorded on #192 (2026-09-08)
@@ -319,9 +303,9 @@ The items the 2026-09-09 note left mid-flight have moved:
    `:app:testDebugUnitTest`, `:app:assembleRelease -PallowPlaceholderHost`.
    The release target is deliberate — `minifyReleaseWithR8` is the task
    that reads `keepRules/rules.keep`, where Step 2's Room/Tink rules go;
-   the flag suppresses only the placeholder-host guard while #102 is open.
-   Every "no Android CI exists" / "hosted runners are blocked" claim in
-   this plan is superseded.
+   the flag suppresses only the placeholder-host guard (see Step 7: #102 is
+   closed, so the real authority replaces the placeholder). Every "no Android
+   CI exists" / "hosted runners are blocked" claim in this plan is superseded.
 3. **The full-snapshot harness is on `main`** (PR #240 merged 2026-09-06,
    `ebd010e`, closes #234): Step 2's dependency on #240 is satisfied; the
    old single-`profile`-object harness is gone. PR #228 (iOS dashboard)
@@ -333,7 +317,7 @@ The items the 2026-09-09 note left mid-flight have moved:
    transport decision plus the four #260 follow-ups (release-host guard
    reading the value it guards, `keepRules` wired to R8 — verified
    empirically, `ExampleUnitTest` and the `androidx.test.ext:junit`
-   catalogue entry dropped, `wtDarkColorScheme` surface roles mapped from
+   catalog entry dropped, `wtDarkColorScheme` surface roles mapped from
    the palette) and closes #260. **Merge it before Step 2 code lands.**
 
 **Revised 2026-09-06.** Re-verified against `main` at `8c75eba`. What changed
@@ -383,7 +367,7 @@ since the 2026-09-01 draft:
 | Architecture | **Dual backend.** (1) Cloud read plane as #194–#198 specify (pairing code → Keystore P-256 → signed context refresh → `GET /api/v1/context/*` with the bearer reader context). (2) Local desktop server via the **connector model**: device token paired in the web UI Settings → session → local JSON API (`/api/state`, `/api/activities`, …), reached **over HTTPS through the rider's own reverse proxy** (see the transport row below). Screens read through one common `ReadModel` interface with one adapter per backend. |
 | Local backend transport | **HTTPS only, terminated by whatever front end the rider runs** (owner, 2026-09-09). The requirement is TLS in front of the local server — **`tailscale serve` and an ordinary reverse proxy (nginx, Caddy) are both accepted**, and the app cannot tell them apart: it sees an HTTPS origin with a chain to a system trust anchor. The tailnet stays a valid deployment for anyone who wants it; it is no longer a *requirement*, because it was the mechanism the #192 comment (2026-09-08) picked, not the property it argued for. In either case the desktop server keeps its loopback bind and speaks plain http to a co-located terminator. The app never speaks cleartext in a release build: `usesCleartextTraffic="false"`, release `network_security_config.xml` strict, **no `domain-config`, no pinning, no custom `TrustManager`**. **No hostname is baked in anywhere** — the rider types the origin, so any front end, name, port or vhost works. **The terminator must also not be publicly reachable** (owner, 2026-09-09): `tailscale serve`, nginx or Caddy on a LAN-only bind, or a VPN all qualify; an internet-facing proxy does not. The tailnet was providing that property silently, and widening to any terminator would have dropped it — an nginx satisfies the other three while bound to `0.0.0.0` and port-forwarded. It is load-bearing beyond transport secrecy: per the reasoning on #132 item 4, the `WATTRACKER_HOST` default of `127.0.0.1` is what keeps the first-account land grab unreachable, and **a reverse proxy defeats that even with the server still bound to loopback, because the proxy is what accepts the connection**. The land-grab window itself is narrow (`/welcome` gates on `_first_run()`, so it cannot mint a second account), but `/login` and the whole desktop UI would be internet-facing, and none of the app's auth was designed against an internet-facing threat model. The server keeps binding loopback and `WATTRACKER_ALLOW_NON_LOOPBACK` stays unset. This keeps all four properties #192's comment mandated (strict release NSC, no raw-socket transport, loopback bind preserved, terminator not publicly reachable) while requiring no third-party account of a rider who does not already have one. Supersedes both options the #257 review put up: the raw-socket cleartext path and the self-signed cert pinned at pairing. The decision and its code/doc changes **landed on `main` via PR #294 (merged 2026-09-14, `ff1f2aa`), which closed PR #266 and #260** — the strict-NSC description in this plan is `main`, not an in-flight tree. |
 | minSdk / targetSdk | minSdk **30** (Android 11, owner's floor; StrongBox API is 28+, Keystore EC P-256 is long stable). targetSdk **36** — Google Play has required API 36+ for new apps and updates **since 2026-08-31** (verify current policy at implementation time). |
-| Release CI runner (#199) | **Hosted `ubuntu-latest`** (owner, on #257; supersedes the earlier "deferred, plan for `macos-ci`" answer, which predated the repo going public). Standard hosted runners are unmetered on a public repo and `cloud.yml` already runs `bicep-validation` and `containerized` on `ubuntu-latest`. `macos-release.yml`'s `if: ${{ false }}` and any note claiming Actions are blocked at the account level are stale. The build/unit-test job (**#259**) **has landed**: `.github/workflows/android.yml` (PR #262, merged 2026-09-10), encoding both gotchas — `compileSdk 37` is not on the runner image (SDK licences accepted so AGP can fetch it) and `gradle/gradle-daemon-jvm.properties` pins `toolchainVersion=25` (pinned with `setup-java`, or Gradle re-downloads a JDK from foojay every run) — plus two deliberate deviations from the #257 sketch: `:app:assembleRelease -PallowPlaceholderHost` is in the job (it is the task that reads `keepRules/rules.keep`, where Step 2's Room/Tink rules go; the flag suppresses only the placeholder-host guard while #102 is open) and the test-report upload is `continue-on-error`. Do **not** copy `cloud.yml`'s fork gate: it exists for a persistent physical runner, and a hosted ephemeral Android job can safely cover fork PRs. |
+| Release CI runner (#199) | **Hosted `ubuntu-latest`** (owner, on #257; supersedes the earlier "deferred, plan for `macos-ci`" answer, which predated the repo going public). Standard hosted runners are unmetered on a public repo and `cloud.yml` already runs `bicep-validation` and `containerized` on `ubuntu-latest`. `macos-release.yml`'s `if: ${{ false }}` and any note claiming Actions are blocked at the account level are stale. The build/unit-test job (**#259**) **has landed**: `.github/workflows/android.yml` (PR #262, merged 2026-09-10), encoding both gotchas — `compileSdk 37` is not on the runner image (SDK licenses accepted so AGP can fetch it) and `gradle/gradle-daemon-jvm.properties` pins `toolchainVersion=25` (pinned with `setup-java`, or Gradle re-downloads a JDK from foojay every run) — plus two deliberate deviations from the #257 sketch: `:app:assembleRelease -PallowPlaceholderHost` is in the job (it is the task that reads `keepRules/rules.keep`, where Step 2's Room/Tink rules go; the flag suppresses only the placeholder-host guard while #102 is open) and the test-report upload is `continue-on-error`. Do **not** copy `cloud.yml`'s fork gate: it exists for a persistent physical runner, and a hosted ephemeral Android job can safely cover fork PRs. |
 | HTTP client | `HttpURLConnection` (plain, no deps). **Note:** issue #193 names "HttpURLConnection or `java.net.http`", but `java.net.http.HttpClient` does not exist in the Android SDK (JDK-11 API, never ported) — the choice is unambiguous. |
 | Screen cache | **Room** (AndroidX, explicitly allowed by #194) for the revision-keyed cloud cache; last-payload cache for the local backend. Justification over hand-rolled SQLite: compile-time-checked SQL, Flow-driven screens, and the cache is ~10 tables of small objects — Room's codegen is the cheap part, not the liability. |
 | App id | `com.wattracker.android` (mirrors `com.wattracker.ios`). |
@@ -395,9 +379,9 @@ since the 2026-09-01 draft:
 
 - #192 (epic) open. **#193 closed** (2026-09-14 — the owner confirmed the
   tablet-in-portrait screenshot that #257's re-opening was scoped to).
-  **#194 is the next startable Android issue and is labelled `ready`**
+  **#194 is the next startable Android issue and is labeled `ready`**
   (verified 2026-09-14; the stale `blocked` label is gone). #195–#199
-  remain `blocked` as labelled (screens also on #194/#195).
+  remain `blocked` as labeled (screens also on #194/#195).
 - Merged/closed and relied on here: #153 (device revocation routes), #165
   (deployment checks — and the APIM removal that followed), #167 (rider
   isolation + `cloud_objects_v1.json` fixture), **#240** (full-snapshot
@@ -413,12 +397,11 @@ since the 2026-09-01 draft:
   (see the 2026-09-15 note above), push held for re-review. The local-backend
   seam (`LocalClient`) stays an honest stub for its own later step. Announced
   per the queue rule below.
-- Still open and relevant: **#102** (hosting decision —
-  `infra/azure/DEPLOY.md` is an *unexecuted* runbook). It alone gates the
-  "real deployment" half of #199's Done; #156 (desktop cloud sync, which
-  mints pairing codes against a deployment) closed via #274, so the
-  desktop side exists on `main`. The dev harness and the local backend are
-  unaffected either way.
+- **#102 is closed (2026-10-27)** and the cloud has been deployed and serving
+  since 2026-09-19. What it retained was live-use validation, not code. #156
+  (desktop cloud sync, which mints pairing codes against a deployment) closed
+  via #274, so the desktop side exists on `main`. #199's cloud-pairing half is
+  therefore unblocked. The dev harness and the local backend are unaffected.
 - **Queue rule:** the refreshed AGENTS.md work queue (#267) carries no
   Android epic item — "the Android epic (#192–#199, plus #259 and #260) is
   taksmon's by GitHub assignee and is not on this queue"; announce before
@@ -480,8 +463,8 @@ re-verified with `gh` on 2026-09-11)
   reads the same files referenced from the repo, not copies.
 - P-256 wire formats: public key = uncompressed SEC1, 65 bytes
   `04‖X‖Y`, hex. Signature = **raw `r‖s`, 128 lowercase hex chars. Not DER.
-  Not low-s normalised** (the server accepts malleable signatures on purpose;
-  normalising `s` would sign something different). Algorithm is always taken
+  Not low-s normalized** (the server accepts malleable signatures on purpose;
+  normalizing `s` would sign something different). Algorithm is always taken
   from stored credential state, never inferred from the request.
 - Every read-plane auth failure (unknown device, revoked, bad signature,
   replayed nonce, …) returns the **identical 404** body as an unknown reader
@@ -717,7 +700,7 @@ executes no secrets and is torn down between runs — the file's comment says
 do not copy `cloud.yml`'s gate across), `actions/checkout@v4` +
 `actions/setup-java@v5` Temurin 25 (`gradle-daemon-jvm.properties` pins
 `toolchainVersion=25`; unpinned, Gradle re-downloads a JDK from foojay every
-run), SDK licences accepted so AGP can fetch compileSdk 37 (not on the
+run), SDK licenses accepted so AGP can fetch compileSdk 37 (not on the
 image), then `./gradlew --no-daemon :app:assembleDebug
 :app:testDebugUnitTest :app:assembleRelease -PallowPlaceholderHost`. Test-
 report upload on failure is `continue-on-error` (the account's artifact
@@ -733,171 +716,58 @@ the persistent-runner jobs; the Step 7 release workflow follows the hosted
 
 ## Step 0 — Prerequisites (install & set up first) — ✅ done
 
-This machine: **Windows x64**. The Android SDK is already installed at
-`C:\Users\Takazumi\AppData\Local\Android\Sdk` (see `android/local.properties`);
-the emulators use x86_64 system images accelerated by the Android Emulator
-Hypervisor Driver (AEHD) / Hyper-V — not `/dev/kvm`. Throughout Step 0, read
-`.venv/bin/...` as the Windows venv path `.venv\Scripts\...` and `./gradlew`
-as `\.\gradlew.bat` (or `gradlew` if on `PATH`).
+The setup procedure, the AVD commands and the IDE-agent configuration are in
+[`AGENTS.md`](AGENTS.md) — "Setting up this machine", "The dev loop", "IDE
+agent". They are standing instructions, not plan steps, so they are not
+repeated here.
 
-### 0.1 Install the toolchain
+Step-specific residue: this machine is Windows x64 with the SDK at
+`C:\Users\Takazumi\AppData\Local\Android\Sdk`; the emulators use x86_64 images
+accelerated by AEHD/Hyper-V, not `/dev/kvm`; Android Studio was already
+installed (2026.1.4 line); and the working AVDs are `medium_phone` (API 36) and
+`medium_tablet` (API 35) — the tablet must be exercised **in portrait**, because
+targetSdk 36 ignores orientation restrictions on large screens (the #171
+lesson). That measurement is part of Step 1's Done criteria.
 
-1. **Android Studio 4** (the current stable line with built-in Agent mode;
-   at planning time the September 2026 "Quail 4" feature drop — install
-   whatever is current at implementation time): **already installed** (the IDE
-   this plan is written in, 2026.1.4 line). If reinstalling, use the Windows
-   `.exe` from `https://developer.android.com/studio`; accept all licenses in
-   the SDK Manager.
-2. **JDK 17** (AGP floor; 21 if the installed AGP demands it) — Temurin via
-   your package manager or `https://adoptium.net`. Android Studio also bundles
-   a JBR for its own use; Gradle on the CLI needs a JDK on `PATH`.
-   Verify: `java -version`, `javac -version`.
-3. **Android SDK components** (already present at
-   `C:\Users\Takazumi\AppData\Local\Android\Sdk`; manage via `sdkmanager` under
-   `C:\Users\Takazumi\AppData\Local\Android\Sdk\cmdline-tools\latest\bin`, or
-   the SDK Manager UI):
-   - Android SDK Platform 36, Build-Tools (latest stable), Platform-Tools,
-     Emulator.
-   - System images: `google_apis;x86_64;36`.
-   Verify: `sdkmanager --list_installed`, `adb version` (run from a shell that
-   has `.../Sdk/platform-tools` and `.../Sdk/cmdline-tools/latest/bin` on
-   `PATH`).
-4. **A BYOK API key for the IDE agent** (owner-supplied): a Google AI Studio
-   key for Gemini, or an Anthropic/OpenAI key for a third-party model —
-   whatever the owner's key is. It goes into IDE-local settings only (0.4);
-   it is a credential — never in the repo, never in `.kilo/`, never in a PR
-   description, never pasted into a commit message.
+### 0.1 Install the toolchain — done, see [`AGENTS.md`](AGENTS.md)
 
-### 0.2 Create the two AVDs (phone + large screen)
+### 0.2 Create the two AVDs (phone + large screen) — done, see [`AGENTS.md`](AGENTS.md)
 
-```sh
-avdmanager create avd -n wt-phone -k "system-images;google_apis;x86_64;36" -d pixel_9
-avdmanager create avd -n wt-tablet -k "system-images;google_apis;x86_64;36" -d pixel_tablet
-```
+**Why the tablet must exercise portrait:** targetSdk 36 means the app is built
+against the Android-16 large-screen rules, where orientation and resizability
+restrictions are ignored on large screens — the same change iPadOS 26 made for
+iOS, which #171 only discovered by measurement. Do not trust the changelog:
+boot both AVDs and record what `config.orientation` and `smallestScreenWidthDp`
+actually report on the tablet in both orientations (screenshot + numbers, in
+`android/README.md`). That measurement is part of Step 1's Done criteria.
 
-- `wt-phone`: default. All app screens are designed landscape-first.
-- `wt-tablet`: **must exercise portrait too** — targetSdk 36 means the app is
-  built against the Android-16 large-screen rules, where orientation/
-  resizability restrictions are ignored on large screens (the same change
-  iPadOS 26 made for iOS, which #171 only discovered by measurement). Do not
-  trust the changelog: boot both AVDs, check what `config.orientation` and
-  `smallestScreenWidthDp` actually report on the tablet in both orientations,
-  and record the findings (screenshot + numbers) in `android/README.md`. This
-  measurement is part of Step 1's Done criteria.
-- Boot check: launch `emulator -avd wt-phone -no-snapshot-load` (in a new
-  window, or `Start-Process` in PowerShell — the POSIX `&` does not apply on
-  Windows), then `adb wait-for-device`,
-  `adb shell getprop ro.build.version.sdk` → 36. `avdmanager`/`sdkmanager`
-  live under `C:\Users\Takazumi\AppData\Local\Android\Sdk\cmdline-tools\
-  latest\bin`.
+### 0.3 Local wattracker for the dev loop — done, see [`AGENTS.md`](AGENTS.md)
 
-### 0.3 Local wattracker for the dev loop
+The commands, the loopback-vs-terminator split, and the harness flags are in
+[`AGENTS.md`](AGENTS.md) ("The dev loop"). Step-specific residue: the cloud
+harness is on `main` since PR #240 (merged 2026-09-06), and **this epic's
+branches make no harness changes** — it is read-only for this work.
 
-- The repo's `.venv` already works (used by the Python suite); on Windows the
-  interpreter is `.venv\Scripts\python.exe`. For the cloud harness it
-  additionally needs `\.\.venv\Scripts\python.exe -m pip install -e '.[cloud]'`.
-- **Local desktop server** (the rich local backend): `./start.sh` is a POSIX
-  script — run it under Git-Bash/WSL, or start the server directly in
-  PowerShell:
-  ```powershell
-  $env:WATTRACKER_PUBLIC_HOSTS = "10.0.2.2"
-  .\.venv\Scripts\python.exe wattracker\server.py
-  ```
-  **The bind stays on loopback for the emulator path** — one variable, not two.
-  `10.0.2.2` is the emulator's NAT alias for the *host's* loopback, so a
-  `127.0.0.1`-bound server is already reachable; only the Host-header allowlist
-  needs the name, because the server 400s any `Host` it does not answer to.
-  (Never `127.0.0.1` from an emulator — that is the emulator's own loopback.)
-  - emulator, debug build → `http://10.0.2.2:8000`, under the `debug` source
-    set's NSC exception;
-  - physical device, or any release-shaped run → `https://<hostname>` through
-    the rider's TLS terminator (`tailscale serve` or a reverse proxy — either),
-    with that name in `WATTRACKER_PUBLIC_HOSTS` and
-    `WATTRACKER_COOKIE_SECURE=1` set. A wider bind (`WATTRACKER_HOST` +
-    `WATTRACKER_ALLOW_NON_LOOPBACK=1`) is needed **only** if the terminator
-    runs on a different machine than the server.
-  Pair the phone as a device in the web UI (Settings → connector pairing,
-  label e.g. `Pixel-9`) to obtain a token.
-- **Cloud dev harness** (the cloud backend in debug; on `main` since PR #240
-  merged 2026-09-06 — see Ground truth — Cloud dev harness):
-  `\.\.venv\Scripts\python.exe scripts\walking_skeleton_server.py --user-id
-  <id>` — loopback by default, in-memory store, full snapshot published,
-  prints pairing code(s). No harness changes in this epic's branches. The
-  `--lan` auto-detect is written for macOS and is untested on Windows, but a
-  physical device needs neither it nor `--host 0.0.0.0`: run
-  `adb reverse tcp:8765 tcp:8765` over USB and point the app at
-  `http://localhost:8765`, which the debug `network_security_config.xml`
-  already permits (the emulator needs no `--lan` either; it reaches the host
-  via `10.0.2.2`). Keep the harness on its default loopback bind in both cases.
-
-### 0.4 IDE agent: Android Studio 4 Agent mode + BYOK
+### 0.4 IDE agent: Android Studio Agent mode + BYOK — done, see [`AGENTS.md`](AGENTS.md)
 
 Goal: an agent that can build, deploy, test, inspect and screenshot the app
-inside the IDE, with the owner's own model key. This is first-party IDE
-functionality — there is **no MCP server to register and no plugin to
-install**; consequently there is no `.kilo/kilo.json` MCP block either
-(`.kilo/` stays untracked, local-only, as it is today).
-
-1. **Sign in to Android Studio** (Google account), then **Settings → Tools →
-   AI → Model providers** and configure BYOK:
-   - **Gemini**: "Get Gemini API key" opens Google AI Studio; paste the key
-     into the **API key** field, tick the models to enable, Apply. (A
-     personal key also widens Agent mode's context window — up to 1M tokens
-     with Gemini 3 Pro — versus the no-cost default tier's limits.)
-   - **Third-party model** (Anthropic, OpenAI, …): the IDE's "using remote
-     models" setup — add the provider's API endpoint and key under the same
-     Model providers screen; the enabled models appear in the chat's model
-     picker.
-   Key handling: the key is stored in IDE-local settings (machine-local).
-   Treat it like any credential — it must never reach the repo (AGENTS.md:
-   the history was rewritten once to strip a personal address; keys are one
-   class worse). If the key must not touch this machine at all, the no-cost
-   default tier still works and nothing in this plan depends on the model
-   being a particular vendor.
-2. **Use Agent mode** from the AI chat (agent-mode toggle; prompts are
-   executed with IDE tools: build, run to device, logcat, terminal). Android
-   Studio's agent mode **honors `AGENTS.md`** — this repo's multi-agent
-   agreement (fetch-before-rebase, branch ownership, test-suite rule,
-   identity) is therefore visible to the IDE agent; keep it that way, and
-   treat the IDE agent as one more participant in that agreement (it works in
-   *this* checkout, so the worktree rule binds it: it must not push to
-   `main`, must not touch the other agent's worktree, and commits it makes
-   carry this clone's noreply identity).
-3. **The terminal stays the floor.** Every thing the IDE agent can do has a
-   `gradlew` + `adb` equivalent (`\.\gradlew.bat :app:assembleDebug`, `adb
-   install`, `adb shell am start`, `adb shell uiautomator dump` (hierarchy —
-   the reliable per-device UI check on this machine; on-disk `screencap` is
-   broken here, see "How to inspect / capture the UI" in the Step 1 notes),
-   `adb shell input`, `adb logcat`, `adb emu console`), and nothing in the
-   validation plan requires the IDE agent. This is what CI runs. If Agent
-   mode is unavailable or misbehaves, the whole plan still executes from the
-   terminal.
-4. **Verify the whole loop before any Step 1 work:**
-   - Android Studio has the (future) `android/` project, or a scratch Compose
-     project, open; the model picker shows an enabled BYOK model; Agent mode
-     is on.
-   - Instruct the agent to build + deploy the scratch app to `wt-phone`,
-     pull a screenshot, and read a few logcat lines. Do the same three things
-     once from the bare terminal (`\.\gradlew.bat :app:installDebug`, `adb
-     shell uiautomator dump` (the UI check), `adb logcat -d`) so both paths
-     are known-good.
-   - `adb devices` shows the booted emulator, independent of the IDE.
+inside the IDE, with the owner's own model key. First-party IDE functionality —
+**no MCP server to register, no plugin to install, no `.kilo/kilo.json` block**
+(`.kilo/` stays untracked, local-only). The configuration steps, the key-handling
+rule, the "agent mode honors `AGENTS.md`" rule and the terminal-is-the-floor
+rule are in [`AGENTS.md`](AGENTS.md) ("IDE agent"). Step-specific residue: the
+loop was verified end to end before Step 1 work — a build+deploy+screenshot+
+logcat run through Agent mode and the same three things once from the bare
+terminal.
 
 ### 0.5 Repo hygiene (AGENTS.md)
 
-- Per-clone commit identity set to the noreply address; verify with
-  `git config user.email` before the first commit.
-- Announce before starting (the Android epic is not on the AGENTS.md work
-  queue). Cut feature branches from a freshly fetched `origin/main`
-  (`git fetch origin` first — never rebase onto a stale ref), named for the
-  work (e.g. `android/cloud-client` for #194), never after a closed issue.
-  The `feature/android-client` branch from #193 is merged and deleted on the
-  remote; a local copy still points at the merge commit — delete it or
-  ignore it.
-- Install the pre-push hook if not already: `scripts/hooks/install.sh` is a
-  POSIX script, so run it under Git-Bash/WSL (`bash scripts/hooks/install.sh`).
-- Python suite green (`.venv\Scripts\python.exe -m pytest` on Windows) before
-  any merge to main.
+Done — see [`AGENTS.md`](AGENTS.md) in this directory and the repo-root
+`AGENTS.md` for the standing rules (commit identity, fetch-before-rebase,
+branch naming, pre-push hook, Python suite before merge). Step-specific
+history: the `feature/android-client` branch from #193 is merged and deleted
+on the remote; a local copy still points at the merge commit — delete it or
+ignore it.
 
 ---
 
@@ -954,41 +824,10 @@ AEHD/Hyper-V surface-capture quirk, not an app problem. The IDE's capture of
 the emulator window is the reliable path (and what the PR images come from).
 Documented in `android/README.md`. The `dumpsys` measurements are unaffected.
 
-**How to inspect / capture the UI on this machine (learned in session 3 —
-every Step-2+ Done criterion that asks for a screenshot or UI check uses
-these paths):**
-
-- **Visual screenshot (to eyeball layout / a PR image):** the IDE's
-  `take_screenshot` tool, or the agent's `ui_state` tool (returns a PNG of the
-  focused window plus the XML hierarchy). This reads the emulator *window*
-  directly, so it shows the live app. **Do not** use `adb exec-out screencap`,
-  `adb shell screencap`+`pull`, or `android screen capture` for a visual shot
-  here — all return the stale lock frame. The IDE capture is ephemeral
-  (not saved to disk) and, being `gh`-PR-incompatible, the owner attaches the
-  PR images manually.
-- **UI hierarchy (the reliable, per-device, scriptable path):**
-  `adb -s <serial> shell uiautomator dump /sdcard/ui.xml` then
-  `adb -s <serial> pull /sdcard/ui.xml out.xml`, and parse the XML (each
-  `node` has `text`, `content-desc`, `class`, `bounds`, `clickable`). This
-  works per-serial (unlike `ui_state`, which only sees the IDE-attached
-  device), needs no surface capture, and is how the portrait bottom-bar vs.
-  landscape rail was verified (bounds of the five nav labels: one horizontal
-  row at high Y = bottom bar; stacked at low X = left rail).
-- **Config measurement (swdp / orientation / rotation):**
-  `adb -s <serial> shell dumpsys activity <package>` → `mCurrentConfig`
-  (`smallestScreenWidthDp`, `orient=`, `ROTATION_`), and
-  `dumpsys input` → `mCurrentOrientation`. This is unaffected by the
-  screenshot quirk — use it for the numbers, not pixels.
-- **Forcing orientation:** `adb -s <serial> shell settings put system
-  accelerometer_rotation 0` then `settings put system user_rotation <N>`.
-  Phone: `0`=portrait, `1`=landscape. Tablet (natural = landscape): `0`=
-  landscape, `1`=portrait. Then `am start -n <pkg>/.MainActivity` to re-apply.
-- **Keeping the screen awake** (for repeated captures): `adb -s <serial>
-  shell "settings put system screen_off_timeout 1800000; svc power stayon
-  true"`.
-
-**The rest of this section is retained for the next steps** — the BOM API
-pitfalls (do not re-derive) and the toolchain state on this machine.
+**How to inspect / capture the UI on this machine:** moved to
+[`AGENTS.md`](AGENTS.md) (visual capture, `uiautomator dump`, `dumpsys` config
+measurement, forcing orientation, keeping the screen awake). Every Step-2+
+Done criterion that asks for a screenshot or UI check uses those paths.
 
 **Done in code (both variants build green):**
 
@@ -1001,11 +840,12 @@ pitfalls (do not re-derive) and the toolchain state on this machine.
   the system" rule (rail/drawer render platform `ImageVector`s, no bundled
   image assets). Build config: `buildConfig` on; `WATTRACKER_CLOUD_SCHEME` +
   `WATTRACKER_CLOUD_AUTHORITY` per build type (debug `http` /
-  `10.0.2.2:8765`; release `https` / `cloud.wattracker.example` placeholder
-  until #102 lands — the guard in `app/build.gradle.kts` refuses
-  `assembleRelease` with it unless `-PallowPlaceholderHost` is passed; #266
-  makes the guard read the same single `releaseCloudAuthority` val the
-  field ships).
+  `10.0.2.2:8765`; release `https` / a `releaseCloudAuthority` that defaults
+  to `cloud.wattracker.example`). That placeholder was tied to #102, which is
+  now closed, so the real authority must be set (Step 7). The guard in
+  `app/build.gradle.kts` refuses `assembleRelease`/`bundleRelease` while the
+  placeholder is in use unless `-PallowPlaceholderHost` is passed; #266 makes
+  the guard read the same single `releaseCloudAuthority` val the field ships).
 - Manifest: `INTERNET`, `usesCleartextTraffic="false"`,
   `networkSecurityConfig="@xml/network_security_config"`.
 - `res/xml/network_security_config.xml` (release: base cleartext false) and
@@ -1032,9 +872,10 @@ pitfalls (do not re-derive) and the toolchain state on this machine.
   **Its "Measured on the AVDs" table is still placeholder** — fill it in the
   device-verification pass.
 
-**API ground truth for this BOM (2026.02.01 → M3 1.4.0, foundation 1.10.4) —
-cost several compile cycles to find, verified against the resolved jars; do
-not re-derive:**
+**API ground truth for this BOM** — moved to [`AGENTS.md`](AGENTS.md), which
+records the four pitfalls (Foundation 1.10 window-size APIs removed; the M3
+1.4 drawer signatures; `ColorScheme` constructors without defaults; the KMP
+material-icons-extended artifact names). Do not re-derive them here.
 
 - Foundation 1.10 **removed** the window-size-class / window-metrics APIs
   (`WindowWidthSizeClass`, `currentWindowWidthSizeClass`, and the
@@ -1047,13 +888,6 @@ not re-derive:**
   the background on the sheet's content instead. `DismissibleNavigationDrawer`
   / `DismissibleDrawerSheet` are the new names alongside the modal pair.
 - M3 1.4 `ColorScheme` constructors have **no default arguments** — build
-  the scheme from `darkColorScheme(…)` with named overrides.
-- material-icons-extended 1.7.x is KMP: **no drawable XMLs** in the AAR; the
-  icons are `ImageVector`s in `androidx.compose.material.icons.filled` (same
-  package as core, e.g. `Icons.Filled.Speed`). Also: the plain
-  `material-icons-extended-1.7.8.aar` Maven URL 404s — the KMP redirect
-  makes the real artifact `material-icons-extended-android` (same for
-  `material3-android`, `ui-android`, `foundation-android`).
 
 **What comes next — Step 2 (issue #194 + local backend):**
 
@@ -1102,65 +936,17 @@ not re-derive:**
 
 Nothing in Step 2 touches the shell or the theme — `RootScreen.kt`, the
 `Destination` enum and `Palette.kt` are stable unless a new destination or
-colour is introduced by pairing (#195).
+color is introduced by pairing (#195).
 
-**Toolchain state on this machine (all discovered sessions 2–3):**
-
-- No JDK on `PATH`; the only one is Android Studio's JBR:
-  `C:\Program Files\Android\Android Studio\jbr`. Every `sdkmanager` /
-  `avdmanager` / `android` invocation needs `$env:JAVA_HOME` set to it.
-  PowerShell also has neither `JAVA_HOME` nor `HOME` — the **new** tools
-  NPE without `$env:HOME` (`AvdManager.createInstance: parameter
-  baseAvdFolder` is null), so set it per shell too.
-- `cmdline-tools`: build 11076708 (sdkmanager 12.0) is **too old for this
-  SDK's package metadata** ("only understands SDK XML versions up to 3") and
-  its `avdmanager` NPEs (`Path.getFileSystem()`; "Error: AVD not created.
-  null" right after "Copying files"). **Upgraded to 16111833**, now in
-  `cmdline-tools\latest` — it ships the new `android.exe` CLI (1.0.16261425)
-  and `sdkmanager` prints a deprecation notice pointing at `android sdk`.
-  Newest-build lookup: `https://dl.google.com/android/repository/
-  repository2-3.xml` → `commandlinetools-win-<build>_latest.zip`.
-- All SDK licenses accepted. `sdkmanager --licenses` ignores piped input —
-  feed the `y`s through a file: `cmd /c "sdkmanager … --licenses < ys.txt"`.
-- `system-images;android-36;google_apis;x86_64` installed (~4.3 GB),
-  verified via `sdkmanager --list_installed`.
-- **Emulator 37.1.11 cannot boot hand-written AVDs.** It finds the AVD name
-  ("Found AVD name 'wt-phone'"), then `path_getRootIniPath` returns NULL →
-  "Failed to process .ini file (null)\config.ini" → falls back to the `arm`
-  default ABI → FATAL "CPU Architecture 'arm' is not supported". Both
-  layouts were tried (top-level `<name>.ini` pointer + `<name>.avd\config.ini`,
-  and the full config duplicated into `<name>.ini`) with and without
-  `ANDROID_AVD_HOME`/`ANDROID_SDK_HOME` (backslash and forward-slash forms).
-  Do **not** spend another cycle on hand-written AVDs.
-- **New `avdmanager` (16111833):** with `HOME` + `ANDROID_AVD_HOME` +
-  `ANDROID_HOME` + `ANDROID_SDK_ROOT` all set, `create avd` fails with
-  "Can't locate Android SDK installation directory for the AVD .ini file".
-  It has **no** `--sdk_root` option (checked its help). Unresolved.
-  Its failed runs leave partial `<name>.avd` dirs behind (next attempt then
-  fails with "already exists") — `~/.android/avd` currently holds
-  `wt-phone.avd` + `wt-tablet.avd` leftovers plus `avd.ini.bak` (the renamed
-  top-level `avd.ini`); delete the two `.avd` dirs before the next attempt.
-- **New `android` CLI passes environment detection:**
-  `…cmdline-tools\latest\bin\android.exe info` → `sdk:
-  C:\Users\Takazumi\AppData\Local\Android\Sdk`, `version: 1.0.16261425`.
-  Per the `android-cli` skill its `emulator` subcommand has `create` / `start`
-  ("returns when the emulator is fully started and ready to use") / `list` /
-  `stop` / `remove`, plus `android screenshot` and `android layout` (JSON UI
-  tree — the faster way to verify the rail/drawer than eyeballing a PNG).
-  **Resolved (session 3):** the CLI worked as documented. `android emulator
-  create` is profile-based, not device-model-based — there is **no**
-  `pixel_9`/`pixel_tablet`; the profiles are `small_phone`, `medium_phone`,
-  `medium_tablet`, `small_desktop`, `medium_desktop`, `large_desktop` (see
-  `android emulator create --list-profiles`). `medium_phone` +
-  `medium_tablet` were created and booted: the CLI auto-downloads the image
-  and `start` blocks until the device is ready. `medium_tablet` lands a
-  Pixel_Tablet model but only has an **API 35** x86_64 image (see the
-  deviation notes above). The orphaned `wt-phone.avd`/`wt-tablet.avd` dirs
-  from the old `avdmanager` attempts can be deleted from `~/.android/avd`
-  (harmless either way).
-- Scratch copies of the downloaded artifacts (cmdtools zips, the resolved
-  AARs, javap'd jars) live in this conversation's artifacts `scratch/`
-  directory — ephemeral, re-download if gone (URLs above).
+**Toolchain state on this machine:** moved to [`AGENTS.md`](AGENTS.md)
+(no JDK on `PATH`; `$env:JAVA_HOME`/`$env:HOME` needed per shell; the
+`cmdline-tools` build to use; the license-file trick; the installed system
+image; hand-written AVDs are a dead end; the `android` CLI's profile-based
+`emulator` commands). Step-specific history: `medium_phone` and
+`medium_tablet` were created and booted with the new CLI, and the tablet's
+only x86_64 image is API 35 — see the deviation notes above. Scratch copies
+of the downloaded artifacts live in this conversation's artifacts `scratch/`
+directory — ephemeral, re-download if gone.
 
 > [!NOTE]
 > Step 1 is merged (PR #257, `6830150a`); `feature/android-client` is
@@ -1299,7 +1085,7 @@ and the terminal `gradlew`+`adb` equivalents).
   high-s vectors must survive unmodified — **no low-s normalization**).
   A live signed refresh against the dev harness is the integration proof.
   iOS precedent: `CanonicalRequest.swift` + `CloudClient` signing — compare
-  behaviour, don't copy Swift into Kotlin.
+  behavior, don't copy Swift into Kotlin.
 - Nonce: 24 random bytes → urlsafe base64 without padding (iOS precedent;
   ≤512 bytes is the server limit, `security.py`).
 
@@ -1399,7 +1185,7 @@ Port the iOS decisions, keeping the constants and their *names* in sync with
       (`src/debug/res/xml/network_security_config.xml`) for the emulator and
       the cloud dev harness. That file stays in the `debug` source set so it
       cannot ship; debug-only scaffolding is fine, shipped cleartext is not.
-    - Platform `HttpURLConnection` behaviour is now an asset rather than
+    - Platform `HttpURLConnection` behavior is now an asset rather than
       something to re-implement: connection reuse, timeouts, redirects, chunked
       decoding and proxy support all come from the SDK. Keep the cloud client's
       no-secrets-in-logs rule — the local device token and the session cookie
@@ -1542,7 +1328,7 @@ model with it, lasts the whole process. Two consequences are designed in:
   start until the process died.
 - **A refresh cancels the load in flight.** Only the newest load has read the
   current pairing state. `CloudSession.load` serves the cache when its network
-  step fails, and cancellation counts as a failure there, so a cancelled load
+  step fails, and cancellation counts as a failure there, so a canceled load
   can still *return normally*; `checkActive()` after every read is what keeps
   its stale result off the screen.
 
@@ -1694,7 +1480,7 @@ became `aChangedIdentitySupersedesTheLoadInFlight`, with
 - **A re-pair clears the previous rider's tiles**: `load()` drops the
   on-screen data the moment the identity changes, so a first load that fails
   does not leave the old data up under "Syncing."
-- **A reset over HTTPS is recognised as a wake**: `isColdStart` walks the
+- **A reset over HTTPS is recognized as a wake**: `isColdStart` walks the
   cause chain and matches `SSLException` (and a `SocketException` that is not a
   refused connection), not just a top-level `SocketException`/`EOFException`.
 - **The refresh ride-out is lifecycle-guarded**: the retry and the
@@ -1730,7 +1516,7 @@ became `aChangedIdentitySupersedesTheLoadInFlight`, with
 - Phone landscape: **list and detail side by side** (the wide-short viewport
   has the width; push navigation costs the round-trip on the scarce axis) —
   state the justification in the layout code. Tablet: same, wider.
-- Cutoff: a hidden ride is **absent**, not greyed.
+- Cutoff: a hidden ride is **absent**, not grayed out.
 - Perf check per #197's Done: realistic history scrolls without jank; verify
   with `adb shell dumpsys meminfo` before/after a long scroll (no unbounded
   growth) — the 1500-point downsampling decision gets validated here on a real
@@ -1800,7 +1586,7 @@ became `aChangedIdentitySupersedesTheLoadInFlight`, with
    parent for the shell's highlight). The "Ride graphs" chart is a
    `Canvas` over the ported model: 220dp, dynamic label padding, grid from
    the power axis (or the right axis when power is hidden), linear lines, no
-   markers, altitude fill 0.18 / line 0.5 in the muted grey — the iOS look,
+   markers, altitude fill 0.18 / line 0.5 in the muted gray — the iOS look,
    not the desktop palette.
 
 **Verification (2026-10-15).** `:app:testDebugUnitTest` 218 passed, 0
@@ -1826,7 +1612,7 @@ failed (was 174 before this branch); `:app:assembleDebug` and
 **Code review round 2 (2026-10-17, PR #450).** Four blocking findings and
 five minor ones:
 - **The detail/stream reads were siblings of the load, not children of it.**
-  `scope.async` used `viewModelScope`, so `loadJob.cancel()` cancelled only
+  `scope.async` used `viewModelScope`, so `loadJob.cancel()` canceled only
   the awaits and every click through the two-pane list left two reads running
   for the ride just left — the road to a cloud 429. Both reads now run inside
   a `coroutineScope` belonging to the load; `supersedingALoadCancelsTheReads…`
@@ -1911,7 +1697,7 @@ declined:
   is not: Android's waking notice comes from a `Failure.Waking` answer, never
   from iOS's 5 s in-flight watch, so a read that spends the full ride-out
   (60 s + 3 s + 60 s) shows a spinner the whole time on all three screens.
-  That is pre-#419 behaviour, not a regression from this PR, and the row now
+  That is pre-#419 behavior, not a regression from this PR, and the row now
   says so. Implementing `WakingWatch` across the dashboard, the list and the
   detail is the follow-up; it is one shared helper and three call sites.
 - **Declined: the author rewrite.** The reviewer would rather `taksmon`
@@ -1922,7 +1708,7 @@ declined:
 
 **Verification (2026-10-19).** `:app:testDebugUnitTest` 237 passed, 0 failed
 (4 new `RideDetailViewModelTest` cases); `:app:assembleDebug` and
-`:app:assembleRelease -PallowPlaceholderHost` green. Each behaviour fix here
+`:app:assembleRelease -PallowPlaceholderHost` green. Each behavior fix here
 was mutation-proved locally and the mutation reverted before committing:
 putting the old `loadedId == activityId` test back turns
 `aPullWhileALoadIsInFlightLeavesTheFlagsToTheNewLoad` red on its first
@@ -1966,7 +1752,7 @@ Still owed with a real device / the owner's review: the paired tablet
 
 **PR #450 review, round 4 (2026-10-24).** The owner's re-review of `9e425ea`
 found no blockers and left two non-blocking nits. Both are answered in prose:
-the head this round carries comments only, no behaviour change.
+the head this round carries comments only, no behavior change.
 
 - **The list holds every ride summary in memory** — #197's "paged or lazily
   loaded — do not hold every ride in memory". It does, and the PR body now
@@ -2080,7 +1866,7 @@ into `docs/mobile-parity.md` in the same PR.
   use `chartTickLabel` now. The month chevrons are vendored vectors, so Material's
   RTL mirroring never reached them (`Modifier.scale(-1f, 1f)` in RTL). Each day
   cell is now one accessibility node named by its date, adjacent-month cells
-  naming their neighbour month ("every month has a 12th"). The unnamed-workout
+  naming their neighbor month ("every month has a 12th"). The unnamed-workout
   fallback was the string "Activities" (`destination_activities`); it is
   "Workout", iOS's fallback. A zero volume change printed an up arrow and "+0%"
   where the desktop prints a flat marker with no sign. `CalendarMonth.fromISODate`
@@ -2109,7 +1895,7 @@ Verification: **310 JVM tests green** (was 302). New: `anEmptyMonthSaysSoAndStay
 `phaseIsTheMonthsContentButNotTheCells`, `aNeighboursBusyDayDoesNotMakeThisMonthLookFull`,
 `printedPercentsRoundTheirHalfAwayFromZero`, `theAtFtpLabelRoundsRatherThanTruncates`,
 `oneReadDoesNotEvictAnotherRoutesCache`, `aCalendarReadThatOutlivesAResetIsNotStored`,
-and the pinned zero percent. Each behavioural fix was mutation-proved one at a
+and the pinned zero percent. Each behavioral fix was mutation-proved one at a
  time: reverting it turns exactly the new test(s) red and leaves the rest green.
 `:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost` assemble.
 
@@ -2158,7 +1944,7 @@ Still unseen on device: the compact phone cell and the portrait bottom sheet (th
 flag they read is the one verified above, and the #456 pass rendered both), and
 the flat zero-change marker, which needs two complete volume windows the seed
 does not have - `VolumeDataTest.formattingVoicesMatchTheScreens` pins its text.
-Two pre-existing RTL artefacts were seen and deliberately **not** touched here:
+Two pre-existing RTL artifacts were seen and deliberately **not** touched here:
 value strings built as "$value $unit" bidi-swap in an RTL locale ("kg 70",
 "h 4.0"), and untranslated strings staying English in a locale the app has no
 strings for. Physical-device no-jank stays owed, as it does on #197.
@@ -2264,6 +2050,34 @@ Owner-side (not code): Google Play Console developer account (**one-time $25**),
 create the app entry, create the **internal testing track** (not open/closed —
 up to 100 testers by email, no review queue, builds don't expire).
 
+**The Play API service account, 2026 workflow.** Google removed the "Setup" and
+"API access" pages from Play Console. Do not link a Cloud project from inside
+Play Console. The current flow has three steps:
+
+1. **Enable the API in Google Cloud.** Select or create a project, then
+   APIs & Services > Library, search "Google Play Android Developer API", and
+   click Enable.
+2. **Create the service account and its JSON key.** IAM & Admin > Service
+   Accounts > Create service account. Name it, for example `play-console-api`.
+   Skip the optional roles and click Done. Copy the long email address. Then
+   open the account, Keys > Add key > Create new key > JSON. The download is
+   the credentials file.
+3. **Grant access in Play Console.** Left menu > Users and permissions >
+   Invite new users. Paste the service account email. On the Account
+   permissions tab, check the permissions the upload needs (`Release apps to
+   testing tracks` and `Manage testing tracks`), then click Invite user.
+
+The old "API access" page is gone. A guide that still says to link the account
+from Play Console is stale.
+
+**Secrets (already set on this repository):** `ANDROID_UPLOAD_KEYSTORE_B64`,
+`ANDROID_UPLOAD_KEYSTORE_PASSWORD`, `ANDROID_UPLOAD_KEY_PASSWORD`,
+`ANDROID_UPLOAD_KEY_ALIAS`, `PLAY_SERVICE_ACCOUNT_JSON`. The keystore signs the
+bundle. The service account authorizes the upload. They are independent.
+
+`.gitignore` covers `*.jks` and `*.keystore`, but **not** a JSON service-account
+key. Keep that file outside the tree, or add an ignore line before creating it.
+
 Code/config:
 
 1. **App signing:** enroll in Play App Signing. Generate an **upload key**
@@ -2281,14 +2095,32 @@ Code/config:
      implementation; tag-triggered per #199).
    - `runs-on: ubuntu-latest`. Reuse android.yml's proven steps: checkout,
      JDK 25 via `setup-java@v5` (the `toolchainVersion=25` pin), accept SDK
-     licences (compileSdk 37 is not on the image). No fork gate, no Docker,
+     licenses (compileSdk 37 is not on the image). No fork gate, no Docker,
      no self-hosted runner.
-   - steps: → `./gradlew --no-daemon :app:bundleRelease
-     -PallowPlaceholderHost` (the placeholder-host guard refuses a release
-     build without the flag while #102 is open — retire both when the real
-     host lands) → `bundletool build-apks`/`zip` as needed → upload to the
-     internal track via the Play CLI / JSON API with the service-account or
-     upload-key secrets. No manual Android Studio steps.
+   - steps: → `./gradlew --no-daemon :app:bundleRelease` → `bundletool
+     build-apks`/`zip` as needed → upload to the internal track via the Play
+     Developer API with `PLAY_SERVICE_ACCOUNT_JSON` and the upload-key
+     secrets. No manual Android Studio steps.
+   - **`app/build.gradle.kts` has no `signingConfig`.** Release builds are
+     unsigned today, so `bundleRelease` cannot produce a Play-ready `.aab`.
+     Add a release `signingConfig` that reads the four upload-key values from
+     environment variables, and set those variables in the workflow from the
+     secrets.
+   - **The placeholder host is retired.** `releaseCloudAuthority` in
+     `app/build.gradle.kts` still defaults to `cloud.wattracker.example`, and
+     the guard still refuses `assembleRelease`/`bundleRelease` without
+     `-PallowPlaceholderHost`. Since #102 is closed and the cloud is deployed,
+     set the real authority (a Gradle property or `local.properties`
+     `wattrackerCloudAuthority`) and drop the flag from the workflow. The guard
+     then passes on its own, and a release build that still points at the
+     placeholder fails instead of shipping. Retire the guard itself only when
+     no placeholder path remains.
+   - `versionCode`/`versionName` come from the tag, not the static `1`/`"1.0"`
+     in `app/build.gradle.kts`: Play refuses a re-upload at a versionCode it
+     already has, and the update-in-place check in 5 needs a higher one.
+     Derive both from `android/v*` (e.g. the numeric part), or bump
+     explicitly per release — decide at implementation and pin it in the
+     workflow so a human never has to remember.
    - Hosted runners are ephemeral: every run pays the cold download (Gradle
      distribution, SDK 37, AndroidX — GBs). Dependency caching
      (`gradle/actions/setup-gradle`) was deliberately left out of android.yml
@@ -2296,20 +2128,92 @@ Code/config:
      call); a deliberate add-back for the release workflow is acceptable if
      build times get painful, not a regression.
 3. **Docs** (`docs/android-distribution.md`): how a rider joins the internal
-   track (invite by email, Play Install on the device, the app is sideloaded —
-   pairing still goes through the in-app pairing screens), how to promote a
-   build, how to rotate the upload key.
-4. **The "pair against a real deployment" half is gated on #102 alone:**
-   the deployment is an unexecuted runbook; the desktop app can already
-   mint pairing codes against a deployment (#156 closed via #274,
-   2026-09-13). Nothing here blocks on that — the internal track can run
-   and riders can pair against the dev harness / local backend — but say
-   so in the PR description if the Done wording implies a deployed cloud.
+   track (added by email as a tester, opt-in link, then install from Play —
+   not a sideload; pairing still goes through the in-app pairing screens), how
+   to promote a build, how to rotate the upload key.
+4. **The cloud deployment exists, so cloud pairing is the target.** #102 closed
+   2026-10-27 and the cloud has been serving since 2026-09-19. The desktop app
+   mints pairing codes against it (#156 closed via #274, 2026-09-13), so #199's
+   "pair with a pairing code" half can be met against the real deployment.
+   See 5: a Play-installed build **cannot** use the HTTP dev harness, so the
+   dev harness is not a fallback for this run.
 
-**Done (per #199):** both riders install from the internal track and pair
-(with a code — harness/local until the deployment exists); release job runs
-from a tag with no manual steps; no signing material in the repository (diff
-inspection).
+5. **Device test, once a build is on the internal track.** This is the first
+   time the **release** shape runs on a device, so it is a separate
+   verification target, not a repeat of the debug AVD passes: R8 has
+   minified the app (the `keepRules` set is exercised at runtime for the first
+   time), Play has re-signed the bundle and delivered it as Play-generated
+   split APKs, and the shipped `network_security_config.xml` is the strict
+   one — cleartext is refused for every connection.
+
+   **Backend for this run.** The dev harness is HTTP on a loopback bind, and
+   the `debug` source set's NSC is the only thing that permits it. A Play build
+   has no such exception, so **the harness is not a usable pairing target**.
+   The cloud deployment exists (#102 closed 2026-10-27), so **cloud pairing is
+   the primary target**: a pairing code minted by the desktop app against the
+   real deployment. The **local desktop server over HTTPS** through the
+   rider's TLS terminator is the second target —
+   `WATTRACKER_PUBLIC_HOSTS=<the phone-facing hostname>`,
+   `WATTRACKER_COOKIE_SECURE=1`, server still bound to loopback — with the
+   hostname typed into Settings. That run also proves that no hostname is
+   baked in.
+
+   **Sequence, on a physical device, with the app installed from Play:**
+   1. Install via the internal-testing opt-in link. Confirm the installed
+      version matches the uploaded one:
+      `adb shell dumpsys package com.wattracker.android` — the
+      `versionName`/`versionCode` line.
+   2. Pair to the cloud with a pairing code (Settings → cloud). Screenshot the
+      pairing flow. Then pair to the local backend over HTTPS (Settings →
+      local) and screenshot that flow too, so both backends are exercised.
+   3. **The credential-vault check owed from #457/#459.** `adb shell am
+      force-stop com.wattracker.android`, relaunch from Play, and confirm
+      Settings still shows the device paired and the Dashboard reads. This is
+      the only evidence that the Keystore-wrapped vault survives a real
+      process restart with the IV convention the provider actually uses: the
+      JVM suite pins the `[IV][body][tag]` layout and the round trip under a
+      software key, but it cannot reach the AndroidKeyStore. The failure mode
+      to look for is a silent unpair — safe (the device reports unpaired and
+      `StoreHealth` says why) but it must be seen.
+   4. The four data screens (Dashboard, Activities, Calendar, Volume) and
+      Settings against the cloud, plus the idiom check — phone landscape and
+      tablet portrait, the standing requirement from #171/#193. Play delivers
+      per device, so the tablet half needs a tablet tester enrolled on the same
+      track. If none is enrolled, say so and leave that half owed rather than
+      implying it passed.
+   5. Revoke the device in the desktop web UI → the next request shows
+      unpaired; then re-pair and exercise the in-app "remove this device".
+   6. Resilience: airplane mode for a while, doze, and a mid-use reader-context
+      expiry — each should land in the expected state, not a crash.
+   7. **Update in place.** Upload a higher `versionCode`, install the update
+      from the same track, relaunch, confirm the pairing survives. Play
+      preserves app data across an update; uninstall/reinstall does not, and
+      `allowBackup="false"` plus the `<device-transfer>` exclude mean there is
+      deliberately no restore — a reinstall must re-pair.
+
+   **What this run cannot show.** The vault file itself cannot be inspected
+   on a Play build: release builds are not `debuggable`, so `adb shell run-as`
+   fails. "Nothing in the clear on disk" stays a JVM-suite result, not a
+   device result. The two storage-warning strings
+   (`settings_cloud_store_unavailable_warning`,
+   `settings_cloud_vault_unreadable_warning`) are reachable only by breaking
+   storage on purpose, and remain unseen unless a run deliberately does that.
+
+   **Evidence to attach to #199:** screenshots per idiom; the paired-state
+   screenshots after the force-stop/relaunch; the revoke/re-pair log; the
+   `dumpsys package` version line; and one line stating which backend was used
+   (the deployed cloud, the local HTTPS terminator, or both). #199's Done also
+   names **both riders**, so record who installed and paired. The second rider
+   proves that the vault is per installation and that no credential is shared
+   between devices.
+
+**Done (per #199):** both riders install from the internal track and pair with
+an **actual pairing code against the deployed cloud** — the HTTP dev harness is
+not reachable from a Play build — and the device test in 5 passes, above all
+the force-stop/relaunch-still-paired check; the release job runs from a tag
+with no manual steps and no `-PallowPlaceholderHost`; no signing material in
+the repository
+(diff inspection).
 
 ---
 
@@ -2340,7 +2244,10 @@ inspection).
    actually exercises the transport decision: a **physical device against
    `https://<the phone-facing hostname>`** through the TLS terminator on a
    release-configured NSC, proving the whole local path works with cleartext
-   off and with a hostname the app has never seen before.
+   off and with a hostname the app has never seen before. **This run, not the
+   emulator one, is the shape a Play build has** (Step 7, item 5). A
+   Play-installed build pairs against the deployed cloud first; the local HTTPS
+   path is the second backend.
 4. **Orientation/idiom:** screenshots on `wt-phone` landscape, `wt-tablet`
    portrait + landscape (and rotated live) — the #193/#196–#198 Done
    criteria; the tablet-portrait correctness is the standing requirement.
@@ -2348,44 +2255,41 @@ inspection).
    1 h airplane mode; doze (`adb shell svc power suspend`); revoked device;
    429 (harness with a tight quota — the durable quota is application-level,
    so the harness is the 429 source).
-6. **Python suite:** `.venv/bin/python -m pytest` green before any merge
-   (AGENTS.md). The full-snapshot harness tests are on `main` since #240;
-   the
-   `GET /api/calendar` PR (Step 6 preamble) carries its own focused tests
-   (flag parity with the HTML calendar on the fixture month, month wrap,
-   cutoff hiding).
-7. **Dep audit:** `./gradlew :app:dependencies` reviewed — only AndroidX,
-   Kotlin stdlib and room (and their transitive AndroidX). Any other artifact
-   fails the review, and since #457 so does seeing `security-crypto` or any Tink
-   artifact in the graph: the credential store is Keystore-only now.
-8. **Dev-loop evidence:** the implementer (or the IDE agent) runs at least the
-   Step-1 build and an install+launch through the 0.4 loop (Agent mode in
-   Android Studio, and/or the terminal `gradlew` + `adb` equivalents); record
-   which BYOK provider/model was used — no key, ever.
-9. **CI:** android.yml (PR #262) gates every PR touching `android/**` —
-   `:app:assembleDebug`, `:app:testDebugUnitTest`, `:app:assembleRelease
-   -PallowPlaceholderHost` on hosted `ubuntu-latest`, no fork gate. From
-   Step 2 onward, a red Android job is part of the Done evidence for every
-   PR in this epic; Step 2's vector and state-machine unit tests run there.
+   **Release-shape device run (Step 7, item 5):** install from the internal
+   track, then force-stop → relaunch and confirm the device is still paired.
+   That is the only evidence the Keystore-wrapped credential vault survives a
+   real restart under the provider's IV convention; it cannot be shown on a
+   debug build, and the JVM suite cannot reach the AndroidKeyStore.
+6. **Python suite:** green before any merge — the rule and the command are in
+   [`AGENTS.md`](AGENTS.md). Step-specific: the full-snapshot harness tests are
+   on `main` since #240, and the `GET /api/calendar` PR (Step 6 preamble)
+   carries its own focused tests (flag parity with the HTML calendar on the
+   fixture month, month wrap, cutoff hiding).
+7. **Dep audit:** the rule is in [`AGENTS.md`](AGENTS.md) (AndroidX, Kotlin
+   stdlib and Room; no JSON/HTTP/DI library; `security-crypto` or any Tink
+   artifact fails since #457). Step-specific: run
+   `./gradlew :app:dependencies` and compare against the catalog in
+   `gradle/libs.versions.toml`.
+8. **Dev-loop evidence:** the rule is in [`AGENTS.md`](AGENTS.md) (a build plus
+   an install+launch through the IDE-agent or terminal loop; record the BYOK
+   provider/model, never the key).
+9. **CI:** the rule is in [`AGENTS.md`](AGENTS.md). Step-specific: from Step 2
+   onward a red Android job is part of the Done evidence for every PR in this
+   epic, and Step 2's vector and state-machine unit tests run there.
 
 ## Risks & known trade-offs
 
-- **IDE agent is a dev accelerator, full stop.** Agent mode is a supported
-  first-party feature, so there is no community-plugin fragility to plan
-  around, but nothing about it is load-bearing: every Done criterion and
-  validation step stands on `./gradlew` + `adb` (which is what CI runs). The
-  only real exposure is the BYOK key — it lives in IDE-local settings on one
-  machine and must never enter the repo, a PR, a screenshot of Settings, or a
-  log. Rotate the key if it is ever printed.
+- **IDE agent is a dev accelerator, full stop.** The rule and its key handling
+  are in [`AGENTS.md`](AGENTS.md); nothing about the agent is load-bearing.
 - **Step 2 must not re-land #266's work.** The transport decision and the
   four #260 follow-ups (release-host guard reading the value it guards,
   `keepRules` wired to R8, test/cleanup, `wtDarkColorScheme` surface
   mapping) are on `main` since PR #294 (2026-09-14). If a Step 2 change
   appears to need any of it, that is a divergence to raise on the issue, not
   a fix to re-apply in a Step 2 branch.
-- **Android 16 large-screen behavior (targetSdk 36):** orientation locks are
-  ignored on large screens — the iOS twin of this bug cost #171 a
-  measurement. Mitigation: the 0.2 AVD measurement is a Step-1 prerequisite
+- **Android 16 large-screen behavior (targetSdk 36):** the standing rule is in
+  [`AGENTS.md`](AGENTS.md) ("Large-screen orientation is a standing
+  requirement"). Mitigation here: the 0.2 measurement is a Step-1 prerequisite
   for screen work; every tablet layout correct in portrait.
 - **DER→raw signature conversion** is the single most likely cause of a
   silent 401. Mitigation: vectors + unit tests before any live call; the live
@@ -2396,14 +2300,13 @@ inspection).
   prominent Revoke guidance, "remove this device" copy that doesn't overclaim.
   Accepted by the owner (the connector model is the explicit request);
   document in `android/README.md`.
-- **Deployed cloud does not exist yet.** #102's deployment is an
-  unexecuted runbook. #156 (desktop cloud sync, which mints pairing codes
-  against a deployment) **closed 2026-09-13 via #274** — the desktop half
-  is on `main`; only the hosting decision is left. Consequence: #199's
-  "pair with a code" and any "real cloud" validation run against the
-  harness or the local backend until #102 executes. APIM is no longer in
-  the picture at all — there is no gateway gap to close, only a deployment
-  to execute.
+- ~~Deployed cloud does not exist yet.~~ **Superseded 2026-10-27: #102 is
+  closed and the cloud has been deployed and serving since 2026-09-19.** #156
+  (desktop cloud sync, which mints pairing codes against a deployment) closed
+  2026-09-13 via #274. Consequence: #199's "pair with a code" runs against the
+  real deployment. What remains from #102 is live-use validation (a real
+  enrolment and a week of real use), which is evidence, not code. APIM was
+  never in the picture: there is no gateway gap, and the deployment exists.
 - **Cloud self-revocation is a documented server trade-off.** The revoke
   route deliberately allows any same-scope credential — including the target
   — to revoke (a lost-phone rider has the other device in hand). Corollary:
@@ -2417,41 +2320,38 @@ inspection).
   screen opens) is far under that; the client must honor `Retry-After` and
   the budget math lives in a `CloudClient` comment so nobody tightens the
   poll interval later without doing the arithmetic.
-- **Hosted Android CI cost.** `android.yml` runs on ephemeral hosted
-  runners with no dependency caching (`setup-gradle` deliberately omitted —
-  third-party action vs the epic's dependency posture): every run downloads
-  the Gradle distribution, SDK 37 and AndroidX. Keep the job's scope tight
-  (`assembleDebug`/`testDebugUnitTest`/`assembleRelease` only — no
-  emulators in CI) and re-visit caching if run times get painful.
+- **Hosted Android CI cost.** `android.yml` runs on ephemeral hosted runners
+  with no dependency caching (`setup-gradle` deliberately omitted — third-party
+  action vs the epic's dependency posture): every run downloads the Gradle
+  distribution, SDK 37 and AndroidX. Keep the job's scope tight
+  (`assembleDebug`/`testDebugUnitTest`/`assembleRelease` only — no emulators in
+  CI) and re-visit caching if run times get painful.
 
 ## Explicitly out of scope
 
-- `.fit` uploads (owner decision, 2026-09-01: out of scope; new issue later).
-- Server-side changes beyond: (a) the owner-approved small read-only
-  `GET /api/calendar` JSON route sharing the extracted `calendar_view` month
-  builder (Step 6 preamble — verified still absent on `main` 2026-09-11).
-  The full-snapshot harness extension that the 2026-09-01 draft planned is
-  **already merged** (PR #240, on `main` since 2026-09-06) — not this
-  epic's work. Everything else server-side (in-app *local* revocation, any
-  write routes) is out of scope; file separate issues first.
-- Light theme, widgets, notifications, BLE, anything write-path on the cloud
-  (capability grants exist server-side; the app stays read-only).
-- A second language/region pass (rider-facing app, two riders; strings in
-  `values/` only, no translation).
-- Any MCP server configuration (community or built-in IDE MCP, npm bridges):
-  dropped 2026-09-06 in favor of the IDE's native Agent mode + BYOK.
+The standing scope boundaries are in [`AGENTS.md`](AGENTS.md) ("Scope
+boundaries"): `.fit` uploads, server-side changes beyond the approved
+`GET /api/calendar` route, light theme / widgets / notifications / BLE / cloud
+write paths, a second language pass, and any MCP configuration. Step-specific:
+the owner-approved `GET /api/calendar` route shares the extracted
+`calendar_view` month builder (Step 6 preamble — verified absent on `main`
+2026-09-11), and the full-snapshot harness extension the 2026-09-01 draft
+planned is **already merged** (PR #240) — not this epic's work.
 
 ## Suggested order of work
 
-1 skeleton (#193) → **done, merged (PR #257, 2026-09-08)** → 2 clients +
-cache (#194) → 3 pairing (#195) → 3b local-calendar server PR (shared
-`build_calendar_month` + read-only `GET /api/calendar`, green Python suite)
-→ 4/5/6 screens (#196, #197, #198 — independent of each other after #195;
-#198's local half needs 3b) → 7 Play internal testing (#199, unblocked by
-#193 but its Done criterium needs #195). Precondition for Step 2 — **merge
-#266** (transport + #260 follow-ups) — is **satisfied** (PR #294,
-2026-09-14; #194 lands on top of it). The
-external dependency previously tracked — PR #240 (#234) merging — is
-**satisfied** (merged 2026-09-06; the harness is on `main`). Each step ends
-with its issue's Done criteria checked, android.yml green, and a PR
-(screenshots included where required).
+Steps 1–6 are merged: 1 skeleton (#193, PR #257, 2026-09-08), 2 clients and
+cache (#194, PR #304), 3 pairing (#195, PR #376), 3b the local-calendar server
+PR (`build_calendar_month` + read-only `GET /api/calendar`), 4 Dashboard
+(#196, PR #419), 5 Activities and ride detail (#197, PR #450, 2026-10-25),
+6 Calendar and Volume (#198, PR #456, 2026-10-27).
+
+**Step 7 (#199) is the only step left.** Its Done criteria need #195 (pairing),
+which is merged. #193 is closed. The dependencies are satisfied: #266 landed
+via PR #294 (2026-09-14), PR #240 merged (2026-09-06, harness on `main`), and
+**#102 closed 2026-10-27 with the cloud deployed and serving since 2026-09-19**,
+so cloud pairing is available.
+
+Each step ends with its issue's Done criteria checked, android.yml green, and a
+PR (screenshots included where required). The open issues #194–#198 remain open
+only for their device checks.
