@@ -27,12 +27,7 @@ final class ActivitiesModel {
     var selectedID: String?
     let wake = CloudWakeNotice()
 
-    var rides: [RideSummary] {
-        (snapshot?.items ?? []).compactMap(RideSummary.init(item:)).sorted {
-            if $0.startedAt != $1.startedAt { return $0.startedAt > $1.startedAt }
-            return $0.id > $1.id
-        }
-    }
+    var rides: [RideSummary] { RideSummary.newestFirst(snapshot?.items ?? []) }
 
     /// Takes the session rather than building one.
     ///
@@ -109,6 +104,15 @@ struct RideSummary: Identifiable {
     let activityID: Int
     let summary: ActivitySummary
     let startedAt: String
+
+    /// The live rides in `items`, newest first. Shared by the Activities list
+    /// and the dashboard's Recent rides strip so they cannot disagree on order.
+    static func newestFirst(_ items: [CloudItem]) -> [RideSummary] {
+        items.compactMap(RideSummary.init(item:)).sorted {
+            if $0.startedAt != $1.startedAt { return $0.startedAt > $1.startedAt }
+            return $0.id > $1.id
+        }
+    }
 
     init?(item: CloudItem) {
         guard !item.deleted, case let .activity(summary) = item.payload else { return nil }
