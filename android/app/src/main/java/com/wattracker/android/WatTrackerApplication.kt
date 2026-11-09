@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.room.Room
 import com.wattracker.android.cache.RoomSnapshotCache
 import com.wattracker.android.cache.WatTrackerDatabase
+import com.wattracker.android.cloud.BackendObservation
 import com.wattracker.android.cloud.BackendSelection
 import com.wattracker.android.cloud.CloudApiResult
 import com.wattracker.android.cloud.CloudClient
@@ -22,6 +23,8 @@ import com.wattracker.android.cloud.ReadModel
 import com.wattracker.android.cloud.RemoveDeviceResult
 import com.wattracker.android.cloud.SharedPreferencesRemovalGate
 import com.wattracker.android.cloud.keepOverride
+import com.wattracker.android.cloud.observeCloudBackend
+import com.wattracker.android.cloud.observeLocalBackend
 import com.wattracker.android.cloud.resolveBackend
 import com.wattracker.android.cloud.StoreHealth
 import kotlinx.coroutines.CancellationException
@@ -110,7 +113,9 @@ object WatTrackerApp {
      * reason waits, so the app-level gate (A1) can tell "not paired yet" from
      * "this device cannot be paired". It is also what B2's release refusal
      * will report, and it must stay reportable without taking the local
-     * desktop backend down with it.
+     * desktop backend down with it. Whatever shows it renders a summary of the
+     * failure, never `toString()`: the message belongs to the Keystore and the
+     * provider, not to the rider.
      */
     val cloudStartFailure: Throwable?
         get() = cloudFailure
@@ -151,12 +156,6 @@ object WatTrackerApp {
         return session
     }
 
-    /** The cloud session, for the flows that cannot work without one. */
-    suspend fun session(context: Context): CloudSession {
-        ensureStarted(context).await()
-        return session ?: throw CloudSession.Failure.NotPaired()
-    }
-
     suspend fun localClient(context: Context): LocalClient {
         ensureStarted(context).await()
         return localClient ?: error("local client unavailable")
@@ -194,18 +193,36 @@ object WatTrackerApp {
         applySelection()
     }
 
+    /**
+     * Recompute the resolved backend from what is paired right now.
+     *
+     * Called from the init dispatcher, from the main thread on a Settings
+     * change, and from the IO context of a pairing or removal. Nothing here is
+     * a counter or a sequence: the value is recomputed from live fields and
+     * written whole, so the worst a race can cost is one refresh -- a write
+     * based on a pairing a moment older, immediately corrected by the next
+     * [refreshBackend]. No screen reads a torn value, because each writes one
+     * complete [DataSource] into a `StateFlow`.
+     */
     private fun applySelection() {
         _dataSourceFlow.value = resolveBackend(_selectionFlow.value, session?.isPaired == true, localClient?.isPaired == true)
     }
 
     suspend fun pairCloud(context: Context, code: String, label: String?) = withContext(Dispatchers.IO) {
         ensureStarted(context).await()
+        // NotPaired is what every screen already renders as "pair first", and it
+        // is close enough here: with no session there is nothing to pair against
+        // this launch. Why there is none is not a pairing failure -- it waits in
+        // [cloudStartFailure], and A1's gate is what refuses the attempt before a
+        // screen can offer one.
         val s = session ?: throw CloudSession.Failure.NotPaired()
         s.pair(code, label).also { refreshBackend() }
     }
 
     suspend fun removeCloudDevice(context: Context): RemoveDeviceResult = withContext(Dispatchers.IO) {
         ensureStarted(context).await()
+        // As in [pairCloud]: no session means no device to remove, and the reason
+        // belongs to [cloudStartFailure], not to this call's failure.
         val s = session ?: throw CloudSession.Failure.NotPaired()
         try {
             s.removeDevice()
@@ -301,8 +318,10 @@ object WatTrackerApp {
         // choice -- the same class of waiver the owner accepted for #457's
         // missing migration: drop it, and say so.
         prefs.edit().remove(KEY_LEGACY_DATA_SOURCE).apply()
-        val storedOverride = prefs.getString(KEY_BACKEND_OVERRIDE, null)
-            ?.let { name -> BackendSelection.entries.firstOrNull { it.name == name && it.isOverride } }
+        val storedName = prefs.getString(KEY_BACKEND_OVERRIDE, null)
+        val storedOverride = storedName?.let { name ->
+            BackendSelection.entries.firstOrNull { it.name == name && it.isOverride }
+        }
 
         val db = openDatabase(context)
         val credentials = openCredentialStore(context)
@@ -354,19 +373,32 @@ object WatTrackerApp {
             source = { _dataSourceFlow.value },
         )
 
-        // An override for a backend that is not paired is dropped here, once,
-        // so it cannot pin the app to a pairing screen while the other backend
-        // works (`SessionGate.swift:305-312`).
-        val cloudPaired = cloudSession?.isPaired == true
-        val localPaired = local.isPaired
-        val selection = if (storedOverride != null && keepOverride(storedOverride, cloudPaired, localPaired)) {
+        // What this launch can claim about each backend. A cloud that was never
+        // built, and a vault the Keystore would not open, are `Unknown` rather
+        // than `Unpaired`: nothing saw them, so nothing proved the stored choice
+        // wrong, and a bad launch must not delete a rider's pick.
+        val cloudObservation =
+            observeCloudBackend(sessionBuilt = cloudSession != null, paired = cloudSession?.isPaired == true)
+        val localObservation = observeLocalBackend(vaultHealth = credentials.health, paired = local.isPaired)
+
+        // An override for a backend that was *seen* unpaired is dropped here,
+        // once, so it cannot pin the app to a pairing screen while the other
+        // backend works (`SessionGate.swift:305-312`). Anything stored that is
+        // not being kept is deleted, including a value this build does not
+        // recognise: it can only have been edited by hand, and leaving it would
+        // mean re-reading the same garbage every launch.
+        val selection = if (storedOverride != null && keepOverride(storedOverride, cloudObservation, localObservation)) {
             storedOverride
         } else {
-            if (storedOverride != null) prefs.edit().remove(KEY_BACKEND_OVERRIDE).apply()
+            if (storedName != null) prefs.edit().remove(KEY_BACKEND_OVERRIDE).apply()
             BackendSelection.Automatic
         }
         _selectionFlow.value = selection
-        _dataSourceFlow.value = resolveBackend(selection, cloudPaired, localPaired)
+        _dataSourceFlow.value = resolveBackend(
+            selection,
+            cloudPaired = cloudObservation == BackendObservation.Paired,
+            localPaired = localObservation == BackendObservation.Paired,
+        )
     }
 
     private fun openDatabase(context: Context): WatTrackerDatabase {

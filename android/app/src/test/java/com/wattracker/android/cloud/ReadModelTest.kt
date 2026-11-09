@@ -2,6 +2,7 @@ package com.wattracker.android.cloud
 
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
@@ -28,6 +29,15 @@ class ReadModelTest {
         assertFalse(noCloud.isPaired)
         assertNull(noCloud.lastSuccess)
         assertNull(runBlocking { noCloud.cached(CloudRoute.Dashboard) })
+    }
+
+    @Test
+    fun theAbsentCloudClaimsNoIdentityARealBackendCould() {
+        // Both backends start their identity at 0. If the seam returned 0 too,
+        // a caller comparing identity across a backend change could read
+        // "unchanged" when the backend behind it was replaced outright.
+        assertEquals(-1, noCloud.identity)
+        assertNotEquals(noCloud.identity, desktop().identity)
     }
 
     @Test
