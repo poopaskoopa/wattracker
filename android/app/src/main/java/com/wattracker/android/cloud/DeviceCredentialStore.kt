@@ -55,6 +55,23 @@ enum class StoreHealth {
      * replaces it.
      */
     UnreadableVault,
+
+    /**
+     * The vault was not established either way: a read that failed (transient
+     * I/O, a provider hiccup) or a member this build cannot parse.
+     *
+     * This is deliberately *not* [Durable]. `Durable` is a promise about the
+     * next launch, and it is true -- nothing is known to be wrong with the
+     * file -- but it reads as "this launch looked and found nothing", which is
+     * what makes one flaky read delete a rider's stored backend choice. A
+     * pairing may be sitting in the file unread, so the launch could not
+     * conclude anything, and the override rules treat that as
+     * [BackendObservation.Unknown] rather than as a seen-unpaired backend.
+     *
+     * Settings shows no warning for it: nothing is broken, and "pair again"
+     * is wrong advice for a file that may open on the next attempt.
+     */
+    Unread,
 }
 
 /** A credential the store could not write, clear, or delete durably. */
@@ -173,6 +190,15 @@ class KeystoreDeviceCredentialStore internal constructor(
     private var vaultUnreadable = false
 
     /**
+     * True while the last look at [file] concluded nothing: a failed read, or a
+     * member this build cannot parse. Distinct from [vaultUnreadable], which is
+     * an authenticated refusal of the envelope, and from "no pairing", which is
+     * a read that succeeded and found nothing.
+     */
+    @Volatile
+    private var vaultUnread = false
+
+    /**
      * Sticky for this launch once anything says the *key* is the problem rather
      * than the file. Not cleared by a later success: the store holds one key
      * handle, so a success after a key failure would mean the first failure was
@@ -192,19 +218,24 @@ class KeystoreDeviceCredentialStore internal constructor(
     /**
      * [StoreHealth.Unavailable] if the key could not be used at all, else
      * [StoreHealth.UnreadableVault] while the last look at [file] found an
-     * envelope this installation's key could not open. The vault flag is set by
+     * envelope this installation's key could not open, else [StoreHealth.Unread]
+     * while the last look concluded nothing. The vault and read flags are set by
      * a read and cleared by the next read or write that succeeds; the key flag
      * is not cleared, because this launch has no second key to try.
      *
-     * A *transient* read failure deliberately does not change this verdict: it
-     * is a failed operation, not evidence about the vault, and the copy attached
-     * to [StoreHealth.UnreadableVault] ("pairing again will replace it") would be
-     * wrong advice for a file that may open on the next attempt.
+     * A *transient* read failure is [StoreHealth.Unread], never
+     * [StoreHealth.UnreadableVault]: it is a failed operation, not evidence about
+     * the vault, and the copy attached to [StoreHealth.UnreadableVault] ("pairing
+     * again will replace it") would be wrong advice for a file that may open on
+     * the next attempt. It must not be [StoreHealth.Durable] either, which reads
+     * as "looked and found nothing": one flaky read would then delete the
+     * rider's stored backend choice.
      */
     override val health: StoreHealth
         get() = when {
             keyUnavailable -> StoreHealth.Unavailable
             vaultUnreadable -> StoreHealth.UnreadableVault
+            vaultUnread -> StoreHealth.Unread
             else -> StoreHealth.Durable
         }
 
@@ -243,6 +274,11 @@ class KeystoreDeviceCredentialStore internal constructor(
         val isEmpty: Boolean
             get() = (pairedDevice.parsed == null && pairedDevice.raw == null) &&
                 (localCredentials.parsed == null && localCredentials.raw == null)
+
+        /** True when a member is on disk as JSON this build cannot parse. */
+        val hasUnparsedMember: Boolean
+            get() = (pairedDevice.parsed == null && pairedDevice.raw != null) ||
+                (localCredentials.parsed == null && localCredentials.raw != null)
     }
 
     /** What one look at [file] established. */
@@ -307,13 +343,15 @@ class KeystoreDeviceCredentialStore internal constructor(
         val envelope = try {
             if (!file.exists()) {
                 vaultUnreadable = false
+                vaultUnread = false
                 return ReadResult.Opened(Vault().also { cachedVault = it })
             }
             file.readBytes()
         } catch (_: Exception) {
-            // Transient until proven otherwise: the file is left alone, the
-            // verdict on the vault does not change, and the next read answers
-            // again. A mutation on top of this attempt is refused, not applied.
+            // Transient until proven otherwise: the file is left alone, nothing
+            // is concluded about it, and the next read answers again. A mutation
+            // on top of this attempt is refused, not applied.
+            vaultUnread = true
             return ReadResult.ReadFailed
         }
 
@@ -327,9 +365,10 @@ class KeystoreDeviceCredentialStore internal constructor(
             return ReadResult.NoKey
         } catch (_: CredentialCipherUnavailableException) {
             // The cipher could not be operated: this is not a verdict about the
-            // vault, so the file is left alone and health is unchanged. Without
+            // vault, so the file is left alone and nothing is concluded. Without
             // this branch a provider hiccup would be reported as "the vault is
             // bad", which is the advice M1 exists to stop.
+            vaultUnread = true
             return ReadResult.ReadFailed
         } catch (_: Exception) {
             // Only an authenticated refusal (AEADBadTagException) or this build's
@@ -337,9 +376,15 @@ class KeystoreDeviceCredentialStore internal constructor(
             // credential this key wrote, or the format is not one this build
             // describes. Either way it is a verdict about the file.
             vaultUnreadable = true
+            vaultUnread = false
             return ReadResult.Unopenable
         }
         vaultUnreadable = false
+        // A member this build cannot parse is kept as raw JSON so the next write
+        // re-emits it, but `load()` answers null for it. That is not "no
+        // pairing": a pairing is sitting in the file and only this build cannot
+        // read it, so the launch concluded nothing about that backend.
+        vaultUnread = vault.hasUnparsedMember
         cachedVault = vault
         return ReadResult.Opened(vault)
     }
@@ -406,6 +451,7 @@ class KeystoreDeviceCredentialStore internal constructor(
                 throw CredentialStoreException("could not replace the credential file")
             }
             vaultUnreadable = false
+            vaultUnread = false
             cachedVault = vault
         } catch (e: CredentialStoreException) {
             throw e
@@ -421,6 +467,7 @@ class KeystoreDeviceCredentialStore internal constructor(
     private fun deleteVaultLocked() {
         if (!file.exists()) {
             vaultUnreadable = false
+            vaultUnread = false
             cachedVault = Vault()
             return
         }
@@ -428,6 +475,7 @@ class KeystoreDeviceCredentialStore internal constructor(
             throw CredentialStoreException("could not delete the credential file")
         }
         vaultUnreadable = false
+        vaultUnread = false
         cachedVault = Vault()
     }
 

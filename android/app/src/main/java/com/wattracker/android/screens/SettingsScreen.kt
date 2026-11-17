@@ -423,9 +423,12 @@ private fun CloudBackendPanel(
             // Two storage failures, two different things the rider can do about
             // them: one store cannot save a pairing at all, the other is holding
             // one it can no longer read and pairing again replaces it (#457).
+            // Unread is neither of those: nothing is known to be wrong and the
+            // file may open on the next attempt, so there is no warning to give.
             val storeWarning = when (WatTrackerApp.credentialStoreHealth) {
                 StoreHealth.Unavailable -> R.string.settings_cloud_store_unavailable_warning
                 StoreHealth.UnreadableVault -> R.string.settings_cloud_vault_unreadable_warning
+                StoreHealth.Unread -> null
                 StoreHealth.Durable -> null
             }
             if (storeWarning != null) {

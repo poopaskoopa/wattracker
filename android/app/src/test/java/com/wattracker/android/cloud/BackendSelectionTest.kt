@@ -124,9 +124,114 @@ class BackendSelectionTest {
 
     @Test
     fun aCloudThatWasNeverBuiltIsNotALookAtTheCloud() {
-        assertEquals(BackendObservation.Unknown, observeCloudBackend(sessionBuilt = false, paired = false))
-        assertEquals(BackendObservation.Unpaired, observeCloudBackend(sessionBuilt = true, paired = false))
-        assertEquals(BackendObservation.Paired, observeCloudBackend(sessionBuilt = true, paired = true))
+        val durable = StoreHealth.Durable
+        assertEquals(BackendObservation.Unknown, observeCloudBackend(sessionBuilt = false, paired = false, vaultHealth = durable))
+        assertEquals(BackendObservation.Unpaired, observeCloudBackend(sessionBuilt = true, paired = false, vaultHealth = durable))
+        assertEquals(BackendObservation.Paired, observeCloudBackend(sessionBuilt = true, paired = true, vaultHealth = durable))
+    }
+
+    @Test
+    fun aVaultTheKeystoreRefusedIsNotALookAtTheCloudEither() {
+        // The trap the review found: the session is built, `load()` answers null
+        // because the in-memory store never opened the file, and a bare
+        // `isPaired == false` reads that as a seen-unpaired cloud. It would then
+        // delete an explicit Cloud override on a launch that looked at nothing.
+        assertEquals(
+            BackendObservation.Unknown,
+            observeCloudBackend(sessionBuilt = true, paired = false, vaultHealth = StoreHealth.Unavailable),
+        )
+        assertTrue(
+            "a Keystore-refused vault keeps an explicit Cloud choice",
+            keepOverride(
+                BackendSelection.Cloud,
+                observeCloudBackend(sessionBuilt = true, paired = false, vaultHealth = StoreHealth.Unavailable),
+                BackendObservation.Paired,
+            ),
+        )
+    }
+
+    @Test
+    fun aCloudWhoseVaultCouldNotBeReadIsNotALookEither() {
+        assertEquals(
+            BackendObservation.Unknown,
+            observeCloudBackend(sessionBuilt = true, paired = false, vaultHealth = StoreHealth.Unread),
+        )
+    }
+
+    @Test
+    fun anUnreadableCloudVaultIsASeenUnpairedCloud() {
+        // The envelope opened and this installation cannot use it, so the
+        // pairing behind it is gone. That is a look, and it says unpaired.
+        assertEquals(
+            BackendObservation.Unpaired,
+            observeCloudBackend(sessionBuilt = true, paired = false, vaultHealth = StoreHealth.UnreadableVault),
+        )
+    }
+
+    @Test
+    fun aFailedReadIsNotALookAtTheDesktop() {
+        // The second trap: one flaky read used to report `Durable`, which reads
+        // as "looked and found nothing", and the override was dropped.
+        assertEquals(BackendObservation.Unknown, observeLocalBackend(StoreHealth.Unread, paired = false))
+        assertTrue(
+            "one flaky read keeps an explicit Local choice",
+            keepOverride(
+                BackendSelection.Local,
+                BackendObservation.Paired,
+                observeLocalBackend(StoreHealth.Unread, paired = false),
+            ),
+        )
+    }
+
+    @Test
+    fun aKeptOverrideSurvivesAndNothingIsDeleted() {
+        val startup = decideStartupSelection(
+            storedName = "Cloud",
+            stored = BackendSelection.Cloud,
+            cloud = BackendObservation.Paired,
+            local = BackendObservation.Unpaired,
+        )
+        assertEquals(BackendSelection.Cloud, startup.selection)
+        assertFalse("a kept preference must not be deleted", startup.deleteStoredPreference)
+    }
+
+    @Test
+    fun aDroppedOverrideIsReplacedAndItsPreferenceDeleted() {
+        val startup = decideStartupSelection(
+            storedName = "Cloud",
+            stored = BackendSelection.Cloud,
+            cloud = BackendObservation.Unpaired,
+            local = BackendObservation.Paired,
+        )
+        assertEquals(BackendSelection.Automatic, startup.selection)
+        assertTrue("a dropped preference must be deleted, not re-read", startup.deleteStoredPreference)
+    }
+
+    @Test
+    fun anUnrecognisedStoredValueIsDeleted() {
+        // Hand-edited or from a build this one does not know. It parses to a null
+        // `stored`, and leaving it would mean re-reading the same garbage every
+        // launch.
+        val startup = decideStartupSelection(
+            storedName = "SomethingElse",
+            stored = null,
+            cloud = BackendObservation.Paired,
+            local = BackendObservation.Paired,
+        )
+        assertEquals(BackendSelection.Automatic, startup.selection)
+        assertTrue(startup.deleteStoredPreference)
+    }
+
+    @Test
+    fun aFirstRunHasNothingToDelete() {
+        val startup = decideStartupSelection(
+            storedName = null,
+            stored = null,
+            cloud = BackendObservation.Unpaired,
+            local = BackendObservation.Unpaired,
+        )
+        assertEquals(BackendSelection.Automatic, startup.selection)
+        assertFalse("there is no preference to remove", startup.deleteStoredPreference)
     }
 
     @Test

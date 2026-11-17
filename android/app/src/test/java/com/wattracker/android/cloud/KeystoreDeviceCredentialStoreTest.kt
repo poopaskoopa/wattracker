@@ -345,7 +345,7 @@ class KeystoreDeviceCredentialStoreTest {
         assertNull("this attempt answers unpaired", store.load())
         assertEquals(
             "a failed read is not evidence the vault is broken",
-            StoreHealth.Durable,
+            StoreHealth.Unread,
             store.health,
         )
 
@@ -390,7 +390,7 @@ class KeystoreDeviceCredentialStoreTest {
         // stopping a rewrite is the store's own refusal.
         val store = KeystoreDeviceCredentialStore(file, DecryptUnavailableCipher())
         assertNull("this attempt answers unpaired", store.load())
-        assertEquals("and does not blame the vault", StoreHealth.Durable, store.health)
+        assertEquals("and does not blame the vault", StoreHealth.Unread, store.health)
 
         val clearFailure = try {
             store.clearLocal()
@@ -574,7 +574,11 @@ class KeystoreDeviceCredentialStoreTest {
         val store = KeystoreDeviceCredentialStore(file, PassthroughCipher())
         assertNull("the member it cannot read is not served", store.load())
         assertEquals("but the other member still is", local, store.loadLocal())
-        assertEquals("a vault that opens is a healthy store", StoreHealth.Durable, store.health)
+        // Unread, not Durable: the member is on disk but this build cannot parse
+        // it, so `load()` answers null without anything having been seen. Durable
+        // would read as "looked and found nothing" and one such launch would
+        // delete the rider's stored choice for that backend (#484 review, 2).
+        assertEquals("an unparsed member leaves that backend unconcluded", StoreHealth.Unread, store.health)
 
         store.saveLocal(local.copy(token = "connector-SECRET-new"))
         val rewritten = file.readText(Charsets.UTF_8)
