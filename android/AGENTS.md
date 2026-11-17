@@ -10,9 +10,10 @@ what the plan assumes of the machine around it. Neither repeats the rules here.
 ## Golden rules
 1. **ASD-STE-100 in all communication** — keep comments and commit messages short. 
    Use US English.
-2. **Test in the simulator first** — ask the user before using any connected
+2. **Test in the emulator first** — ask the user before using any connected
    devices.
-3. **Wait for review before PR** — an internal review will be conducted beforehand.
+3. **Report ready to merge** — an internal review runs first, and only the
+   integrator merges.
 
 ## Tooling: Windows, PowerShell, `gh`
 
@@ -147,11 +148,11 @@ ever printed.
 
 ## Toolchain and device facts on this machine
 
-**Environment.** Windows x64; the Android SDK is at
-`C:\Users\Takazumi\AppData\Local\Android\Sdk` (see `local.properties`).
+**Environment.** Windows x64; the Android SDK is wherever `local.properties`
+points, which on this machine is an `AppData\Local\Android\Sdk` path.
 
-- **No JDK on `PATH`** — the only one is Android Studio's JBR,
-  `C:\Program Files\Android\Android Studio\jbr`. Every `sdkmanager`,
+- **No JDK on `PATH`** — the only one is Android Studio's bundled JBR, in the
+  Android Studio install directory. Every `sdkmanager`,
   `avdmanager` and `android` invocation needs `$env:JAVA_HOME` set to it.
 - **PowerShell has neither `JAVA_HOME` nor `HOME`**, and the new tools NPE
   without `$env:HOME` (`AvdManager.createInstance: parameter baseAvdFolder`
@@ -208,10 +209,12 @@ loopback). `WATTRACKER_HOST` + `WATTRACKER_ALLOW_NON_LOOPBACK=1` are needed
 
 ## Repo hygiene for this directory
 
-- **Commit identity:** noreply address always, verified with
-  `git config user.email` before the first commit. The repo is private but its
-  history was rewritten once to strip a personal address, so treat every commit
-  as publishable.
+- **Commit identity:** a distinct name per agent, and a noreply address
+  always. Verify with `git config user.email` before the first commit; it must
+  end in `@users.noreply.github.com`. Both agents authenticate as the same
+  GitHub account, so the commit name is the only record of who did the work.
+  The repo is private but its history was rewritten once to strip a personal
+  address, so treat every commit as publishable.
 - **Fetch before you rebase or branch:** `git fetch origin` first. A
   remote-tracking ref is a cache; rebasing onto a stale one silently replays an
   old lineage and drops what landed in between.

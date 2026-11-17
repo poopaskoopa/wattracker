@@ -22,7 +22,7 @@ and the validation sequence.
 - **Merged:** Step 1 (#193, PR #257), Step 2 (#194, PR #304), Step 3 (#195, PR #376, landed through #403), Step 4 (#196, PR #419, `736f290`), Step 5 (#197, PR #450, 2026-10-25), Step 6 (#198, PR #456, 2026-10-27), and PR #459 (#457, `ec6aab0`, 2026-11-03) — the credential store on the Keystore instead of `security-crypto`, which closed #457. All three of its review rounds (2026-10-30, 2026-10-31, 2026-11-02) are addressed, and its device run is the 2026-11-03 note further down.
 - **Open issues:** #194, #195, #196, #197 and #198 stay open only for their device checks. #193 is closed. #192 (the epic) is open.
 - **Remaining device work on #459:** one physical device (a Pixel 6a) covered the desktop-token half of the vault. The emulator half and the **cloud** half stay open until #468 (the cloud authority is unset and the release path can still ship a placeholder host) is fixed.
-- **This branch:** `feature/android-client-7`, which carries only documentation. Step 7 is the next work, and its device test is specified — the release-shape run from the internal track, gated on the force-stop/relaunch-still-paired check and the local HTTPS backend (the HTTP dev harness is unreachable from a Play build). See Step 7 item 5 below.
+- **This branch:** `feature/android-client-7`, which carries only documentation. Step 7 is the next work, and its device test is specified — the release-shape run from the internal track, gated on the force-stop/relaunch-still-paired check and on cloud pairing against the deployed cloud (the HTTP dev harness is unreachable from a Play build). See Step 7 item 5 below.
 - **#102 is CLOSED (2026-10-27).** The cloud is deployed and serving since 2026-09-19. The placeholder host and the `-PallowPlaceholderHost` flag are therefore retired requirements, not open gates. See Step 7.
 
 The Step 4 and Step 5 implementation notes, the PR #419 review and its fixes, verification and known gaps are under "Step 4 — Dashboard screen" and "Step 5 — Activities list + ride detail" below.
@@ -68,7 +68,7 @@ Verification: `:app:testDebugUnitTest` -- **353 green**; `:app:assembleDebug` gr
 **Revised 2026-11-03 — the 2026-11-02 security review of `0d8e3d3` addressed, and the device run done.** That review found no blocking defect and held the PR on two things outside the code -- #457's migration requirement, and a run on hardware. Both are settled here.
 
 1. **Medium (process) -- the migration waiver is now the owner's, not the agent's.** #457 asks for "one-time migration of existing paired devices, with no re-pairing", this branch ships none, and the body says `Closes #457`, which is the review's objection. The owner's answer (2026-11-02): **the waiver is accepted** -- no shipped build ever wrote the old format, so the only cost is dead bytes on developer and emulator installs, which `dropLegacyEncryptedStore` deletes. The PR body now states the decision in those terms instead of leaving it implicit.
-2. **Low (availability) -- an unusable key had no way back, and is now caught before a store exists.** A Keystore entry can exist, read back, and be unexportable while refusing to be *used* (a corrupt key blob after an OEM update): the store took the handle at face value, so every launch answered unpaired, every `save()` threw after a pairing code had been spent, and nothing shorter of clearing app data helped. `KeystoreDeviceCredentialStore.open(context)` (a factory, not a `Context` constructor -- the key has to be loaded and driven before the store exists, and a constructor cannot hand its own file to the code provisioning its cipher) now runs [provisionCipher]: load the key, drive one throwaway encrypt/decrypt through the real cipher, and only then build. A key that fails that probe fails *at startup*, where `openCredentialStore` can fall back to memory and `health` can say `Unavailable` -- which also makes the existing "pairing here lasts only until the app closes" copy true again, since pairing into the fallback now succeeds. It replaces the alias (`CredentialKeyStore.deleteKey()` + create + probe again) **only when there is no vault file on disk**: with no vault the alias is a lockout rather than a lock and nothing is lost, while over a vault nobody read a new key would turn "this launch could not look at the credential" into "the credential is gone" -- M1's mistake in a new place. The probe also catches the provider-that-reports-no-IV case at startup, where the answer is a warning rather than a silent unpair -- the review's own named device risk, and it is now the first thing the app does with the key rather than the first thing that breaks at the next relaunch.
+2. **Low (availability) -- an unusable key had no way back, and is now caught before a store exists.** A Keystore entry can exist, read back, and be unexportable while refusing to be *used* (a corrupt key blob after an OEM update): the store took the handle at face value, so every launch answered unpaired, every `save()` threw after a pairing code had been spent, and nothing shorter of clearing app data helped. `KeystoreDeviceCredentialStore.open(context)` (a factory, not a `Context` constructor -- the key has to be loaded and driven before the store exists, and a constructor cannot hand its own file to the code provisioning its cipher) now runs [provisionCipher]: load the key, drive one throwaway encrypt/decrypt through the real cipher, and only then build. A key that fails that probe fails *at startup*, where `openCredentialStore` can fall back to memory and `health` can say `Unavailable` -- which also makes the existing `settings_cloud_store_unavailable_warning` copy ("pairing is temporary until the app closes") true again, since pairing into the fallback now succeeds. It replaces the alias (`CredentialKeyStore.deleteKey()` + create + probe again) **only when there is no vault file on disk**: with no vault the alias is a lockout rather than a lock and nothing is lost, while over a vault nobody read a new key would turn "this launch could not look at the credential" into "the credential is gone" -- M1's mistake in a new place. The probe also catches the provider-that-reports-no-IV case at startup, where the answer is a warning rather than a silent unpair -- the review's own named device risk, and it is now the first thing the app does with the key rather than the first thing that breaks at the next relaunch.
 3. **Low (availability) -- a `ProviderException` is no longer a whole-launch key verdict.** It is the Keystore daemon failing to answer, and the old classification spent the rest of the launch claiming the device cannot protect a pairing over an error that may clear by itself. `InvalidKeyException` and `UnrecoverableKeyException` stay key failures; `ProviderException` is a failed operation (file left alone, mutation refused, `health` unchanged) -- safe to relax precisely because a genuinely dead key is now caught at construction. **This corrects the 2026-10-31 note's item 1**, which named `ProviderException` a key failure.
 4. **Low -- test gaps where a mutation survived.** The minimum-envelope-length check: `anEnvelopeTooShortToBeOneIsRefusedAsABadFile` asserts 0, 1, 11, 12 and 27-byte files are refused *as* `CredentialCipherException` (without the check the provider's complaint about a short IV arrives as "cipher unavailable", the store reads a failed read, and every later save is refused over a file that was never an envelope); `anEnvelopeWithNoIvIsRefused` now asserts the type it always assumed. The taxonomy moved into `classifyInitFailure` / `classifyOperationFailure` so a JVM test can redden the mapping -- the JVM cannot make a real provider fail, and both stages are pinned, including that `ProviderException` is not a key failure and that a named `CredentialKeyException` passes through untouched. New `CredentialKeyStoreTest`: a Keystore this platform cannot open comes back as `CredentialKeyException` rather than raw I/O (the JVM hits that path on its first line), and `assertNonExportable` -- internal for the purpose -- refuses an exportable key and passes both shapes of an unexportable one.
 5. **Info.** The `catch (CredentialCipherUnavailableException)` around `file.readBytes()` could never fire; it is gone.
@@ -78,7 +78,7 @@ Verification: `:app:testDebugUnitTest` -- **353 green**; `:app:assembleDebug` gr
 - **The old-prefs cleanup, on a phone that actually held old data.** This install carried `shared_prefs/wattracker_device_credential.xml` from a 2026-09-26 build; after the in-place update (`adb install -r`, data kept) that file is gone, `legacy_credential_store_dropped` is recorded in `wattracker_app_prefs.xml`, and the app reports unpaired. That is the waiver above seen from the outside: one developer-install pairing lost, nothing leaked, no rider affected.
 - **The store started `Durable` on real Keystore hardware** -- key load-or-create, read-back, `assertNonExportable`, and the probe's round trip all passed, so the fallback never fired and Settings showed no warning.
 - **Pair → relaunch → still paired, twice.** `saveLocal()` wrote `files/wattracker_device_credentials`: mode `0600`, **183 bytes = 12 IV + 155 body + 16 tag**, exactly the envelope the JVM suite pins; pulled off the device and hex-dumped, no plaintext anywhere in it, and no `.tmp` left behind. Force-stop and relaunch: still paired (`Paired: 2026-11-03 02:19`), and the Dashboard's reads went through (`POST /api/connector/session` 200, then `/api/state`, `/api/load`, `/api/curve`, `/api/activities` all 200). That round trip is the one that settles the `getIV()` question -- the envelope this `AndroidKeyStore` key wrote opened under the same key in a later process.
-- **The unreadable-vault warning, on screen, with storage broken on purpose.** Overwriting the vault with 40 random bytes left the app reporting unpaired, kept the file exactly where it is, and rendered `settings_cloud_vault_unreadable_warning` ("the pairing saved on this device could not be read, so it is not in use. Pairing again replaces it"). Re-pairing replaced it (back to 183 bytes) and the next relaunch was paired again -- a save may replace an unopenable vault, and the replacement survives.
+- **The unreadable-vault warning, on screen, with storage broken on purpose.** Overwriting the vault with 40 random bytes left the app reporting unpaired, kept the file exactly where it is, and rendered `settings_cloud_vault_unreadable_warning` ("the pairing saved on this device could not be read. Pairing again will replace it"). Re-pairing replaced it (back to 183 bytes) and the next relaunch was paired again -- a save may replace an unopenable vault, and the replacement survives.
 - **`Remove this device`** deletes the vault file entirely (the empty-vault path).
 
 Still not verified by device: `settings_cloud_store_unavailable_warning` (needs a Keystore that will not hand over a usable key, which no `adb` access on an unrooted phone can arrange -- the probe path that makes it reachable is JVM-tested only); the alias-replacement recovery (needs a corrupted Keystore entry); the **cloud** half of the vault on hardware -- the desktop-token half is what the phone covered, same envelope and same code path, and the cloud binding needs an emulator or a build-time authority override. Screenshots and the pulled vault bytes are kept untracked under the session's artifacts directory, not in the repo.
@@ -721,8 +721,8 @@ The setup procedure, the AVD commands and the IDE-agent configuration are in
 agent". They are standing instructions, not plan steps, so they are not
 repeated here.
 
-Step-specific residue: this machine is Windows x64 with the SDK at
-`C:\Users\Takazumi\AppData\Local\Android\Sdk`; the emulators use x86_64 images
+Step-specific residue: this machine is Windows x64 with the SDK at the path
+`local.properties` records; the emulators use x86_64 images
 accelerated by AEHD/Hyper-V, not `/dev/kvm`; Android Studio was already
 installed (2026.1.4 line); and the working AVDs are `medium_phone` (API 36) and
 `medium_tablet` (API 35) — the tablet must be exercised **in portrait**, because
@@ -2070,23 +2070,44 @@ Play Console. The current flow has three steps:
 The old "API access" page is gone. A guide that still says to link the account
 from Play Console is stale.
 
-**Secrets (already set on this repository):** `ANDROID_UPLOAD_KEYSTORE_B64`,
-`ANDROID_UPLOAD_KEYSTORE_PASSWORD`, `ANDROID_UPLOAD_KEY_PASSWORD`,
-`ANDROID_UPLOAD_KEY_ALIAS`, `PLAY_SERVICE_ACCOUNT_JSON`. The keystore signs the
-bundle. The service account authorizes the upload. They are independent.
+**Secrets:** `ANDROID_UPLOAD_KEYSTORE_B64`, `ANDROID_UPLOAD_KEYSTORE_PASSWORD`,
+`ANDROID_UPLOAD_KEY_PASSWORD`, `ANDROID_UPLOAD_KEY_ALIAS`,
+`PLAY_SERVICE_ACCOUNT_JSON`. The keystore signs the bundle. The service account
+authorizes the upload. They are independent. All five are repository secrets
+today; **move them into the environment below.** A repository secret is
+readable by any workflow a write collaborator can push, on any branch.
 
 `.gitignore` covers `*.jks` and `*.keystore`, but **not** a JSON service-account
 key. Keep that file outside the tree, or add an ignore line before creating it.
 
 Code/config:
 
+0. **Gate the signing secrets behind an environment.** iOS, Windows and macOS
+each declare one (`ios-code-signing` in `ios-release.yml`), and #478 builds a
+merge-time gate on the same idea. Android needs the same shape, because the
+upload key and the Play service account are release rights, not build inputs.
+   - Create the `android-code-signing` environment. Add a deployment branch
+     rule that allows only `main`, plus admin-only `android/v*` tags. Add a
+     tag ruleset so only an admin can create or move those tags.
+   - Move the five secrets above into that environment. Delete the repository
+     copies.
+   - Declare `environment: android-code-signing` on the release job, and keep
+     `android.yml` free of it: a PR build needs no signing material.
+   - The environment is only half the gate. The other half is CODEOWNERS:
+     `.github/CODEOWNERS` (#478) owns `/.github/` but leaves `android/`
+     unowned, so the Gradle signing config can change with no owner review.
+     Add `/android/app/build.gradle.kts` there once #478 lands.
+   - Verify the gate the way #478 does: a workflow on another branch that
+     names the environment must fail to read the secrets.
+
 1. **App signing:** enroll in Play App Signing. Generate an **upload key**
    (`keytool -genkeypair -v -keystore wattracker-upload.jks -alias
    wattracker-upload -keyalg RSA -keysize 2048 -validity 10000`); the keystore
-   + password go into a **GitHub repository secret** (or the runner's keystore
-   dir) — never into git. The root `.gitignore` already covers `*.key`/`*.pem`/
-   `*.p12`; add `*.jks`, `*.keystore`. Committed files contain no key material
-   — verify by inspecting the PR diff, per #199's Done.
+   + password go into an **environment secret** in `android-code-signing` (or
+   the runner's keystore dir) — never into git. The root `.gitignore` already
+   covers `*.key`/`*.pem`/`*.p12`/`*.jks`/`*.keystore`; it does **not** cover a
+   JSON service-account key. Committed files contain no key material — verify
+   by inspecting the PR diff, per #199's Done.
 2. **Workflow** `.github/workflows/android-release.yml`, following the
    **hosted `android.yml` pattern** (PR #262) rather than `cloud.yml`'s
    self-hosted one — the owner's runner decision (hosted `ubuntu-latest`)
@@ -2097,6 +2118,9 @@ Code/config:
      JDK 25 via `setup-java@v5` (the `toolchainVersion=25` pin), accept SDK
      licenses (compileSdk 37 is not on the image). No fork gate, no Docker,
      no self-hosted runner.
+   - `environment: android-code-signing`, with the branch and tag rules from
+     item 0. Without it the five secrets are repo-level and any write
+     collaborator's branch can read them.
    - steps: → `./gradlew --no-daemon :app:bundleRelease` → `bundletool
      build-apks`/`zip` as needed → upload to the internal track via the Play
      Developer API with `PLAY_SERVICE_ACCOUNT_JSON` and the upload-key
