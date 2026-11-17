@@ -44,6 +44,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.wattracker.android.R
 import com.wattracker.android.WatTrackerApp
+import com.wattracker.android.cloud.BackendSelection
 import com.wattracker.android.cloud.CloudDevice
 import com.wattracker.android.cloud.CloudKind
 import com.wattracker.android.cloud.CloudPayload
@@ -88,13 +89,16 @@ fun SettingsScreen() {
         scope.launch {
             isLoading = true
             try {
-                val s = WatTrackerApp.session(context)
+                // A cloud this launch could not build is reported by null, not
+                // by an exception: the desktop half of this screen still has to
+                // load, and the reason belongs to `cloudStartFailure`, not here.
+                val s = WatTrackerApp.cloudSessionOrNull(context)
                 val lc = WatTrackerApp.localClient(context)
-                isCloudPaired = s.isPaired
+                isCloudPaired = s?.isPaired == true
                 isLocalPaired = lc.isPaired
                 localCreds = lc.credentials
 
-                if (s.isPaired) {
+                if (s != null && s.isPaired) {
                     val cachedProfile = s.cached(CloudRoute.Profile)
                     val profileItem = cachedProfile?.items?.firstOrNull { it.kind == CloudKind.Profile }
                     val profile = (profileItem?.payload as? CloudPayload.Profile)?.value
@@ -147,7 +151,7 @@ fun SettingsScreen() {
                 activeSource = activeSource,
                 onViewSourceSelected = { viewSource = it },
                 onSetActiveSource = { source ->
-                    WatTrackerApp.setDataSource(context, source)
+                    WatTrackerApp.setSelection(context, BackendSelection.of(source))
                     refreshState()
                 },
             )
@@ -163,7 +167,7 @@ fun SettingsScreen() {
                     currentCredentialId = currentCredentialId,
                     onPairSuccess = {
                         globalNotice = null
-                        WatTrackerApp.setDataSource(context, DataSource.Cloud)
+                        WatTrackerApp.setSelection(context, BackendSelection.Cloud)
                         refreshState()
                     },
                     onRemoveResult = { notice ->
@@ -178,7 +182,7 @@ fun SettingsScreen() {
                     credentials = localCreds,
                     onPairSuccess = {
                         globalNotice = null
-                        WatTrackerApp.setDataSource(context, DataSource.Local)
+                        WatTrackerApp.setSelection(context, BackendSelection.Local)
                         refreshState()
                     },
                     onRemoveSuccess = {
@@ -419,9 +423,12 @@ private fun CloudBackendPanel(
             // Two storage failures, two different things the rider can do about
             // them: one store cannot save a pairing at all, the other is holding
             // one it can no longer read and pairing again replaces it (#457).
+            // Unread is neither of those: nothing is known to be wrong and the
+            // file may open on the next attempt, so there is no warning to give.
             val storeWarning = when (WatTrackerApp.credentialStoreHealth) {
                 StoreHealth.Unavailable -> R.string.settings_cloud_store_unavailable_warning
                 StoreHealth.UnreadableVault -> R.string.settings_cloud_vault_unreadable_warning
+                StoreHealth.Unread -> null
                 StoreHealth.Durable -> null
             }
             if (storeWarning != null) {
