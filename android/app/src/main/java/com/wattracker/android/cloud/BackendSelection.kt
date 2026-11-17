@@ -87,23 +87,50 @@ enum class BackendObservation {
  * [StoreHealth.Unavailable] is the Keystore refusing the vault outright: the
  * in-memory store that stands in never opens the file on disk, so a pairing may
  * be sitting in it unread and nothing about it has been seen.
+ * [StoreHealth.Unread] is the same answer for a different reason: the file is
+ * there, but this launch could not read it (a transient I/O or provider failure,
+ * or a member this build cannot parse), so again nothing was seen. Neither is
+ * evidence against a stored choice.
  * [StoreHealth.UnreadableVault] is the opposite -- the file was opened, and the
  * key behind it is gone -- so the pairing behind it is genuinely gone, and that
  * is a look that says unpaired.
  */
 fun observeLocalBackend(vaultHealth: StoreHealth, paired: Boolean): BackendObservation = when {
     vaultHealth == StoreHealth.Unavailable -> BackendObservation.Unknown
+    // Paired before Unread: a vault with one unparsed member still serves the
+    // member that parsed, so a desktop paired from it really is paired.
     paired -> BackendObservation.Paired
+    vaultHealth == StoreHealth.Unread -> BackendObservation.Unknown
     else -> BackendObservation.Unpaired
 }
 
 /**
- * What this launch may claim about the cloud. No signing key means no session,
- * and no session means nobody looked: [BackendObservation.Unknown].
+ * What this launch may claim about the cloud.
+ *
+ * No signing key means no session, and no session means nobody looked:
+ * [BackendObservation.Unknown].
+ *
+ * A built session can still have concluded nothing. The session reads the vault
+ * in its constructor, so a Keystore that would not open it ([StoreHealth.Unavailable])
+ * or a read that failed ([StoreHealth.Unread]) leaves `isPaired` false without
+ * anything having been seen. The cloud binding lives in that same vault, so the
+ * vault's health is the cloud's health too -- without this, a Keystore-refused
+ * vault would read as a seen-unpaired cloud and delete an explicit `Cloud`
+ * override, which is the mistake [observeLocalBackend] exists to avoid.
+ *
+ * [StoreHealth.UnreadableVault] is deliberately not `Unknown`: the envelope
+ * opened and this installation cannot use it, so the pairing behind it is gone.
+ * That is a look, and it says unpaired.
  */
-fun observeCloudBackend(sessionBuilt: Boolean, paired: Boolean): BackendObservation = when {
+fun observeCloudBackend(
+    sessionBuilt: Boolean,
+    paired: Boolean,
+    vaultHealth: StoreHealth,
+): BackendObservation = when {
     !sessionBuilt -> BackendObservation.Unknown
+    vaultHealth == StoreHealth.Unavailable -> BackendObservation.Unknown
     paired -> BackendObservation.Paired
+    vaultHealth == StoreHealth.Unread -> BackendObservation.Unknown
     else -> BackendObservation.Unpaired
 }
 
@@ -138,4 +165,36 @@ fun keepOverride(
     BackendSelection.Automatic -> true
     BackendSelection.Cloud -> !cloud.contradictsOverride
     BackendSelection.Local -> !local.contradictsOverride
+}
+
+/**
+ * The whole startup decision: what the launch starts on, and whether the stored
+ * preference has to be deleted.
+ *
+ * [keepOverride] alone cannot be pinned from a screen, and the wiring around it
+ * -- dropping a kept override anyway, or forgetting to delete one that was
+ * dropped -- would stay green. So the two outcomes are decided here, together,
+ * and `doInit` only applies them. [deleteStoredPreference] is true exactly when
+ * something is stored and is not being kept, which is also the rule for a value
+ * this build does not recognise: it can only have been edited by hand, and
+ * leaving it would mean re-reading the same garbage every launch.
+ */
+data class StartupSelection(
+    val selection: BackendSelection,
+    val deleteStoredPreference: Boolean,
+)
+
+fun decideStartupSelection(
+    storedName: String?,
+    stored: BackendSelection?,
+    cloud: BackendObservation,
+    local: BackendObservation,
+): StartupSelection {
+    val kept = stored != null && keepOverride(stored, cloud, local)
+    return StartupSelection(
+        selection = if (kept) stored else BackendSelection.Automatic,
+        // `storedName` is the raw preference, so an unrecognised value -- which
+        // parses to a null `stored` -- is deleted rather than re-read forever.
+        deleteStoredPreference = storedName != null && !kept,
+    )
 }

@@ -5,7 +5,6 @@ import android.content.Context
 import androidx.room.Room
 import com.wattracker.android.cache.RoomSnapshotCache
 import com.wattracker.android.cache.WatTrackerDatabase
-import com.wattracker.android.cloud.BackendObservation
 import com.wattracker.android.cloud.BackendSelection
 import com.wattracker.android.cloud.CloudApiResult
 import com.wattracker.android.cloud.CloudClient
@@ -22,7 +21,7 @@ import com.wattracker.android.cloud.LocalCredentials
 import com.wattracker.android.cloud.ReadModel
 import com.wattracker.android.cloud.RemoveDeviceResult
 import com.wattracker.android.cloud.SharedPreferencesRemovalGate
-import com.wattracker.android.cloud.keepOverride
+import com.wattracker.android.cloud.decideStartupSelection
 import com.wattracker.android.cloud.observeCloudBackend
 import com.wattracker.android.cloud.observeLocalBackend
 import com.wattracker.android.cloud.resolveBackend
@@ -76,6 +75,16 @@ object WatTrackerApp {
     @Volatile private var cloudFailure: Throwable? = null
 
     private val _selectionFlow = MutableStateFlow(BackendSelection.Automatic)
+
+    /** Guards [selectionGeneration]. */
+    private val selectionLock = Any()
+
+    /**
+     * Bumped on every [setSelection]. [applySelection] drops a resolve whose
+     * generation moved under it, so an IO-thread refresh cannot write a backend
+     * the rider has already replaced.
+     */
+    private var selectionGeneration = 0
 
     /** What the rider asked for. It is not what the screens read. */
     val selectionFlow: StateFlow<BackendSelection> = _selectionFlow.asStateFlow()
@@ -169,6 +178,9 @@ object WatTrackerApp {
      * first run. Only an explicit backend is persisted.
      */
     fun setSelection(context: Context, selection: BackendSelection) {
+        // Bumped before the flow is written, so any resolve already in flight on
+        // an IO thread is stale the moment it reads the counter back.
+        synchronized(selectionLock) { selectionGeneration += 1 }
         _selectionFlow.value = selection
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         if (selection.isOverride) {
@@ -197,15 +209,30 @@ object WatTrackerApp {
      * Recompute the resolved backend from what is paired right now.
      *
      * Called from the init dispatcher, from the main thread on a Settings
-     * change, and from the IO context of a pairing or removal. Nothing here is
-     * a counter or a sequence: the value is recomputed from live fields and
-     * written whole, so the worst a race can cost is one refresh -- a write
-     * based on a pairing a moment older, immediately corrected by the next
-     * [refreshBackend]. No screen reads a torn value, because each writes one
-     * complete [DataSource] into a `StateFlow`.
+     * change, and from the IO context of a pairing or removal.
+     *
+     * A resolve reads the selection, then two pairing flags, then writes. On the
+     * IO thread that sequence can straddle a main-thread [setSelection]: an
+     * `Automatic` refresh that read `Local` just before the rider chose `Cloud`
+     * would write `Local` afterwards, and because [refreshBackend] returns early
+     * once an override is set, nothing would correct it until the next restart.
+     * iOS guards the same window with `selectionGeneration` (the #298/#308 fix).
+     * So the generation is captured first and checked before the write: a stale
+     * resolve drops its result instead of overwriting the newer one. No screen
+     * reads a torn value either way, because each writes one complete
+     * [DataSource] into a `StateFlow`.
      */
     private fun applySelection() {
-        _dataSourceFlow.value = resolveBackend(_selectionFlow.value, session?.isPaired == true, localClient?.isPaired == true)
+        val generation = synchronized(selectionLock) { selectionGeneration }
+        val resolved = resolveBackend(
+            _selectionFlow.value,
+            session?.isPaired == true,
+            localClient?.isPaired == true,
+        )
+        synchronized(selectionLock) {
+            if (selectionGeneration != generation) return
+            _dataSourceFlow.value = resolved
+        }
     }
 
     suspend fun pairCloud(context: Context, code: String, label: String?) = withContext(Dispatchers.IO) {
@@ -327,7 +354,15 @@ object WatTrackerApp {
         val credentials = openCredentialStore(context)
         val local = LocalClient(
             credentialsProvider = { credentials.loadLocal() },
-            onRevoked = { credentials.clearLocal() },
+            onRevoked = {
+                credentials.clearLocal()
+                // A local 401 is a backend that just went away, which is what
+                // Automatic resolves on. `removeCloudDevice` already refreshes
+                // from its `finally`; this half did not, so an `Automatic`
+                // launch stayed pinned to a desktop it had just lost until the
+                // next restart.
+                refreshBackend()
+            },
         )
 
         // The cloud is one backend, not the app. Building it needs a signing
@@ -357,7 +392,12 @@ object WatTrackerApp {
                 removalGate = SharedPreferencesRemovalGate(context),
             )
         } catch (t: Throwable) {
+            // Cancellation is not a failure, and an `Error` is not one either:
+            // an OOM or a linkage problem must not be quietly spent as "this
+            // device cannot be paired" for the rest of the launch. Only an
+            // `Exception` is the cloud failing to build.
             if (t is CancellationException) throw t
+            if (t is Error) throw t
             cloudFailure = t
         }
 
@@ -377,8 +417,11 @@ object WatTrackerApp {
         // built, and a vault the Keystore would not open, are `Unknown` rather
         // than `Unpaired`: nothing saw them, so nothing proved the stored choice
         // wrong, and a bad launch must not delete a rider's pick.
-        val cloudObservation =
-            observeCloudBackend(sessionBuilt = cloudSession != null, paired = cloudSession?.isPaired == true)
+        val cloudObservation = observeCloudBackend(
+            sessionBuilt = cloudSession != null,
+            paired = cloudSession?.isPaired == true,
+            vaultHealth = credentials.health,
+        )
         val localObservation = observeLocalBackend(vaultHealth = credentials.health, paired = local.isPaired)
 
         // An override for a backend that was *seen* unpaired is dropped here,
@@ -386,19 +429,15 @@ object WatTrackerApp {
         // backend works (`SessionGate.swift:305-312`). Anything stored that is
         // not being kept is deleted, including a value this build does not
         // recognise: it can only have been edited by hand, and leaving it would
-        // mean re-reading the same garbage every launch.
-        val selection = if (storedOverride != null && keepOverride(storedOverride, cloudObservation, localObservation)) {
-            storedOverride
-        } else {
-            if (storedName != null) prefs.edit().remove(KEY_BACKEND_OVERRIDE).apply()
-            BackendSelection.Automatic
-        }
-        _selectionFlow.value = selection
-        _dataSourceFlow.value = resolveBackend(
-            selection,
-            cloudPaired = cloudObservation == BackendObservation.Paired,
-            localPaired = localObservation == BackendObservation.Paired,
-        )
+        // mean re-reading the same garbage every launch. The decision is
+        // [decideStartupSelection]'s so a mutation in this wiring is not silent.
+        val startup = decideStartupSelection(storedName, storedOverride, cloudObservation, localObservation)
+        if (startup.deleteStoredPreference) prefs.edit().remove(KEY_BACKEND_OVERRIDE).apply()
+        _selectionFlow.value = startup.selection
+        // Through the same guarded path as a Settings change: the init
+        // dispatcher is not the main thread, and a rider who opens Settings
+        // before this lands must not have their choice overwritten by it.
+        applySelection()
     }
 
     private fun openDatabase(context: Context): WatTrackerDatabase {
