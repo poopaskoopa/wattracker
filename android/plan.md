@@ -2074,31 +2074,43 @@ from Play Console is stale.
 `ANDROID_UPLOAD_KEY_PASSWORD`, `ANDROID_UPLOAD_KEY_ALIAS`,
 `PLAY_SERVICE_ACCOUNT_JSON`. The keystore signs the bundle. The service account
 authorizes the upload. They are independent. All five are repository secrets
-today; **move them into the environment below.** A repository secret is
-readable by any workflow a write collaborator can push, on any branch.
+today; **the owner moves them into the environment below.** A repository
+secret is readable by any workflow a write collaborator can push, on any
+branch.
 
 `.gitignore` covers `*.jks` and `*.keystore`, but **not** a JSON service-account
 key. Keep that file outside the tree, or add an ignore line before creating it.
 
 Code/config:
 
-0. **Gate the signing secrets behind an environment.** iOS, Windows and macOS
-each declare one (`ios-code-signing` in `ios-release.yml`), and #478 builds a
-merge-time gate on the same idea. Android needs the same shape, because the
-upload key and the Play service account are release rights, not build inputs.
-   - Create the `android-code-signing` environment. Add a deployment branch
-     rule that allows only `main`, plus admin-only `android/v*` tags. Add a
-     tag ruleset so only an admin can create or move those tags.
-   - Move the five secrets above into that environment. Delete the repository
-     copies.
-   - Declare `environment: android-code-signing` on the release job, and keep
-     `android.yml` free of it: a PR build needs no signing material.
-   - The environment is only half the gate. The other half is CODEOWNERS:
-     `.github/CODEOWNERS` (#478) owns `/.github/` but leaves `android/`
-     unowned, so the Gradle signing config can change with no owner review.
-     Add `/android/app/build.gradle.kts` there once #478 lands.
-   - Verify the gate the way #478 does: a workflow on another branch that
-     names the environment must fail to read the secrets.
+0. **Gate the signing secrets behind an environment — owner work.** iOS,
+Windows and macOS each declare one (`ios-code-signing` in `ios-release.yml`),
+and #478 builds a merge-time gate on the same idea. Android needs the same
+shape, because the upload key and the Play service account are release rights,
+not build inputs.
+
+   **This is a repository-settings change, not a code change, so it is the
+owner's.** No agent can do it: secret values are write-only and never readable
+through the API, so moving them means re-supplying them by hand. Filed as
+#486, alongside the other owner action items (#132).
+
+   The owner creates the `android-code-signing` environment, adds a deployment
+   branch rule for `main` plus `android/v*` tags, adds a tag ruleset for
+   `android/v*`, sets the five secrets at environment scope, and deletes the
+   repository copies — environment first, so no window exists where a consumer
+   finds neither.
+
+   The code half is an agent task and stays here: declare
+   `environment: android-code-signing` on the release job once it exists, and
+   keep `android.yml` free of it, because a PR build needs no signing material.
+
+   The environment is only half the gate. The other half is CODEOWNERS:
+   `.github/CODEOWNERS` (#478) owns `/.github/` but leaves `android/` unowned,
+   so the Gradle signing config can change with no owner review. Add
+   `/android/app/build.gradle.kts` there once #478 lands.
+
+   The owner also verifies the gate the way #478 does: a workflow on another
+   branch that names the environment must fail to read the secrets.
 
 1. **App signing:** enroll in Play App Signing. Generate an **upload key**
    (`keytool -genkeypair -v -keystore wattracker-upload.jks -alias
