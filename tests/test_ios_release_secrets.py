@@ -231,7 +231,7 @@ def test_workflow_uses_manual_diagnostic_version_and_upload_is_main_or_tag_push_
     upload = workflow[upload_start:] if upload_end == -1 else workflow[upload_start:upload_end]
     assert (
         "if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || "
-        "startsWith(github.ref, 'refs/tags/ios-v')) && steps.supersede.outputs.superseded != 'true'"
+        "startsWith(github.ref, 'refs/tags/ios-v'))\n"
     ) in upload
     assert "if: startsWith(github.ref, 'refs/tags/ios-v')" not in upload
 

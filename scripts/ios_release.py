@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """Planning and follow-up helpers for .github/workflows/ios-release.yml.
 
-Standard library only: this runs on hosted ubuntu and macOS runners with
-whatever ``python3`` the image ships, before anything is installed.
+Standard library only: this runs on hosted ubuntu runners with whatever
+``python3`` the image ships, before anything is installed.
 
-Three subcommands, one per job that needs a decision made in code rather than
-in a YAML expression:
+Two subcommands, one per job that needs a decision made in code rather than
+in a YAML expression. Neither runs in the job that holds the signing secrets.
 
 ``plan``        (the ``plan`` job, contents: read)
     Decides whether this run releases at all and which marketing version it
-    carries. See ``plan()`` for the rules.
+    carries, and refuses a manual tag that would not be above what has
+    already shipped. See ``plan()`` for the rules.
 
-``superseded``  (the signing job, contents: read, just before upload)
-    Asks whether ``main`` has already moved past this commit with another
-    change to the app. If it has, that push started its own release, which is
-    queued behind this one and ships everything this one would, so this run
-    skips its upload. Fails open: any doubt means "upload".
-
-``notify``      (the ``notify`` job, issues: write, never the signing job)
+``notify``      (the ``notify`` job, issues: write)
     Comments "Shipped in TestFlight <version> (build <n>)" on each issue the
     shipped pull requests closed.
 
@@ -27,23 +22,24 @@ THE VERSION RULE, and why it is not "latest tag + 1".
               increased by the number of first-parent commits since that tag
               that touch the app (minimum 1).
 
-On ``main`` every pull request lands as one first-parent merge commit, so in
-the normal flow (one merge per push, the previous release tagged) this is
-exactly "latest tag's patch + 1". It differs in the two cases where "+1" is
-wrong:
+The workflow never creates tags: ``ios-v*`` tag creation is admin-only (the
+"iOS release tag policy" ruleset), and that restriction is part of the signing
+boundary. So the latest tag is whichever release an admin last tagged by hand,
+and automatic releases count forward from it: with ios-v0.1.9 the latest tag,
+the next three app merges ship 0.1.10, 0.1.11 and 0.1.12. On ``main`` every
+pull request lands as one first-parent merge commit, so that is "+1" per
+merge. The rule is a pure function of the commit, so re-running a run
+recomputes the same version; a number can be skipped when two merges ship as
+one build, which is accurate, because that version never shipped.
 
-* The post-upload tag could not be created (the tag ruleset refuses it, or the
-  tag job failed). "+1" would then reuse the previous version forever. This
-  rule is additive - patch(T) + count(T..H) is the same whether it is computed
-  from the last tag that exists or from one that was never written - so the
-  tag is a cache for humans and for the notify range, never load-bearing.
-* A release was superseded (two merges, one build). The number skips, which
-  is accurate: the skipped version was never shipped.
+Because the tags lag behind what has shipped, a manual tag is checked against
+``shipped_version()`` - the highest version the automatic release can already
+have shipped at that commit and at the tip of main - and refused unless it is
+strictly above it. Without that, a hand-pushed ios-v0.1.10 after 0.1.12
+shipped would ship 0.1.10 again and make the next merge ship 0.1.11.
 
-The version is therefore a pure function of the commit, so re-running a run
-recomputes the same version. The build number (``run_number.run_attempt``) is
-what makes every upload unique to App Store Connect; it is set in the workflow,
-not here.
+The build number (``run_number.run_attempt``) is what makes every upload
+unique to App Store Connect; it is set in the workflow, not here.
 """
 
 from __future__ import annotations
@@ -54,7 +50,6 @@ import os
 import re
 import subprocess
 import sys
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
@@ -68,8 +63,7 @@ TAG_PREFIX = "ios-v"
 #
 # NOT here, deliberately: WatTrackerTests/ (test target only), tests/vectors/
 # (bundled into the test target only), docs, and the workflow itself - a
-# workflow change can be exercised with a non-uploading dispatch run or the
-# manual tag. tests/test_ios_release_workflow.py asserts this tuple matches
+# workflow change can be exercised with a non-uploading dispatch run. tests/test_ios_release_workflow.py asserts this tuple matches
 # the workflow's `paths:` filter and covers every file the app target names.
 APP_PATHS: tuple[str, ...] = (
     "ios/WatTracker/WatTracker",
@@ -186,6 +180,38 @@ def app_commits(git: GitRunner, base: str, head: str) -> list[str]:
     )
 
 
+MAIN_REF = "refs/remotes/origin/main"
+
+
+def ref_exists(git: GitRunner, ref: str) -> bool:
+    try:
+        git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"])
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
+def shipped_version(git: GitRunner, rev: str, exclude: str) -> tuple[int, int, int] | None:
+    """The highest version the automatic release can have shipped at rev.
+
+    The latest release tag reachable from rev (other than `exclude`, the tag
+    being judged) plus every first-parent app commit since it, each of which
+    a merge to main would have shipped as the next patch. No minimum of one
+    here: with no app commit since the tag, the tag's own version is the last
+    one shipped. None when no release tag is reachable at all.
+    """
+    merged = _lines(git(["tag", "--merged", rev, "--list", f"{TAG_PREFIX}*"]))
+    base = latest_tag(t for t in merged if t != exclude)
+    if base is None:
+        return None
+    major, minor, patch = parse_tag(base)
+    return major, minor, patch + len(app_commits(git, base, rev))
+
+
+def _fmt(version: tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
 # ---------------------------------------------------------------- plan
 
 
@@ -209,11 +235,14 @@ class Plan:
 def plan(event_name: str, ref: str, git: GitRunner, head: str = "HEAD") -> Plan:
     """Decide what this run does.
 
-    push of refs/tags/ios-v*   the manual escape hatch: ship the tag's version.
+    push of refs/tags/ios-v*   the manual escape hatch: ship the tag's version,
+                               provided it is above everything the automatic
+                               release can already have shipped at this commit
+                               and at the tip of main. Refused (before any
+                               secret is in scope) otherwise.
     push of refs/heads/main    ship the derived version, unless a release tag
-                               already points at this commit (a manual tag
-                               run, or a re-run of a run that already shipped
-                               and tagged it).
+                               already points at this commit (its tag run
+                               ships it).
     workflow_dispatch          archive and export only, as 0.0.0.
     """
     if event_name == "workflow_dispatch":
@@ -225,8 +254,22 @@ def plan(event_name: str, ref: str, git: GitRunner, head: str = "HEAD") -> Plan:
     if ref.startswith("refs/tags/"):
         tag = ref[len("refs/tags/"):]
         version = tag_version_string(tag)
+        floors = [shipped_version(git, head, tag)]
+        if ref_exists(git, MAIN_REF):
+            floors.append(shipped_version(git, MAIN_REF, tag))
+        else:
+            print(f"::warning::{MAIN_REF} is not in this checkout; checking {tag} "
+                  "against this commit only.")
+        floor = max((f for f in floors if f is not None), default=None)
+        if floor is not None and parse_tag(tag) <= floor:
+            raise PlanError(
+                f"Tag '{tag}' is not above {_fmt(floor)}, which the automatic "
+                f"release may already have shipped. Delete it and tag a version "
+                f"above {_fmt(floor)} instead."
+            )
         base = base_tag_for(git, head) or ""
-        return Plan(True, "tag", version, base, f"tag {tag}")
+        above = _fmt(floor) if floor is not None else "no earlier release"
+        return Plan(True, "tag", version, base, f"tag {tag}, above {above}")
 
     if ref == "refs/heads/main":
         existing = tags_at(git, head)
@@ -301,29 +344,6 @@ class GitHub:
         if not isinstance(result, dict) or result.get("errors"):
             raise RuntimeError("GraphQL request failed")
         return result["data"]
-
-
-# ---------------------------------------------------------------- superseded
-
-
-def is_superseded(client, repo: str, sha: str, branch: str = "main") -> bool:
-    """True only when branch has a newer commit that touches the app.
-
-    That newer push fired its own release (same path filter), which the
-    workflow concurrency group has queued behind this run. Any uncertainty -
-    an API error, a diverged history, a truncated file list with no app path
-    in it - returns False: a redundant TestFlight build is harmless, a
-    missing one is not.
-    """
-    try:
-        result = client.rest("GET", f"/repos/{repo}/compare/{sha}...{branch}")
-    except Exception as error:  # noqa: BLE001 - fail open, by design
-        print(f"::warning::Could not compare with {branch} ({type(error).__name__}); uploading.")
-        return False
-    if not isinstance(result, dict) or result.get("status") != "ahead":
-        return False
-    files = result.get("files") or []
-    return any(touches_app(str(f.get("filename", ""))) for f in files if isinstance(f, dict))
 
 
 # ---------------------------------------------------------------- notify
@@ -406,10 +426,17 @@ def notify(client, git: GitRunner, repo: str, base_tag: str, head: str,
     if base_tag and parse_tag(base_tag) is None:
         raise ValueError("bad base tag")
 
+    # The range is every app commit since the latest admin-created tag, so it
+    # grows until the next manual tag. Only the newest MAX_NOTIFY_COMMITS are
+    # looked at: this build's own pull requests are always the newest, older
+    # ones were reported by the builds that shipped them (and are skipped by
+    # the marker check while still in the window), and the bound keeps the
+    # API calls per release constant. What falls out of the window unreported
+    # is only a pull request whose own notify failed 30 app merges earlier.
     commits = app_commits(git, base_tag, head) if base_tag else [head]
     if len(commits) > MAX_NOTIFY_COMMITS:
-        print(f"::warning::{len(commits)} app commits since {base_tag}; "
-              f"notifying for the newest {MAX_NOTIFY_COMMITS} only.")
+        print(f"{len(commits)} app commits since {base_tag}; "
+              f"checking the newest {MAX_NOTIFY_COMMITS}.")
         commits = commits[:MAX_NOTIFY_COMMITS]
 
     failures = 0
@@ -452,10 +479,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_plan.add_argument("--event", required=True)
     p_plan.add_argument("--ref", required=True)
 
-    p_sup = sub.add_parser("superseded")
-    p_sup.add_argument("--repo", required=True)
-    p_sup.add_argument("--sha", required=True)
-
     p_note = sub.add_parser("notify")
     p_note.add_argument("--repo", required=True)
     p_note.add_argument("--base-tag", default="")
@@ -473,23 +496,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print(f"Plan: {result.reason}")
         write_outputs(result.outputs())
-        return 0
-
-    if args.command == "superseded":
-        if not _REPO_RE.match(args.repo) or not _SHA_RE.match(args.sha):
-            print("::warning::Unexpected repository or sha; uploading.")
-            write_outputs({"superseded": "false"})
-            return 0
-        try:
-            client = GitHub.from_env()
-        except ValueError:
-            print("::warning::No usable GitHub token; uploading.")
-            write_outputs({"superseded": "false"})
-            return 0
-        superseded = is_superseded(client, args.repo, args.sha)
-        if superseded:
-            print("main has a newer app change; its queued release ships this one too.")
-        write_outputs({"superseded": "true" if superseded else "false"})
         return 0
 
     return notify(GitHub.from_env(), run_git, args.repo, args.base_tag,

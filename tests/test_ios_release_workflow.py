@@ -242,34 +242,27 @@ def _upload_if() -> str:
 
 
 @pytest.mark.parametrize(
-    ("event", "ref", "superseded", "uploads"),
+    ("event", "ref", "uploads"),
     [
-        ("push", "refs/heads/main", "", True),
-        ("push", "refs/heads/main", "false", True),
-        ("push", "refs/heads/main", "true", False),
-        ("push", "refs/tags/ios-v0.1.10", "", True),
-        ("push", "refs/heads/feature", "", False),
-        ("push", "refs/tags/v1.2.3", "", False),
-        ("workflow_dispatch", "refs/heads/main", "", False),
-        ("workflow_dispatch", "refs/tags/ios-v0.1.10", "", False),
-        ("workflow_dispatch", "refs/heads/main", "false", False),
+        ("push", "refs/heads/main", True),
+        ("push", "refs/tags/ios-v0.1.10", True),
+        ("push", "refs/heads/feature", False),
+        ("push", "refs/tags/v1.2.3", False),
+        ("workflow_dispatch", "refs/heads/main", False),
+        ("workflow_dispatch", "refs/tags/ios-v0.1.10", False),
     ],
 )
-def test_upload_is_gated_to_main_push_or_release_tag(event, ref, superseded, uploads):
-    context = {
-        "github.event_name": event,
-        "github.ref": ref,
-        "steps.supersede.outputs.superseded": superseded,
-    }
+def test_upload_is_gated_to_main_push_or_release_tag(event, ref, uploads):
+    context = {"github.event_name": event, "github.ref": ref}
     assert _evaluate(_upload_if(), context) is uploads
 
 
 def test_upload_gate_names_the_refs_itself_and_only_one_step_uploads():
     condition = _upload_if()
-    assert "github.event_name == 'push'" in condition
-    assert "github.ref == 'refs/heads/main'" in condition
-    assert "startsWith(github.ref, 'refs/tags/ios-v')" in condition
-    assert "needs.plan" not in condition
+    assert condition == (
+        "github.event_name == 'push' && (github.ref == 'refs/heads/main' || "
+        "startsWith(github.ref, 'refs/tags/ios-v'))"
+    )
     steps = _workflow()["jobs"]["archive-export-upload"]["steps"]
     uploaders = [s["name"] for s in steps if "--upload-app" in s.get("run", "")]
     assert uploaders == ["Validate and upload to TestFlight"]
@@ -278,15 +271,14 @@ def test_upload_gate_names_the_refs_itself_and_only_one_step_uploads():
     assert upload["run"].index("--upload-app") < upload["run"].index('echo "uploaded=true"')
 
 
-def test_supersession_check_runs_before_upload_on_main_pushes_only():
+def test_the_signing_job_makes_no_github_api_call():
     job = _workflow()["jobs"]["archive-export-upload"]
-    names = [s.get("name") for s in job["steps"]]
-    check = _step(job, "Check whether a newer main release supersedes this one")
-    assert names.index(check["name"]) == names.index("Validate and upload to TestFlight") - 1
-    assert check["id"] == "supersede"
-    assert check["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
-    assert "secrets." not in str(check.get("env", {}))
-    assert "superseded" in check["run"]
+    text = yaml.safe_dump(job)
+    assert "github.token" not in text
+    assert "GITHUB_TOKEN" not in text
+    assert "GH_TOKEN" not in text
+    assert "gh api" not in text
+    assert "scripts/ios_release.py" not in text
 
 
 # ------------------------------------------------------------------ permissions
@@ -296,10 +288,9 @@ def test_permissions_are_least_privilege_and_scoped_per_job():
     workflow = _workflow()
     assert workflow["permissions"] == {}
     jobs = workflow["jobs"]
-    assert set(jobs) == {"plan", "archive-export-upload", "tag", "notify"}
+    assert set(jobs) == {"plan", "archive-export-upload", "notify"}
     assert jobs["plan"]["permissions"] == {"contents": "read"}
     assert jobs["archive-export-upload"]["permissions"] == {"contents": "read"}
-    assert jobs["tag"]["permissions"] == {"contents": "write"}
     assert jobs["notify"]["permissions"] == {
         "contents": "read",
         "issues": "write",
@@ -319,10 +310,26 @@ def test_signing_environment_and_secrets_live_only_in_the_archive_job():
             assert "secrets." not in text, name
 
 
-def test_write_token_job_runs_no_repository_code():
-    tag = _workflow()["jobs"]["tag"]
-    assert all("uses" not in step for step in tag["steps"])
-    assert "python" not in yaml.safe_dump(tag)
+def test_the_workflow_never_writes_contents_or_tags():
+    # ios-v* tag creation being admin-only is half of the signing boundary
+    # (see the workflow header): a workflow-created tag can be dispatched on
+    # and would reach the signing environment. Nothing here may create one.
+    workflow = _workflow()
+    for name, job in workflow["jobs"].items():
+        assert job["permissions"].get("contents") == "read", name
+        assert "actions" not in job["permissions"], name
+    text = WORKFLOW.read_text(encoding="utf-8")
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    for forbidden in ("git/refs", "git tag", "git push", "contents: write", "actions: write"):
+        assert forbidden not in code, forbidden
+
+
+def test_header_states_the_signing_boundary_and_the_bypass_trap():
+    header = WORKFLOW.read_text(encoding="utf-8").split("\non:\n", 1)[0]
+    assert "(a) a merge to `main`, gated by the code-owner `main` ruleset (#478)" in header
+    assert "repository admins create, move or delete" in header
+    assert "a bypass actor of ANY kind on that ruleset" in header
+    assert "never creates, moves or deletes a tag" in header
 
 
 def test_notify_job_cannot_fail_the_release_and_never_holds_signing():
@@ -342,10 +349,6 @@ def test_every_job_is_pinned_to_this_repository():
 @pytest.mark.parametrize(
     ("job", "event", "ref", "uploaded", "runs"),
     [
-        ("tag", "push", "refs/heads/main", "true", True),
-        ("tag", "push", "refs/heads/main", "", False),
-        ("tag", "push", "refs/tags/ios-v0.2.0", "true", False),
-        ("tag", "workflow_dispatch", "refs/heads/main", "true", False),
         ("notify", "push", "refs/heads/main", "true", True),
         ("notify", "push", "refs/tags/ios-v0.2.0", "true", True),
         ("notify", "push", "refs/heads/main", "", False),
@@ -455,57 +458,6 @@ def test_derive_step_revalidates_the_planned_version(tmp_path, event, mode, vers
     if ok:
         assert f"MARKETING_VERSION={version}\nBUILD_NUMBER=41.2\n" == (tmp_path / "env").read_text()
         assert (tmp_path / "output").read_text() == "build_number=41.2\n"
-
-
-# ------------------------------------------------------------------ tag step
-
-
-def _fake_gh(tmp_path: Path, behaviour: str) -> Path:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    gh = bin_dir / "gh"
-    gh.write_text(
-        "#!/bin/bash\n"
-        f'echo "$*" >> "{tmp_path}/gh-calls"\n'
-        'if [[ "$*" == *"--method POST"* ]]; then\n'
-        f'  {"exit 0" if behaviour == "created" else "echo \"Repository rule violations found\" >&2; exit 1"}\n'
-        "fi\n"
-        f'{"echo " + "a" * 40 if behaviour == "exists" else "exit 1"}\n'
-    )
-    gh.chmod(gh.stat().st_mode | stat.S_IEXEC)
-    return bin_dir
-
-
-@pytest.mark.parametrize(
-    ("behaviour", "code"), [("created", 0), ("exists", 0), ("refused", 1)]
-)
-def test_tag_step_creates_the_tag_or_fails_loudly_naming_the_ruleset(tmp_path, behaviour, code):
-    script = _step(_workflow()["jobs"]["tag"], "Tag the uploaded commit")["run"]
-    result = _run_step(
-        script,
-        {"VERSION": "0.1.10", "GITHUB_SHA": "a" * 40, "GITHUB_REPOSITORY": REPO, "GH_TOKEN": "x"},
-        tmp_path,
-        _fake_gh(tmp_path, behaviour),
-    )
-    assert result.returncode == code, result.stderr
-    calls = (tmp_path / "gh-calls").read_text()
-    assert "--method POST repos/poopaskoopa/wattracker/git/refs" in calls
-    assert "ref=refs/tags/ios-v0.1.10" in calls
-    if behaviour == "refused":
-        assert "iOS release tag policy" in result.stdout
-        assert "Repository rule violations" in result.stderr
-
-
-def test_tag_step_refuses_a_malformed_version_before_calling_github(tmp_path):
-    script = _step(_workflow()["jobs"]["tag"], "Tag the uploaded commit")["run"]
-    result = _run_step(
-        script,
-        {"VERSION": "0.1.10$(id)", "GITHUB_SHA": "a" * 40, "GITHUB_REPOSITORY": REPO},
-        tmp_path,
-        _fake_gh(tmp_path, "created"),
-    )
-    assert result.returncode == 1
-    assert not (tmp_path / "gh-calls").exists()
 
 
 # ------------------------------------------------------------------ version rule
@@ -639,6 +591,7 @@ def test_plan_follows_a_manual_minor_bump(repo):
 
 def test_plan_tag_push_ships_the_tag_version_and_reports_the_previous_tag(repo):
     repo.merge(APP_FILE, "fix")
+    repo("update-ref", rel.MAIN_REF, "HEAD")
     repo("tag", "ios-v0.3")
     result = rel.plan("push", "refs/tags/ios-v0.3", repo.runner)
     assert (result.release, result.mode, result.version, result.base_tag) == (
@@ -659,6 +612,62 @@ def test_plan_refuses_a_main_push_with_no_tag_to_count_from(tmp_path):
         rel.plan("push", "refs/heads/main", git.runner)
 
 
+def _ship_three_untagged_merges(repo):
+    """ios-v0.1.9, then three app merges the automatic release shipped as
+    0.1.10, 0.1.11 and 0.1.12 without any tag being written."""
+    commits = [repo.merge(APP_FILE, f"fix-{n}") for n in range(3)]
+    assert rel.plan("push", "refs/heads/main", repo.runner).version == "0.1.12"
+    repo("update-ref", rel.MAIN_REF, commits[-1])
+    return commits
+
+
+@pytest.mark.parametrize("tag", ["ios-v0.1.10", "ios-v0.1.12", "ios-v0.1", "ios-v0.0.99"])
+def test_plan_refuses_a_manual_tag_at_or_below_what_already_shipped(repo, tag):
+    _ship_three_untagged_merges(repo)
+    repo("tag", tag)
+    with pytest.raises(rel.PlanError, match=r"not above 0\.1\.12"):
+        rel.plan("push", f"refs/tags/{tag}", repo.runner)
+
+
+@pytest.mark.parametrize("tag", ["ios-v0.1.13", "ios-v0.2", "ios-v1.0.0"])
+def test_plan_accepts_a_manual_tag_above_what_already_shipped(repo, tag):
+    _ship_three_untagged_merges(repo)
+    repo("tag", tag)
+    result = rel.plan("push", f"refs/tags/{tag}", repo.runner)
+    assert (result.release, result.mode, result.version) == (True, "tag", tag[len("ios-v"):])
+    assert result.base_tag == "ios-v0.1.9"
+
+
+def test_plan_refuses_a_tag_on_an_old_commit_below_the_tip_of_main(repo):
+    first, *_ = _ship_three_untagged_merges(repo)
+    # At `first` only 0.1.10 had shipped, but main has since shipped 0.1.12.
+    repo("tag", "ios-v0.1.11", first)
+    with pytest.raises(rel.PlanError, match=r"not above 0\.1\.12"):
+        rel.plan("push", "refs/tags/ios-v0.1.11", repo.runner, head=first)
+
+
+def test_plan_allows_reshipping_an_unchanged_commit_with_the_next_patch(repo):
+    repo.merge("docs/ios-testflight.md", "docs-only")
+    repo("update-ref", rel.MAIN_REF, "HEAD")
+    repo("tag", "ios-v0.1.10")
+    assert rel.plan("push", "refs/tags/ios-v0.1.10", repo.runner).version == "0.1.10"
+
+
+def test_plan_checks_the_commit_alone_when_main_is_not_in_the_checkout(repo, capsys):
+    repo.merge(APP_FILE, "fix")
+    repo("tag", "ios-v0.1.10")
+    with pytest.raises(rel.PlanError):
+        rel.plan("push", "refs/tags/ios-v0.1.10", repo.runner)
+    assert "is not in this checkout" in capsys.readouterr().out
+
+
+def test_versions_keep_rising_after_an_accepted_manual_tag(repo):
+    _ship_three_untagged_merges(repo)
+    repo("tag", "ios-v0.1.13")
+    repo.merge(APP_FILE, "after-tag")
+    assert rel.plan("push", "refs/heads/main", repo.runner).version == "0.1.14"
+
+
 def test_plan_dispatch_is_the_diagnostic_version(repo):
     result = rel.plan("workflow_dispatch", "refs/heads/main", repo.runner)
     assert (result.release, result.mode, result.version) == (True, "dispatch", "0.0.0")
@@ -671,9 +680,6 @@ def test_plan_cli_writes_github_outputs(repo, tmp_path, monkeypatch):
     monkeypatch.chdir(repo.path)
     assert rel.main(["plan", "--event", "push", "--ref", "refs/heads/main"]) == 0
     assert output.read_text() == "release=true\nmode=main\nversion=0.1.10\nbase_tag=ios-v0.1.9\n"
-
-
-# ------------------------------------------------------------------ superseded
 
 
 class FakeClient:
@@ -695,32 +701,6 @@ class FakeClient:
 
     def graphql(self, query, variables):
         return self._graphql[variables["number"]]
-
-
-SHA = "1" * 40
-COMPARE = f"/repos/{REPO}/compare/{SHA}...main"
-
-
-@pytest.mark.parametrize(
-    ("response", "superseded"),
-    [
-        ({"status": "ahead", "files": [{"filename": APP_FILE}]}, True),
-        ({"status": "ahead", "files": [{"filename": "docs/x.md"}, {"filename": TEST_FILE}]}, False),
-        ({"status": "identical", "files": []}, False),
-        ({"status": "diverged", "files": [{"filename": APP_FILE}]}, False),
-        ({"status": "ahead"}, False),
-        (RuntimeError("boom"), False),
-    ],
-)
-def test_supersession_only_on_a_newer_app_change_and_fails_open(response, superseded):
-    assert rel.is_superseded(FakeClient(rest={COMPARE: response}), REPO, SHA) is superseded
-
-
-def test_superseded_cli_fails_open_without_a_token(tmp_path, monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "out"))
-    assert rel.main(["superseded", "--repo", REPO, "--sha", SHA]) == 0
-    assert (tmp_path / "out").read_text() == "superseded=false\n"
 
 
 # ------------------------------------------------------------------ notify
@@ -833,11 +813,11 @@ def test_docs_describe_the_automatic_release_and_the_owner_settings():
     start = docs.index("## Settings the automatic release needs")
     settings = docs[start:docs.index("\n## ", start + 1)]
     first = settings.index("\n1. **Land #478")
-    second = settings.index("\n2. **Let GitHub Actions create `ios-v*` tags")
-    third = settings.index("\n3. **Remove the required reviewer")
-    assert first < second < third
-    assert "iOS release tag policy" in settings[second:third]
-    assert "\n4. " not in settings
+    second = settings.index("\n2. **Remove the required reviewer")
+    assert first < second
+    assert "\n3. " not in settings
+    assert "Do not add a bypass actor of any kind" in " ".join(settings.split())
+    assert "15368" not in docs
     agents = Path("AGENTS.md").read_text(encoding="utf-8")
     finishing = agents[agents.index("### Finishing an item"):agents.index("## Scope")]
     assert "TestFlight automatically on merge" in finishing

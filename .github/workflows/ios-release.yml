@@ -3,9 +3,10 @@ name: iOS TestFlight release
 # Three ways in, one pipeline:
 #
 #   push to main that changes the app   -> automatic release (the normal path).
-#                                           Version derived, uploaded, tagged.
-#   push of an `ios-v*` tag             -> manual escape hatch. Ships exactly
-#                                           the version the tag names.
+#                                           Version derived, then uploaded.
+#   push of an `ios-v*` tag             -> manual escape hatch (admins only).
+#                                           Ships exactly the version the tag
+#                                           names, if it is above what shipped.
 #   workflow_dispatch                   -> archive and export only, never an
 #                                           upload. For exercising signing.
 #
@@ -31,10 +32,23 @@ name: iOS TestFlight release
 # any fork's diff, and the `if:` below is not a substitute for the trigger
 # being right.
 #
-# Because a merge to `main` now ships, whoever can merge to `main` can run
-# code with the signing secrets. That is why the merge-time CODEOWNERS gate
-# and its `main` ruleset (#478) must be in force before the
-# `ios-code-signing` environment's required reviewer is removed.
+# THE SIGNING BOUNDARY, once the `ios-code-signing` environment has no
+# required reviewer. That environment admits exactly two refs, `main` and
+# `ios-v*` tags, so code reaches the signing secrets only by:
+#
+#   (a) a merge to `main`, gated by the code-owner `main` ruleset (#478), or
+#   (b) an `ios-v*` tag, which the "iOS release tag policy" ruleset lets only
+#       repository admins create, move or delete.
+#
+# (b) is load-bearing, not housekeeping. If anything other than an admin can
+# create an `ios-v*` tag - a bypass actor of ANY kind on that ruleset,
+# including GitHub Actions, or a workflow token with that right - then a
+# write collaborator can tag a commit carrying an altered copy of this file
+# and `workflow_dispatch` it on that tag ref (a dispatch made with
+# GITHUB_TOKEN does start a run), and that unreviewed code receives the
+# signing secrets. So this workflow never creates, moves or deletes a tag,
+# holds no `contents: write`, and its versions do not depend on tags being
+# written (scripts/ios_release.py).
 #
 # The `if:` on each job is a second, narrower thing: it stops the job doing
 # anything if the repository is ever forked WITH its history and the fork's
@@ -75,27 +89,27 @@ on:
         type: boolean
         default: false
 
-# Nothing by default. Each job asks for exactly what it uses, so the one job
-# that may write (tags) and the one that may comment (issues) never share a
-# token with the job that holds the signing secrets.
+# Nothing by default. Each job asks for exactly what it uses. No job can write
+# repository contents, and the one job that may comment on issues never
+# shares a runner or a token with the job that holds the signing secrets.
 permissions: {}
 
 # One group per trigger kind: push-branch (main), push-tag (ios-v*), and
 # workflow_dispatch. Never cancel-in-progress: a run is never cancelled once
 # it has started, so nothing is ever killed mid-upload. GitHub keeps at most
 # one run PENDING per group and cancels the older pending run when a newer one
-# queues, which is exactly the supersession wanted for back-to-back merges:
-# the newest queued release replaces an older one that has not started. A run
-# already archiving when a newer app change lands checks for that just before
-# uploading and skips its upload (scripts/ios_release.py superseded).
+# queues, which is the supersession wanted for back-to-back merges: the
+# newest queued release replaces an older one that has not started. A run
+# that has already started finishes and uploads; the extra build that costs
+# is harmless.
 #
 # Main pushes and tags are in different groups so a merge can never cancel a
 # queued tag release (and a manual dispatch can never replace either). The
 # cost is that a tag run and a main run can overlap; they cannot collide at
 # App Store Connect, because every run has a distinct build number.
 #
-# Workflow level rather than job level so the next main run's plan starts
-# only after this run's tag exists, keeping the notify range tight.
+# Workflow level rather than job level so the notify job of one release
+# finishes before the next release's starts.
 concurrency:
   group: ios-release-${{ github.event_name }}-${{ github.ref_type }}
   cancel-in-progress: false
@@ -104,8 +118,10 @@ jobs:
   # Decides, with no secret in scope, whether this run releases and which
   # marketing version it carries. Full history because the version is counted
   # from the latest reachable `ios-v*` tag; see the docstring of
-  # scripts/ios_release.py for the rule and why it is additive rather than
-  # "latest tag + 1".
+  # scripts/ios_release.py for the rule. A manual tag that is not above what
+  # the automatic release can already have shipped fails here, before the
+  # signing job exists. Full history also brings refs/remotes/origin/main,
+  # which that check compares against.
   plan:
     if: github.repository == 'poopaskoopa/wattracker'
     runs-on: ubuntu-latest
@@ -942,25 +958,6 @@ jobs:
             exit 1
           fi
 
-      # SUPERSESSION, main pushes only and as late as possible: right before
-      # the upload is the last moment skipping still saves anything. If main
-      # has moved past this commit with another change to the app, that push
-      # started its own release (same path filter), the concurrency group has
-      # queued it behind this run, and it ships everything this one would. So
-      # this run stops here rather than spending an App Store Connect build on
-      # a version that is already stale.
-      #
-      # Fails open: an API error or any doubt means "upload". A redundant
-      # TestFlight build costs nothing; a missing one is the bug this whole
-      # pipeline exists to fix. The token is read-only (the job's
-      # contents: read) and is in scope for this step alone.
-      - name: Check whether a newer main release supersedes this one
-        id: supersede
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python3 scripts/ios_release.py superseded --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA"
-
       # altool, and it is present: `xcrun --find altool` resolves on this
       # runner under Xcode 26.6 (altool 26.40.1), and --upload-app with
       # --api-key/--api-issuer is still its documented App Store delivery path.
@@ -993,7 +990,7 @@ jobs:
         # dispatch is for exercising the signing and archive path; it must
         # never be able to publish a build to App Store Connect, where a bad
         # build number cannot be reused.
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/ios-v')) && steps.supersede.outputs.superseded != 'true'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/ios-v'))
         env:
           ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
@@ -1070,68 +1067,14 @@ jobs:
           fi
           echo "Signing material removed."
 
-  # TAG THE SHIPPED COMMIT, main pushes only (a tag run already has its tag).
-  #
-  # A separate job so `contents: write` never coexists with the signing
-  # secrets, and so it runs no repository code at all: no checkout, one API
-  # call. A tag created with GITHUB_TOKEN does not trigger workflows, so this
-  # cannot start a second release.
-  #
-  # RULESET DEPENDENCY. The "iOS release tag policy" ruleset blocks creating
-  # refs/tags/ios-v* for everyone but repository admins, and GITHUB_TOKEN is
-  # not an admin. Until the owner adds GitHub Actions as a bypass actor on that
-  # ruleset (docs/ios-testflight.md, "Settings the automatic release needs"),
-  # this job fails - loudly, by design, so the gap is visible. Nothing else
-  # depends on it: the version rule is additive (scripts/ios_release.py), so
-  # the next release computes the same version whether or not this tag
-  # exists. The tag is for humans and for bounding the notify range.
-  tag:
-    needs: [plan, archive-export-upload]
-    if: >-
-      !cancelled()
-      && github.repository == 'poopaskoopa/wattracker'
-      && github.event_name == 'push'
-      && github.ref == 'refs/heads/main'
-      && needs.archive-export-upload.outputs.uploaded == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    timeout-minutes: 5
-    steps:
-      - name: Tag the uploaded commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -euo pipefail
-          if ! printf '%s' "${VERSION:-}" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
-            echo "The planned version is not a 1-3 component numeric version" >&2
-            exit 1
-          fi
-          tag="ios-v$VERSION"
-          if gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" \
-              > /dev/null 2> "$RUNNER_TEMP/tag-error"; then
-            echo "Tagged $GITHUB_SHA as $tag."
-            exit 0
-          fi
-          existing="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha 2> /dev/null || true)"
-          if [ "$existing" = "$GITHUB_SHA" ]; then
-            echo "$tag already points at $GITHUB_SHA."
-            exit 0
-          fi
-          cat "$RUNNER_TEMP/tag-error" >&2 || true
-          echo "::error title=Release tag not created::The build uploaded, but $tag could not be created. If the error above is a repository rule violation, the 'iOS release tag policy' ruleset needs GitHub Actions as a bypass actor; see docs/ios-testflight.md. The next release's version is unaffected."
-          exit 1
-
   # TELL THE ISSUES. Comments "Shipped in TestFlight <version> (build <n>)" on
-  # every issue closed by a pull request this build ships: the first-parent
-  # app commits since the previous release tag, each mapped to the pull
-  # request whose merge commit it is, then to that PR's
-  # closingIssuesReferences. Range, not just this push, so a superseded run's
-  # pull requests are reported by the build that actually shipped them; the
-  # workflow's own earlier comments are recognised, so overlap (for example
-  # while the tag job cannot tag) never comments twice.
+  # every issue closed by a pull request this build ships: the newest 30
+  # first-parent app commits since the latest (admin-created) release tag,
+  # each mapped to the pull request whose merge commit it is, then to that
+  # PR's closingIssuesReferences. A range rather than this push alone, so a
+  # queued run that GitHub superseded has its pull requests reported by the
+  # build that actually shipped them; the workflow's own earlier comments are
+  # recognised, so the overlap between ranges never comments twice.
   #
   # Its own job, on its own runner, never holding the signing environment:
   # the issues:write token and the signing secrets never share a process.
