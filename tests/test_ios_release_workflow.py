@@ -774,6 +774,56 @@ def test_notify_skips_what_the_workflow_already_said_but_not_what_a_human_pasted
     assert f"/repos/{REPO}/issues/486/comments" in bodies
 
 
+class StatefulIssues(FakeClient):
+    """One PR per merge commit, each closing its own issue; comments persist."""
+
+    def __init__(self):
+        super().__init__()
+        self.comments: dict[int, list[dict]] = {}
+
+    def rest(self, method, path, body=None):
+        match = re.fullmatch(rf"/repos/{REPO}/commits/([0-9a-f]{{40}})/pulls", path)
+        if match:
+            sha = match.group(1)
+            return [{"number": int(sha, 16) % 10_000, "merged_at": "x", "merge_commit_sha": sha}]
+        match = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/comments(\?per_page=100&page=(\d+))?", path)
+        if match and method == "GET":
+            return self.comments.get(int(match.group(1)), []) if match.group(3) == "1" else []
+        if match and method == "POST":
+            self.comments.setdefault(int(match.group(1)), []).append(
+                {"user": {"login": "github-actions[bot]"}, "body": body["body"]}
+            )
+            return {}
+        raise AssertionError(path)
+
+    def graphql(self, query, variables):
+        return _closing(variables["number"] + 50_000)
+
+
+def test_overlapping_ranges_comment_exactly_once_per_shipped_pr_even_past_30():
+    # No tag is ever written, so every release's range starts at the same
+    # admin tag and grows. 40 releases: each ships one new merge, and some
+    # ship two (a queued run GitHub superseded).
+    client = StatefulIssues()
+    shipped: list[str] = []
+    for release in range(40):
+        shipped.insert(0, f"{release + 1:040x}")
+        if release % 7 == 3:
+            shipped.insert(0, f"{release + 1001:040x}")
+        version = f"0.1.{10 + release}"
+        assert rel.notify(client, _git_listing(*shipped), REPO, "ios-v0.1.9", shipped[0],
+                          version, f"{release}.1") == 0
+        for issue, comments in client.comments.items():
+            assert len(comments) == 1, (release, issue)
+    assert len(client.comments) == len(shipped)
+    first_release = {
+        int(sha, 16) % 10_000 + 50_000: f"0.1.{10 + (int(sha, 16) % 1000) - 1}"
+        for sha in shipped
+    }
+    for issue, comments in client.comments.items():
+        assert comments[0]["body"].startswith(f"Shipped in TestFlight {first_release[issue]} ")
+
+
 def test_notify_keeps_going_after_a_failure_and_reports_it():
     client = _notify_client(**{f"/repos/{REPO}/issues/479/comments": RuntimeError("403")})
     code = rel.notify(client, _git_listing(C2, C1), REPO, "ios-v0.1.9", C2, "0.1.10", "57.1")
