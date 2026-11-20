@@ -50,6 +50,21 @@ def test_power_zone_exact_half_open_boundaries_and_zero():
     assert result["missing_s"] == 0
 
 
+@pytest.mark.parametrize("definitions,anchor,sample,kind,count", [
+    (zones.POWER_ZONES, 200, 50, "power", 7),
+    (zones.HR_ZONES, 200, 100, "heart-rate", 5),
+])
+def test_time_in_zones_keeps_unreached_zones(definitions, anchor, sample, kind, count):
+    result = zones.time_in_zones([sample], [], anchor, definitions, kind)
+    rows = result["zones"]
+    assert [row["label"] for row in rows] == [f"Z{i}" for i in range(1, count + 1)]
+    assert rows[0]["seconds"] == 1
+    assert rows[0]["percent"] == 100
+    assert len(rows[1:]) == count - 1
+    assert all(row["seconds"] == 0 and row["percent"] == 0
+               and row["duration"] == "0:00" for row in rows[1:])
+
+
 def test_hr_zone_boundaries_and_below_fifty_percent_goes_to_z1():
     result = zones.time_in_zones(
         [60, 119.9, 120, 139.9, 140, 159.9, 160, 179.9, 180, 200],

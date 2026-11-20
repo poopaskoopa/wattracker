@@ -236,7 +236,7 @@ data class ZoneGroup(
         /**
          * The two zone blocks of an `activity_detail.zones` payload. A block
          * is absent (or carries no `zones` array) when the ride had no stream
-         * or no anchor for it; a row with no time in it is not rendered.
+         * or no anchor for it; unreached zones are still rendered.
          */
         fun extract(zones: JsonValue?): List<ZoneGroup> {
             if (zones == null) return emptyList()
@@ -249,8 +249,10 @@ data class ZoneGroup(
                         as? JsonValue.Array
                         ?: return@mapNotNull null
                     val rows = rowsArray.values.mapIndexedNotNull { index, row ->
-                        val seconds = row.optDouble("seconds")
-                        if (seconds == null || seconds <= 0) return@mapIndexedNotNull null
+                        val rawSeconds = row.optDouble("seconds") ?: return@mapIndexedNotNull null
+                        // Only missing/non-numeric time drops a row. Match iOS by
+                        // showing negative or non-finite time as zero.
+                        val seconds = if (rawSeconds.isFinite() && rawSeconds >= 0) rawSeconds else 0.0
                         ZoneRow(
                             id = "$key-$index",
                             label = row.optString("label") ?: "Z${index + 1}",

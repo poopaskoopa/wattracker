@@ -164,9 +164,9 @@ class RideDisplayTest {
         )
         val groups = ZoneGroup.extract(zones)
         assertEquals(listOf("power", "heart_rate"), groups.map { it.id })
-        assertEquals(listOf(61.0, 539.0), groups[0].rows.map { it.seconds })
-        assertEquals(listOf("Recovery", "Z2"), groups[0].rows.map { it.label })
-        assertEquals(listOf(10.25, 89.75), groups[0].rows.map { it.percent })
+        assertEquals(listOf(61.0, 539.0, 0.0), groups[0].rows.map { it.seconds })
+        assertEquals(listOf("Recovery", "Z2", "empty"), groups[0].rows.map { it.label })
+        assertEquals(listOf(10.25, 89.75, 0.0), groups[0].rows.map { it.percent })
         assertEquals(listOf(600.0), groups[1].rows.map { it.seconds })
         assertEquals(listOf("Z1"), groups[1].rows.map { it.label })
         assertTrue(ZoneGroup.extract(null).isEmpty())
@@ -239,15 +239,88 @@ class RideDisplayTest {
 
         val zones = JsonValue.parse(
             """{"heart_rate":{"zones":[
-                {"label":"Z1","seconds":0},
+                {"label":"Z1","seconds":0,"duration":"0:00"},
                 {"label":"Z2","seconds":60,"percent":25},
                 {"seconds":180,"percent":75}
             ]}}""",
         )
         val rows = ZoneGroup.extract(zones).firstOrNull()?.rows
             ?: throw AssertionError("expected the heart-rate group")
-        // The dropped zero-time Z1 must not shift the zones behind it.
-        assertEquals(listOf(2, 3), rows.map { it.zone })
+        // Keeping zero-time Z1 preserves both payload order and zone numbering.
+        assertEquals(listOf(1, 2, 3), rows.map { it.zone })
+        assertEquals("Z1", rows[0].label)
+        assertEquals(0.0, rows[0].seconds, 0.0)
+        assertEquals("0:00", rows[0].durationText)
+    }
+
+    @Test
+    fun allZeroPowerZonesKeepEveryRowAndColors() {
+        val values = (1..7).map { zone ->
+            JsonValue.Object(mapOf(
+                "label" to JsonValue.String("Z$zone"),
+                "seconds" to JsonValue.Number(0.0),
+                "percent" to JsonValue.Number(0.0),
+            ))
+        }
+        val groups = ZoneGroup.extract(JsonValue.Object(mapOf(
+            "power" to JsonValue.Object(mapOf("zones" to JsonValue.Array(values))),
+        )))
+        assertEquals(1, groups.size)
+        val rows = groups.single().rows
+        assertEquals((0..6).map { "power-$it" }, rows.map { it.id })
+        assertEquals((1..7).map { "Z$it" }, rows.map { it.label })
+        assertEquals((1..7).toList(), rows.map { it.zone })
+        rows.forEach { row ->
+            assertEquals(0.0, row.seconds, 0.0)
+            assertEquals("0:00", row.durationText)
+            assertEquals(0.0, row.percent, 0.0)
+            assertEquals(0f, ZoneStyle.barFraction(row.percent), 0f)
+        }
+        rows.takeLast(2).forEach { row ->
+            assertEquals(0xa82828, ZoneStyle.barRgb(row.zone))
+            assertEquals(0xff7a8a, ZoneStyle.labelRgb(row.zone))
+        }
+    }
+
+    @Test
+    fun heartRateKeepsFiveZonesWhenOnlyZoneTwoIsReached() {
+        val values = (1..5).map { zone ->
+            JsonValue.Object(mapOf(
+                "label" to JsonValue.String("Z$zone"),
+                "seconds" to JsonValue.Number(if (zone == 2) 60.0 else 0.0),
+                "percent" to JsonValue.Number(if (zone == 2) 100.0 else 0.0),
+            ))
+        }
+        val groups = ZoneGroup.extract(JsonValue.Object(mapOf(
+            "heart_rate" to JsonValue.Object(mapOf("zones" to JsonValue.Array(values))),
+        )))
+        val rows = groups.single().rows
+        assertEquals((1..5).map { "Z$it" }, rows.map { it.label })
+        assertEquals(listOf(0.0, 60.0, 0.0, 0.0, 0.0), rows.map { it.seconds })
+        assertEquals(listOf(0.0, 100.0, 0.0, 0.0, 0.0), rows.map { it.percent })
+    }
+
+    @Test
+    fun emptyZoneArraysDoNotInventGroups() {
+        assertTrue(ZoneGroup.extract(JsonValue.parse(
+            """{"power":{"zones":[]},"heart_rate":{"zones":[]}}""",
+        )).isEmpty())
+    }
+
+    @Test
+    fun zoneTimesDropMissingOrNonNumericAndClampInvalidToZero() {
+        val values = listOf(
+            JsonValue.Object(mapOf("label" to JsonValue.String("missing"))),
+            JsonValue.Object(mapOf("seconds" to JsonValue.String("0"))),
+        ) + listOf(-1.0, Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY).map {
+            JsonValue.Object(mapOf("seconds" to JsonValue.Number(it)))
+        }
+        val rows = ZoneGroup.extract(JsonValue.Object(mapOf(
+            "power" to JsonValue.Object(mapOf("zones" to JsonValue.Array(values))),
+        ))).single().rows
+        assertEquals(listOf("power-2", "power-3", "power-4", "power-5"), rows.map { it.id })
+        assertEquals(listOf(0.0, 0.0, 0.0, 0.0), rows.map { it.seconds })
+        assertEquals(listOf("0:00", "0:00", "0:00", "0:00"), rows.map { it.durationText })
     }
 
     @Test

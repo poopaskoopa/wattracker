@@ -309,9 +309,12 @@ struct ZoneGroup: Identifiable {
             (key, title) -> ZoneGroup? in
             guard case let .array(values)? = value?[key]?["zones"] else { return nil }
             let rows = values.enumerated().compactMap { index, value -> ZoneRow? in
-                guard let seconds = value["seconds"]?.doubleValue, seconds > 0 else {
+                guard let rawSeconds = value["seconds"]?.doubleValue else {
                     return nil
                 }
+                // Keep unreached zones; only missing/non-numeric time drops a row.
+                // Invalid negative or non-finite time is shown as zero on both clients.
+                let seconds = rawSeconds.isFinite && rawSeconds >= 0 ? rawSeconds : 0
                 return ZoneRow(
                     id: "\(key)-\(index)",
                     label: value["label"]?.stringValue ?? "Z\(index + 1)",
