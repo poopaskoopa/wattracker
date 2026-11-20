@@ -246,6 +246,13 @@ enum CalendarWorkoutFormatting {
         return result
     }
 
+    /// Axis clock uses total minutes, rounding half-seconds away from zero.
+    static func chartTime(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0,
+              let total = Int(exactly: seconds.rounded()) else { return "—" }
+        return String(format: "%02lld:%02lld", Int64(total / 60), Int64(total % 60))
+    }
+
     static func duration(_ seconds: Double) -> String {
         guard seconds.isFinite, seconds >= 0 else { return "—" }
         let total = Int(seconds.rounded())

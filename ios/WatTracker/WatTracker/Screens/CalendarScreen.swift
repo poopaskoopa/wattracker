@@ -734,7 +734,18 @@ private struct CalendarWorkoutProfileChart: View {
                     }
             }
         }
-        .chartXAxisLabel("Time (s)")
+        .chartXAxis {
+            AxisMarks { value in
+                AxisGridLine()
+                AxisTick()
+                AxisValueLabel {
+                    if let seconds = value.as(Double.self) {
+                        Text(CalendarWorkoutFormatting.chartTime(seconds))
+                    }
+                }
+            }
+        }
+        .chartXAxisLabel("Time (mm:ss)")
         .chartYAxisLabel(hasFTP ? "Power (W)" : "Target (% FTP)")
         .frame(minHeight: 190)
         .accessibilityIdentifier("calendar-workout-profile-chart")
