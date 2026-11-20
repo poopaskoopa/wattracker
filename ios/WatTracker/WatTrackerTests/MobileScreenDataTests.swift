@@ -223,6 +223,34 @@ final class MobileScreenDataTests: XCTestCase {
         )
     }
 
+    func testCalendarChartTimeTicksUseWholeMinuteIntervals() {
+        XCTAssertEqual(
+            CalendarWorkoutFormatting.chartTimeTicks(upTo: 3600),
+            [0, 600, 1200, 1800, 2400, 3000, 3600]
+        )
+        XCTAssertEqual(CalendarWorkoutFormatting.chartTimeTicks(upTo: 90), [0, 60])
+        XCTAssertEqual(CalendarWorkoutFormatting.chartTimeTicks(upTo: 30), [0])
+        XCTAssertEqual(CalendarWorkoutFormatting.chartTimeTicks(upTo: 0), [0])
+    }
+
+    func testCalendarChartTimeUsesMinutesAndSeconds() {
+        let cases: [(Double, String)] = [
+            (0, "00:00"), (9, "00:09"), (60, "01:00"), (309, "05:09"),
+            (3599, "59:59"), (3600, "60:00"), (3725, "62:05"),
+            (9.49, "00:09"), (9.5, "00:10"), (59.5, "01:00")
+        ]
+        for (seconds, expected) in cases {
+            XCTAssertEqual(CalendarWorkoutFormatting.chartTime(seconds), expected, "seconds: \(seconds)")
+        }
+    }
+
+    func testCalendarChartTimeRejectsInvalidOrUnrepresentableSeconds() {
+        for seconds in [-1, Double.nan, .infinity, -.infinity,
+                        Double(Int.max), Double.greatestFiniteMagnitude] {
+            XCTAssertEqual(CalendarWorkoutFormatting.chartTime(seconds), "—")
+        }
+    }
+
     func testCalendarChartFallsBackToPercentFTPWithoutAnFTP() {
         XCTAssertEqual(
             CalendarWorkoutFormatting.chartTarget(0.78, ftp: nil),

@@ -534,6 +534,13 @@ object CalendarWorkoutFormatting {
         return result
     }
 
+    /** Axis clock uses total minutes, rounding half-seconds away from zero. */
+    fun chartTime(seconds: Double): String {
+        if (!seconds.isFinite() || seconds < 0 || seconds >= Long.MAX_VALUE.toDouble()) return "\u2014"
+        val total = seconds.roundToLong()
+        return String.format(Locale.ROOT, "%02d:%02d", total / 60, total % 60)
+    }
+
     /** "45s" / "4 min" / "1m 30s" -- the desktop's step durations. */
     fun duration(seconds: Double): String {
         if (!seconds.isFinite() || seconds < 0) return "\u2014"

@@ -683,6 +683,7 @@ private struct CalendarWorkoutProfileChart: View {
 
     var body: some View {
         let hasFTP = ftp?.isFinite == true && (ftp ?? 0) > 0
+        let timeMax = profile.map(\.end).max() ?? 0
         Chart {
             ForEach(profile) { step in
                 if !step.free,
@@ -734,7 +735,18 @@ private struct CalendarWorkoutProfileChart: View {
                     }
             }
         }
-        .chartXAxisLabel("Time (s)")
+        .chartXAxis {
+            AxisMarks(values: CalendarWorkoutFormatting.chartTimeTicks(upTo: timeMax)) { value in
+                AxisGridLine()
+                AxisTick()
+                AxisValueLabel {
+                    if let seconds = value.as(Double.self) {
+                        Text(CalendarWorkoutFormatting.chartTime(seconds))
+                    }
+                }
+            }
+        }
+        .chartXAxisLabel("Time (mm:ss)")
         .chartYAxisLabel(hasFTP ? "Power (W)" : "Target (% FTP)")
         .frame(minHeight: 190)
         .accessibilityIdentifier("calendar-workout-profile-chart")

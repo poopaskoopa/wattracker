@@ -27,6 +27,19 @@ def test_calendar_chart_uses_area_fill_and_percent_axis_without_ftp():
     assert '.chartYAxisLabel(hasFTP ? "Power (W)" : "Target (% FTP)")' in chart
 
 
+def test_calendar_chart_formats_time_axis_labels_without_changing_seconds_data():
+    source = CALENDAR_SCREEN.read_text(encoding="utf-8")
+    chart = source.split("private struct CalendarWorkoutProfileChart", 1)[1].split(
+        "private struct CalendarActivityRow", 1
+    )[0]
+    assert ".chartXAxis {" in chart
+    assert "AxisValueLabel {" in chart
+    assert "Text(CalendarWorkoutFormatting.chartTime(seconds))" in chart
+    assert '.chartXAxisLabel("Time (mm:ss)")' in chart
+    assert 'x: .value("Time", step.start)' in chart
+    assert 'x: .value("Time", step.end)' in chart
+
+
 def test_calendar_workout_shows_the_ftp_used_for_watts():
     source = CALENDAR_SCREEN.read_text(encoding="utf-8")
     panel = source.split("private struct CalendarWorkoutPanel", 1)[1].split(
@@ -34,3 +47,12 @@ def test_calendar_workout_shows_the_ftp_used_for_watts():
     )[0]
     assert '"at FTP \\(Int(ftp.rounded(.toNearestOrEven))) W"' in panel
     assert '"calendar-workout-ftp"' in panel
+
+
+def test_calendar_chart_uses_explicit_whole_minute_ticks():
+    source = CALENDAR_SCREEN.read_text(encoding="utf-8")
+    chart = source.split("private struct CalendarWorkoutProfileChart", 1)[1].split(
+        "private struct CalendarActivityRow", 1
+    )[0]
+    assert r"let timeMax = profile.map(\.end).max() ?? 0" in chart
+    assert "AxisMarks(values: CalendarWorkoutFormatting.chartTimeTicks(upTo: timeMax))" in chart

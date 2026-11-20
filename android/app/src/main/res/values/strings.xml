@@ -180,7 +180,7 @@
     <string name="calendar_a11y_workouts">%1$d planned workouts</string>
     <string name="calendar_a11y_rides">%1$d completed rides</string>
     <string name="calendar_a11y_missed">%1$d missed workouts</string>
-    <string name="calendar_chart_time_axis">Time (s)</string>
+    <string name="calendar_chart_time_axis">Time (mm:ss)</string>
     <string name="calendar_chart_power_axis">Power (W)</string>
     <string name="calendar_chart_target_axis">Target (% FTP)</string>
     <string name="calendar_chart_ftp_label">FTP</string>

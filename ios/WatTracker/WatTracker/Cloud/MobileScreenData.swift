@@ -246,6 +246,18 @@ enum CalendarWorkoutFormatting {
         return result
     }
 
+    /// Keep the seconds-based chart's ticks on the ride graph's whole-minute grid.
+    static func chartTimeTicks(upTo seconds: Double) -> [Double] {
+        ChartTicks.minutes(upTo: seconds / 60).map { $0 * 60 }
+    }
+
+    /// Axis clock uses total minutes, rounding half-seconds away from zero.
+    static func chartTime(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0,
+              let total = Int(exactly: seconds.rounded()) else { return "—" }
+        return String(format: "%02lld:%02lld", Int64(total / 60), Int64(total % 60))
+    }
+
     static func duration(_ seconds: Double) -> String {
         guard seconds.isFinite, seconds >= 0 else { return "—" }
         let total = Int(seconds.rounded())

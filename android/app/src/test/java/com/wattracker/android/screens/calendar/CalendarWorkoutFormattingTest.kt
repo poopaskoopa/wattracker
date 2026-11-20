@@ -216,6 +216,26 @@ class CalendarWorkoutFormattingTest {
     }
 
     @Test
+    fun chartTimeUsesMinutesAndSeconds() {
+        val cases = listOf(
+            0.0 to "00:00", 9.0 to "00:09", 60.0 to "01:00", 309.0 to "05:09",
+            3599.0 to "59:59", 3600.0 to "60:00", 3725.0 to "62:05",
+            9.49 to "00:09", 9.5 to "00:10", 59.5 to "01:00",
+        )
+        cases.forEach { (seconds, expected) ->
+            assertEquals("seconds: $seconds", expected, CalendarWorkoutFormatting.chartTime(seconds))
+        }
+    }
+
+    @Test
+    fun chartTimeRejectsInvalidOrUnrepresentableSeconds() {
+        listOf(-1.0, Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY,
+            Long.MAX_VALUE.toDouble(), Double.MAX_VALUE).forEach { seconds ->
+            assertEquals("\u2014", CalendarWorkoutFormatting.chartTime(seconds))
+        }
+    }
+
+    @Test
     fun durationFormattingMatchesTheDesktop() {
         assertEquals("45s", CalendarWorkoutFormatting.duration(45.0))
         assertEquals("4 min", CalendarWorkoutFormatting.duration(240.0))

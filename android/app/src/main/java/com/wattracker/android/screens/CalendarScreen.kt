@@ -1094,8 +1094,8 @@ private fun CalendarWorkoutProfileChart(
         scale.ticks.map { textMeasurer.measure(chartTickLabel(it), profileChartLabelStyle) }
     }
     val ftpLabelResult = remember(ftpLabel, textMeasurer) { textMeasurer.measure(ftpLabel, profileChartLabelStyle) }
-    val zeroLabel = remember(textMeasurer) { textMeasurer.measure("0", profileChartLabelStyle) }
-    val lengthLabel = remember(timeMax, textMeasurer) { textMeasurer.measure(chartTickLabel(timeMax), profileChartLabelStyle) }
+    val zeroLabel = remember(textMeasurer) { textMeasurer.measure(CalendarWorkoutFormatting.chartTime(0.0), profileChartLabelStyle) }
+    val lengthLabel = remember(timeMax, textMeasurer) { textMeasurer.measure(CalendarWorkoutFormatting.chartTime(timeMax), profileChartLabelStyle) }
     val yTitleResult = remember(powerAxisTitle, textMeasurer) { textMeasurer.measure(powerAxisTitle, profileChartLabelStyle) }
     val xTitleResult = remember(timeAxisTitle, textMeasurer) { textMeasurer.measure(timeAxisTitle, profileChartLabelStyle) }
 
@@ -1193,7 +1193,7 @@ private fun CalendarWorkoutProfileChart(
                     )
                 }
 
-                // x end labels: 0 and the profile's length in seconds.
+                // x end labels: elapsed mm:ss, retaining total minutes past an hour.
                 drawText(
                     textLayoutResult = zeroLabel,
                     topLeft = Offset(plotLeft, plotBottom + 2.dp.toPx()),
