@@ -1,0 +1,44 @@
+# Code owners for the paths that decide what runs with release secrets.
+#
+# This file is half of a merge-time gate. The other half is a branch ruleset
+# on `main` that requires code-owner review, with the admin role allowed to
+# bypass only through a pull request. Together they replace the manual
+# approval click on the `ios-code-signing` environment: a job can reach that
+# environment only from `main` or an admin-created `ios-v*` tag, so whoever
+# can change these paths on `main` controls what runs with the signing
+# secrets.
+#
+# Paths not listed here have no owner and need no owner review; a pull request
+# touching only android/ is not held up by this file.
+#
+# GitHub reads this file from the pull request's BASE branch, so editing it in
+# a pull request takes effect only after that pull request merges, and the
+# `/.github/` line below makes such an edit itself need owner review.
+# Last matching pattern wins: never add a broader, ownerless pattern below these
+# lines. tests/test_codeowners.py checks that each path stays owned.
+
+# Every workflow (including ios-release.yml, which declares the
+# ios-code-signing environment), the Apple certificates the release job pins,
+# and this file.
+/.github/                    @poopaskoopa
+
+# GitHub uses the first CODEOWNERS it finds in .github/, the root, then docs/.
+# Owning the other two locations means adding one needs owner review too.
+/CODEOWNERS                  @poopaskoopa
+/docs/CODEOWNERS             @poopaskoopa
+
+# The iOS app, its Xcode project and test targets: compiled, tested and signed
+# inside the release job.
+/ios/                        @poopaskoopa
+
+# Run on the owner's machine with privileged credentials: the iOS release
+# secret uploader and distribution certificate tooling, the Azure deploy and
+# budget-hook scripts, and the pre-push guardrail hook.
+/scripts/                    @poopaskoopa
+
+# Container builds published from `main` by cloud-publish.yml.
+/Dockerfile*                 @poopaskoopa
+
+# Instructions the agents follow. They run as the owner's admin account, so an
+# edit here can steer an actor that is able to merge and to bypass rulesets.
+/AGENTS.md                   @poopaskoopa
