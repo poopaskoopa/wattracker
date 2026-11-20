@@ -683,6 +683,7 @@ private struct CalendarWorkoutProfileChart: View {
 
     var body: some View {
         let hasFTP = ftp?.isFinite == true && (ftp ?? 0) > 0
+        let timeMax = profile.map(\.end).max() ?? 0
         Chart {
             ForEach(profile) { step in
                 if !step.free,
@@ -735,7 +736,7 @@ private struct CalendarWorkoutProfileChart: View {
             }
         }
         .chartXAxis {
-            AxisMarks { value in
+            AxisMarks(values: CalendarWorkoutFormatting.chartTimeTicks(upTo: timeMax)) { value in
                 AxisGridLine()
                 AxisTick()
                 AxisValueLabel {

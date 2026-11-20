@@ -47,3 +47,12 @@ def test_calendar_workout_shows_the_ftp_used_for_watts():
     )[0]
     assert '"at FTP \\(Int(ftp.rounded(.toNearestOrEven))) W"' in panel
     assert '"calendar-workout-ftp"' in panel
+
+
+def test_calendar_chart_uses_explicit_whole_minute_ticks():
+    source = CALENDAR_SCREEN.read_text(encoding="utf-8")
+    chart = source.split("private struct CalendarWorkoutProfileChart", 1)[1].split(
+        "private struct CalendarActivityRow", 1
+    )[0]
+    assert r"let timeMax = profile.map(\.end).max() ?? 0" in chart
+    assert "AxisMarks(values: CalendarWorkoutFormatting.chartTimeTicks(upTo: timeMax))" in chart

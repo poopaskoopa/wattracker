@@ -223,6 +223,16 @@ final class MobileScreenDataTests: XCTestCase {
         )
     }
 
+    func testCalendarChartTimeTicksUseWholeMinuteIntervals() {
+        XCTAssertEqual(
+            CalendarWorkoutFormatting.chartTimeTicks(upTo: 3600),
+            [0, 600, 1200, 1800, 2400, 3000, 3600]
+        )
+        XCTAssertEqual(CalendarWorkoutFormatting.chartTimeTicks(upTo: 90), [0, 60])
+        XCTAssertEqual(CalendarWorkoutFormatting.chartTimeTicks(upTo: 30), [0])
+        XCTAssertEqual(CalendarWorkoutFormatting.chartTimeTicks(upTo: 0), [0])
+    }
+
     func testCalendarChartTimeUsesMinutesAndSeconds() {
         let cases: [(Double, String)] = [
             (0, "00:00"), (9, "00:09"), (60, "01:00"), (309, "05:09"),
