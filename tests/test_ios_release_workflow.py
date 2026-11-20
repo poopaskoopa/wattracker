@@ -332,6 +332,16 @@ def test_header_states_the_signing_boundary_and_the_bypass_trap():
     assert "never creates, moves or deletes a tag" in header
 
 
+def test_plan_and_notify_check_out_full_history():
+    # The version count, the manual-tag checks (refs/remotes/origin/main) and
+    # the notify range all need every commit and tag.
+    jobs = _workflow()["jobs"]
+    for name in ("plan", "notify"):
+        checkout = next(s for s in jobs[name]["steps"] if "actions/checkout@" in s.get("uses", ""))
+        assert checkout["with"]["fetch-depth"] == 0, name
+        assert checkout["with"]["persist-credentials"] is False, name
+
+
 def test_notify_job_cannot_fail_the_release_and_never_holds_signing():
     notify = _workflow()["jobs"]["notify"]
     assert notify["continue-on-error"] is True
@@ -638,12 +648,56 @@ def test_plan_accepts_a_manual_tag_above_what_already_shipped(repo, tag):
     assert result.base_tag == "ios-v0.1.9"
 
 
-def test_plan_refuses_a_tag_on_an_old_commit_below_the_tip_of_main(repo):
+@pytest.mark.parametrize("tag", ["ios-v0.1.11", "ios-v0.4.0"])
+def test_plan_refuses_a_tag_main_has_already_shipped_past(repo, tag):
     first, *_ = _ship_three_untagged_merges(repo)
-    # At `first` only 0.1.10 had shipped, but main has since shipped 0.1.12.
-    repo("tag", "ios-v0.1.11", first)
-    with pytest.raises(rel.PlanError, match=r"not above 0\.1\.12"):
-        rel.plan("push", "refs/tags/ios-v0.1.11", repo.runner, head=first)
+    # Two app merges landed on main after `first`, and shipped as 0.1.11 and
+    # 0.1.12. Even a version above everything is refused: shipping `first`
+    # now would put an older build on top of a newer one.
+    repo("tag", tag, first)
+    with pytest.raises(rel.PlanError, match=r"behind main: 2 app change"):
+        rel.plan("push", f"refs/tags/{tag}", repo.runner, head=first)
+
+
+def test_rerunning_an_old_tag_run_after_main_shipped_from_it_is_refused(repo):
+    tagged = repo.merge(APP_FILE, "feature")
+    repo("tag", "ios-v0.4.0", tagged)
+    repo("update-ref", rel.MAIN_REF, tagged)
+    assert rel.plan("push", "refs/tags/ios-v0.4.0", repo.runner, head=tagged).version == "0.4.0"
+    repo.merge(APP_FILE, "fix")  # main auto-ships 0.4.1 from the tag
+    assert rel.plan("push", "refs/heads/main", repo.runner).version == "0.4.1"
+    repo("update-ref", rel.MAIN_REF, "HEAD")
+    with pytest.raises(rel.PlanError, match="behind main"):
+        rel.plan("push", "refs/tags/ios-v0.4.0", repo.runner, head=tagged)
+
+
+def test_plan_allows_a_tag_followed_on_main_only_by_non_app_changes(repo):
+    tagged = repo.merge(APP_FILE, "feature")
+    repo.merge("docs/ios-testflight.md", "docs-only")
+    repo.merge(TEST_FILE, "tests-only")
+    repo("update-ref", rel.MAIN_REF, "HEAD")
+    repo("tag", "ios-v0.1.11", tagged)
+    assert rel.plan("push", "refs/tags/ios-v0.1.11", repo.runner, head=tagged).version == "0.1.11"
+
+
+def test_plan_refuses_a_tag_below_a_newer_admin_tag_on_main(repo):
+    tagged = repo.merge(APP_FILE, "feature")
+    repo.merge("docs/ios-testflight.md", "docs-only")
+    repo("tag", "ios-v0.2.0")
+    repo("update-ref", rel.MAIN_REF, "HEAD")
+    repo("tag", "ios-v0.1.20", tagged)
+    with pytest.raises(rel.PlanError, match=r"not above 0\.2\.0"):
+        rel.plan("push", "refs/tags/ios-v0.1.20", repo.runner, head=tagged)
+
+
+def test_plan_refuses_a_tag_on_a_commit_that_is_not_on_main(repo):
+    main_tip = repo("rev-parse", "HEAD").strip()
+    repo("checkout", "-q", "-b", "hotfix")
+    hotfix = repo.commit(APP_FILE, "hotfix")
+    repo("tag", "ios-v0.2.0", hotfix)
+    repo("update-ref", rel.MAIN_REF, main_tip)
+    with pytest.raises(rel.PlanError, match="not on main"):
+        rel.plan("push", "refs/tags/ios-v0.2.0", repo.runner, head=hotfix)
 
 
 def test_plan_allows_reshipping_an_unchanged_commit_with_the_next_patch(repo):
@@ -653,12 +707,11 @@ def test_plan_allows_reshipping_an_unchanged_commit_with_the_next_patch(repo):
     assert rel.plan("push", "refs/tags/ios-v0.1.10", repo.runner).version == "0.1.10"
 
 
-def test_plan_checks_the_commit_alone_when_main_is_not_in_the_checkout(repo, capsys):
+def test_plan_fails_closed_when_main_is_not_in_the_checkout(repo):
     repo.merge(APP_FILE, "fix")
-    repo("tag", "ios-v0.1.10")
-    with pytest.raises(rel.PlanError):
-        rel.plan("push", "refs/tags/ios-v0.1.10", repo.runner)
-    assert "is not in this checkout" in capsys.readouterr().out
+    repo("tag", "ios-v9.0.0")
+    with pytest.raises(rel.PlanError, match="is not in this checkout"):
+        rel.plan("push", "refs/tags/ios-v9.0.0", repo.runner)
 
 
 def test_versions_keep_rising_after_an_accepted_manual_tag(repo):
@@ -824,6 +877,24 @@ def test_overlapping_ranges_comment_exactly_once_per_shipped_pr_even_past_30():
         assert comments[0]["body"].startswith(f"Shipped in TestFlight {first_release[issue]} ")
 
 
+def test_notify_looks_at_exactly_the_newest_30_app_commits():
+    commits = [f"{n:040x}" for n in range(45, 0, -1)]  # newest first
+    client = StatefulIssues()
+    looked_up: list[str] = []
+    original = client.rest
+
+    def recording(method, path, body=None):
+        match = re.fullmatch(rf"/repos/{REPO}/commits/([0-9a-f]{{40}})/pulls", path)
+        if match:
+            looked_up.append(match.group(1))
+        return original(method, path, body)
+
+    client.rest = recording
+    assert rel.notify(client, _git_listing(*commits), REPO, "ios-v0.1.9", commits[0], "0.1.54", "9.1") == 0
+    assert looked_up == commits[:30]
+    assert len(client.comments) == 30
+
+
 def test_notify_keeps_going_after_a_failure_and_reports_it():
     client = _notify_client(**{f"/repos/{REPO}/issues/479/comments": RuntimeError("403")})
     code = rel.notify(client, _git_listing(C2, C1), REPO, "ios-v0.1.9", C2, "0.1.10", "57.1")
@@ -868,6 +939,7 @@ def test_docs_describe_the_automatic_release_and_the_owner_settings():
     assert "\n3. " not in settings
     assert "Do not add a bypass actor of any kind" in " ".join(settings.split())
     assert "15368" not in docs
+    assert "**Only re-run the newest release run.**" in docs
     agents = Path("AGENTS.md").read_text(encoding="utf-8")
     finishing = agents[agents.index("### Finishing an item"):agents.index("## Scope")]
     assert "TestFlight automatically on merge" in finishing

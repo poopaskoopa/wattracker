@@ -118,10 +118,15 @@ jobs:
   # Decides, with no secret in scope, whether this run releases and which
   # marketing version it carries. Full history because the version is counted
   # from the latest reachable `ios-v*` tag; see the docstring of
-  # scripts/ios_release.py for the rule. A manual tag that is not above what
-  # the automatic release can already have shipped fails here, before the
+  # scripts/ios_release.py for the rule. A manual tag that would ship out of
+  # order (not on main, behind an app change on main, or not above what the
+  # automatic release can already have shipped) fails here, before the
   # signing job exists. Full history also brings refs/remotes/origin/main,
-  # which that check compares against.
+  # which those checks need; without it they fail closed.
+  #
+  # "Re-run failed jobs" does not re-run this job, so its checks are not
+  # repeated on a re-run: only re-run the newest release run
+  # (docs/ios-testflight.md, "Re-running a release").
   plan:
     if: github.repository == 'poopaskoopa/wattracker'
     runs-on: ubuntu-latest

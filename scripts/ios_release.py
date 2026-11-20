@@ -32,11 +32,12 @@ merge. The rule is a pure function of the commit, so re-running a run
 recomputes the same version; a number can be skipped when two merges ship as
 one build, which is accurate, because that version never shipped.
 
-Because the tags lag behind what has shipped, a manual tag is checked against
-``shipped_version()`` - the highest version the automatic release can already
-have shipped at that commit and at the tip of main - and refused unless it is
-strictly above it. Without that, a hand-pushed ios-v0.1.10 after 0.1.12
-shipped would ship 0.1.10 again and make the next merge ship 0.1.11.
+Because the tags lag behind what has shipped, a manual tag is refused unless
+its commit is on main with no app change after it, and its version is
+strictly above ``shipped_version()`` - the highest version the automatic
+release can already have shipped (``check_manual_tag``). Without that, a
+hand-pushed ios-v0.1.10 after 0.1.12 shipped would ship 0.1.10 again and make
+the next merge ship 0.1.11.
 
 The build number (``run_number.run_attempt``) is what makes every upload
 unique to App Store Connect; it is set in the workflow, not here.
@@ -215,6 +216,55 @@ def _fmt(version: tuple[int, int, int]) -> str:
 # ---------------------------------------------------------------- plan
 
 
+def is_ancestor(git: GitRunner, ancestor: str, descendant: str) -> bool:
+    try:
+        git(["merge-base", "--is-ancestor", ancestor, descendant])
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
+def check_manual_tag(git: GitRunner, tag: str, head: str) -> tuple[int, int, int] | None:
+    """Refuse a manual tag that would ship out of order. Returns the floor.
+
+    1. The tagged commit must be on main. A tag on an unmerged commit would
+       ship a version the automatic release never counts from, so main could
+       later ship a lower one (ios-v0.2.0 on a hotfix, then 0.1.13 from main).
+    2. No app change may have landed on main's first-parent line after it.
+       If one has, the automatic release has already counted past this
+       commit, and shipping it now (a re-run of an old tag run, say) would put
+       an older build above a newer one.
+    3. The version must be strictly above what the automatic release can
+       already have shipped at this commit and at the tip of main
+       (shipped_version, which excludes the tag being judged).
+
+    Fails closed when refs/remotes/origin/main is missing: the plan job's
+    full-history checkout always fetches it, so its absence means the
+    checkout is not what this check assumes.
+    """
+    if not ref_exists(git, MAIN_REF):
+        raise PlanError(f"{MAIN_REF} is not in this checkout, so '{tag}' cannot be "
+                        "checked against main. Refusing to release it.")
+    if not is_ancestor(git, head, MAIN_REF):
+        raise PlanError(f"Tag '{tag}' is not on main. Merge the commit first, then tag "
+                        "it (or let the merge ship it).")
+    later = app_commits(git, head, MAIN_REF)
+    if later:
+        raise PlanError(
+            f"Tag '{tag}' is behind main: {len(later)} app change(s) landed on main after "
+            "it, so the automatic release has already shipped past it. Tag main instead."
+        )
+    floors = [shipped_version(git, head, tag), shipped_version(git, MAIN_REF, tag)]
+    floor = max((f for f in floors if f is not None), default=None)
+    if floor is not None and parse_tag(tag) <= floor:
+        raise PlanError(
+            f"Tag '{tag}' is not above {_fmt(floor)}, which the automatic "
+            f"release may already have shipped. Delete it and tag a version "
+            f"above {_fmt(floor)} instead."
+        )
+    return floor
+
+
 @dataclass(frozen=True)
 class Plan:
     release: bool
@@ -236,10 +286,12 @@ def plan(event_name: str, ref: str, git: GitRunner, head: str = "HEAD") -> Plan:
     """Decide what this run does.
 
     push of refs/tags/ios-v*   the manual escape hatch: ship the tag's version,
-                               provided it is above everything the automatic
-                               release can already have shipped at this commit
-                               and at the tip of main. Refused (before any
-                               secret is in scope) otherwise.
+                               provided (all checked before any secret is in
+                               scope, see check_manual_tag):
+                               - the tagged commit is on main,
+                               - no app change has landed on main after it,
+                               - the version is above everything the automatic
+                                 release can already have shipped.
     push of refs/heads/main    ship the derived version, unless a release tag
                                already points at this commit (its tag run
                                ships it).
@@ -254,19 +306,7 @@ def plan(event_name: str, ref: str, git: GitRunner, head: str = "HEAD") -> Plan:
     if ref.startswith("refs/tags/"):
         tag = ref[len("refs/tags/"):]
         version = tag_version_string(tag)
-        floors = [shipped_version(git, head, tag)]
-        if ref_exists(git, MAIN_REF):
-            floors.append(shipped_version(git, MAIN_REF, tag))
-        else:
-            print(f"::warning::{MAIN_REF} is not in this checkout; checking {tag} "
-                  "against this commit only.")
-        floor = max((f for f in floors if f is not None), default=None)
-        if floor is not None and parse_tag(tag) <= floor:
-            raise PlanError(
-                f"Tag '{tag}' is not above {_fmt(floor)}, which the automatic "
-                f"release may already have shipped. Delete it and tag a version "
-                f"above {_fmt(floor)} instead."
-            )
+        floor = check_manual_tag(git, tag, head)
         base = base_tag_for(git, head) or ""
         above = _fmt(floor) if floor is not None else "no earlier release"
         return Plan(True, "tag", version, base, f"tag {tag}, above {above}")

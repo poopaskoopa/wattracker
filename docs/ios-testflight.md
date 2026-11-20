@@ -21,9 +21,11 @@ Two manual paths remain:
 - **An `ios-v*` tag** (repository admins only) is the escape hatch. It ships
   exactly the version it names, whatever changed, and is how to bump the minor
   or major version or to re-ship an unchanged commit before a build expires.
-  The tag must be **above the last version already shipped** - the newest
-  build in TestFlight, which the latest "Shipped in TestFlight" issue comment
-  also names - or the run refuses it before anything is signed:
+  The tag must be on a commit that is **on `main` with no app change merged
+  after it** (in practice: tag the tip of `main`), and its version must be
+  **above the last version already shipped** - the newest build in
+  TestFlight, which the latest "Shipped in TestFlight" issue comment also
+  names. Otherwise the run refuses it before anything is signed:
 
   ```sh
   git tag ios-v0.2.0
@@ -402,14 +404,22 @@ nothing on disk changes.
 
   A merge whose commit already carries an `ios-v*` tag does not ship again;
   that tag's own run ships it.
-- **A manual tag must be above what has shipped.** Because the tags lag
-  behind the automatic releases, the `plan` job computes the highest version
-  the automatic release can already have shipped, at the tagged commit and at
-  the tip of `main`, and refuses a tag that is not strictly above it, before
-  the signing job starts. Without that, pushing `ios-v0.1.10` after 0.1.12
-  had shipped would ship 0.1.10 again and make the next merge ship 0.1.11.
-  The error names the version to beat; delete the refused tag and push a
-  higher one.
+- **A manual tag cannot ship out of order.** Because the tags lag behind
+  the automatic releases, the `plan` job refuses a tag, before the signing job
+  starts, when:
+  - its commit is not on `main` (`ios-v0.2.0` on an unmerged hotfix would
+    ship, and then `main` would ship 0.1.13 after it);
+  - an app change has been merged to `main` after its commit (the automatic
+    release has already shipped past it, so it would put an older build on
+    top; this is also what stops a re-run of an old tag run); or
+  - its version is not strictly above the highest version the automatic
+    release can already have shipped, at the tagged commit and at the tip of
+    `main` (pushing `ios-v0.1.10` after 0.1.12 shipped would ship 0.1.10 again
+    and make the next merge ship 0.1.11).
+
+  The checks fail closed if the checkout lacks `main`. The error says which
+  rule failed and, for the last one, the version to beat; delete the refused
+  tag and tag the tip of `main` with a higher version.
 - On a **manual dispatch**, it is `0.0.0`, and nothing is uploaded.
 
 **`CFBundleVersion`**, the build number, is `<run_number>.<run_attempt>`.
@@ -426,6 +436,16 @@ and fail for a reason unrelated to the original failure.
 The consequence: the build number is a property of the CI run, not of the
 commit. Re-releasing the same commit produces a different build number, which
 is correct.
+
+### Re-running a release
+
+**Only re-run the newest release run.** "Re-run failed jobs" keeps the
+original `plan` job's result and goes straight to signing, so the version and
+the checks above are not recomputed. Re-running an older failed run after a
+newer one has shipped would upload an older version on top of a newer one.
+To recover an older failed release, do not re-run it: merge the next app
+change (it ships everything up to it), or have an admin tag the tip of `main`
+with a version above the newest build in TestFlight.
 
 ### Back-to-back merges
 
@@ -482,7 +502,7 @@ Two practical notes:
 
 0. A `plan` job on `ubuntu-latest`, with `contents: read` and no secrets,
    decides whether the run releases, computes the version, and refuses a
-   manual tag that is not above what has shipped
+   manual tag that would ship out of order
    (`scripts/ios_release.py plan`).
 1. Checks out the release commit with `persist-credentials: false`.
 2. Re-validates the planned version and derives the build number from the
@@ -647,6 +667,9 @@ keeps out of the tree. Nothing needs it: the build's destination is TestFlight.
 - `Tag 'ios-v…' is not above X` in the `plan` job — the tag is at or below a
   version the automatic release may already have shipped. Delete the tag and
   push one above X.
+- `Tag 'ios-v…' is not on main` / `is behind main` in the `plan` job — the
+  tagged commit is unmerged, or app changes have shipped from `main` since it.
+  Delete the tag and tag the tip of `main` instead.
 - `No ios-v* tag is reachable from this commit` in the `plan` job — the
   automatic release has nothing to count from. Push one release tag by hand.
 - A merge to `main` that should have shipped did not start a run — check that
