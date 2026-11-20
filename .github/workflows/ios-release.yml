@@ -1,35 +1,86 @@
 name: iOS TestFlight release
 
-# Fires on an `ios-v*` tag, deliberately a different prefix from the `v*` that
+# Three ways in, one pipeline:
+#
+#   push to main that changes the app   -> automatic release (the normal path).
+#                                           Version derived, then uploaded.
+#   push of an `ios-v*` tag             -> manual escape hatch (admins only).
+#                                           Ships exactly the version the tag
+#                                           names, if it is above what shipped.
+#   workflow_dispatch                   -> archive and export only, never an
+#                                           upload. For exercising signing.
+#
+# `ios-v`, deliberately a different prefix from the `v*` that
 # macos-release.yml and windows-release.yml both use. The desktop app and the
 # iOS app version independently, and a shared `v*` prefix would mean every
-# desktop release tag also fired an iOS archive (and vice versa) - three
-# release workflows racing over a tag that concerned one of them.
+# desktop release tag also fired an iOS archive (and vice versa).
 #
-# FORK SAFETY. This repository is public and the job below both reads
+# FORK SAFETY. This repository is public and the release job reads
 # code-signing secrets. Neither may ever be reachable from a fork.
 #
-# A `push` trigger restricted to tags is inherently safe from that, and it is
-# worth saying why rather than leaving it as folklore: a fork's tags live in
-# the fork's repository and fire that fork's workflows using that fork's
-# secrets - `push` events from a fork do not run here at all. That is a
-# stronger guarantee than cloud.yml's and windows.yml's
-# `github.event.pull_request.head.repo.full_name == github.repository` guard,
-# which those files need only because they also trigger on `pull_request`.
-# This workflow has no `pull_request` trigger and must not gain one: adding it
-# would expose both the secrets and the runner to any fork's diff, and the
-# `if:` below is not a substitute for the trigger being right.
+# A `push` trigger - restricted to the `main` branch and `ios-v*` tags - is
+# inherently safe from that, and it is worth saying why rather than leaving it
+# as folklore: a fork's branches and tags live in the fork's repository and
+# fire that fork's workflows using that fork's secrets - `push` events from a
+# fork do not run here at all. The only way code reaches `main` here is a
+# merge by someone with write access, which is the same trust boundary the
+# merge itself is. That is a stronger guarantee than cloud.yml's and
+# windows.yml's `github.event.pull_request.head.repo.full_name ==
+# github.repository` guard, which those files need only because they also
+# trigger on `pull_request`. This workflow has no `pull_request` trigger and
+# must not gain one: adding it would expose both the secrets and the runner to
+# any fork's diff, and the `if:` below is not a substitute for the trigger
+# being right.
 #
-# The `if:` on the job is a second, narrower thing: it stops the job doing
-# anything if the repository is ever forked WITH its tags and the fork's owner
-# adds their own credentials, which would otherwise archive and upload our
-# bundle identifier from someone else's account.
+# THE SIGNING BOUNDARY, once the `ios-code-signing` environment has no
+# required reviewer. That environment admits exactly two refs, `main` and
+# `ios-v*` tags, so code reaches the signing secrets only by:
+#
+#   (a) a merge to `main`, gated by the code-owner `main` ruleset (#478), or
+#   (b) an `ios-v*` tag, which the "iOS release tag policy" ruleset lets only
+#       repository admins create, move or delete.
+#
+# (b) is load-bearing, not housekeeping. If anything other than an admin can
+# create an `ios-v*` tag - a bypass actor of ANY kind on that ruleset,
+# including GitHub Actions, or a workflow token with that right - then a
+# write collaborator can tag a commit carrying an altered copy of this file
+# and `workflow_dispatch` it on that tag ref (a dispatch made with
+# GITHUB_TOKEN does start a run), and that unreviewed code receives the
+# signing secrets. So this workflow never creates, moves or deletes a tag,
+# holds no `contents: write`, and its versions do not depend on tags being
+# written (scripts/ios_release.py).
+#
+# The `if:` on each job is a second, narrower thing: it stops the job doing
+# anything if the repository is ever forked WITH its history and the fork's
+# owner adds their own credentials, which would otherwise archive and upload
+# our bundle identifier from someone else's account.
 on:
   push:
+    branches:
+      - main
     tags:
       - "ios-v*"
+    # Everything the App Store archive compiles, bundles or signs with - and
+    # nothing else, so a test-only (WatTrackerTests/), vector-only, doc-only
+    # or workflow-only change does not ship a build. APP_PATHS in
+    # scripts/ios_release.py is the same list; a test keeps the two equal and
+    # checks every file the app target in project.pbxproj names is under one
+    # of them.
+    #
+    # GitHub does not evaluate path filters for tag pushes, so an `ios-v*`
+    # tag still fires regardless of what changed. That is the escape hatch
+    # working as intended, not an accident of this list.
+    #
+    # Known limit: GitHub stops matching after the first 300 changed files of
+    # a push. A larger push that changes the app outside those may not fire;
+    # push a tag by hand if that ever happens.
+    paths:
+      - "ios/WatTracker/WatTracker/**"
+      - "ios/WatTracker/WatTracker.xcodeproj/**"
+      - "ios/WatTracker/Config/**"
+      - "ios/WatTracker/ExportOptions.plist"
   # Manual runs exist so the signing path can be exercised without
-  # spending a tag. A dispatch run archives and exports but does not
+  # spending a release. A dispatch run archives and exports but does not
   # upload, so it can never publish a build to App Store Connect.
   workflow_dispatch:
     inputs:
@@ -38,33 +89,90 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: read
+# Nothing by default. Each job asks for exactly what it uses. No job can write
+# repository contents, and the one job that may comment on issues never
+# shares a runner or a token with the job that holds the signing secrets.
+permissions: {}
 
-# Serialize release attempts within each event type so tag archives cannot
-# race over App Store Connect's provisioning profile updates, while a manual
-# dispatch cannot replace a queued tag release. The hosted VM is disposable,
-# but cleanup still runs unconditionally so a cancelled step does not leave
-# signing material in its workspace.
+# One group per trigger kind: push-branch (main), push-tag (ios-v*), and
+# workflow_dispatch. Never cancel-in-progress: a run is never cancelled once
+# it has started, so nothing is ever killed mid-upload. GitHub keeps at most
+# one run PENDING per group and cancels the older pending run when a newer one
+# queues, which is the supersession wanted for back-to-back merges: the
+# newest queued release replaces an older one that has not started. A run
+# that has already started finishes and uploads; the extra build that costs
+# is harmless.
+#
+# Main pushes and tags are in different groups so a merge can never cancel a
+# queued tag release (and a manual dispatch can never replace either). The
+# cost is that a tag run and a main run can overlap; they cannot collide at
+# App Store Connect, because every run has a distinct build number.
+#
+# Workflow level rather than job level so the notify job of one release
+# finishes before the next release's starts.
 concurrency:
-  group: ios-release-${{ github.event_name }}
+  group: ios-release-${{ github.event_name }}-${{ github.ref_type }}
   cancel-in-progress: false
 
 jobs:
-  archive-export-upload:
-    # See the fork-safety note above: this is the "forked with tags, then given
-    # its own credentials" case, not the fork-PR case, which the trigger
-    # already excludes.
+  # Decides, with no secret in scope, whether this run releases and which
+  # marketing version it carries. Full history because the version is counted
+  # from the latest reachable `ios-v*` tag; see the docstring of
+  # scripts/ios_release.py for the rule. A manual tag that would ship out of
+  # order (not on main, behind an app change on main, or not above what the
+  # automatic release can already have shipped) fails here, before the
+  # signing job exists. Full history also brings refs/remotes/origin/main,
+  # which those checks need; without it they fail closed.
+  #
+  # "Re-run failed jobs" does not re-run this job, so its checks are not
+  # repeated on a re-run: only re-run the newest release run
+  # (docs/ios-testflight.md, "Re-running a release").
+  plan:
     if: github.repository == 'poopaskoopa/wattracker'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      mode: ${{ steps.plan.outputs.mode }}
+      version: ${{ steps.plan.outputs.version }}
+      base_tag: ${{ steps.plan.outputs.base_tag }}
+    steps:
+      - name: Check out the full history and tags
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # $GITHUB_REF via env rather than ${{ github.ref }} in the script body:
+      # a tag name is attacker-shaped text as far as a shell is concerned.
+      - name: Plan the release
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: python3 scripts/ios_release.py plan --event "$EVENT_NAME" --ref "$GITHUB_REF"
+
+  archive-export-upload:
+    needs: plan
+    # See the fork-safety note above: this is the "forked with its history,
+    # then given its own credentials" case, not the fork-PR case, which the
+    # trigger already excludes.
+    if: github.repository == 'poopaskoopa/wattracker' && needs.plan.outputs.release == 'true'
     # GitHub's hosted macOS 26 arm64 image currently ships Xcode 26.6 and the
     # iOS 26.5 SDK. Select it explicitly so an image-default change cannot
     # silently fall below Apple's App Store Connect upload requirement.
     runs-on: macos-26
     environment: ios-code-signing
+    permissions:
+      contents: read
     timeout-minutes: 60
+    outputs:
+      uploaded: ${{ steps.upload.outputs.uploaded }}
+      build_number: ${{ steps.derive.outputs.build_number }}
 
     steps:
-      - name: Check out the tagged source
+      - name: Check out the release source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           # The repository convention, and it matters more here than usual: a
@@ -90,7 +198,13 @@ jobs:
           echo "Using Xcode 26.6 with iOS SDK $sdk_version."
 
       # Nothing secret in this step, deliberately, so it can fail loudly and
-      # early on a malformed tag before any credential is written to disk.
+      # early on a malformed version before any credential is written to disk.
+      #
+      # THE MARKETING VERSION comes from the plan job: the tag's own version
+      # on a tag push, the derived next version on a push to main, and 0.0.0
+      # on a manual dispatch. It is re-validated here anyway, because this is
+      # the job that hands it to xcodebuild and App Store Connect rejects
+      # anything but one to three non-negative integers - after the archive.
       #
       # THE BUILD NUMBER. App Store Connect rejects an upload whose
       # CFBundleVersion it has already accepted for this
@@ -100,49 +214,53 @@ jobs:
       # to bump it.
       #
       # `run_number.run_attempt` is that. run_number increases by one for every
-      # run of this workflow and never repeats; run_attempt distinguishes the
-      # re-runs of a single run, which is the failure mode worth naming: a job
-      # that dies in the upload step and is re-run from the Actions UI keeps
-      # its run_number, so a bare run_number would send Apple the exact build
+      # run of this workflow - main pushes, tags and dispatches share one
+      # sequence - and never repeats; run_attempt distinguishes the re-runs of
+      # a single run, which is the failure mode worth naming: a job that dies
+      # in the upload step and is re-run from the Actions UI keeps its
+      # run_number, so a bare run_number would send Apple the exact build
       # number it just rejected, and the re-run would fail for a reason that
       # has nothing to do with why the first one did. CFBundleVersion accepts
       # up to three dot-separated integers and compares them component-wise, so
-      # 41.1 < 41.2 < 42.1 orders the way it reads.
+      # 41.1 < 41.2 < 42.1 orders the way it reads, and it is strictly
+      # increasing across versions as well as within one.
       #
       # The consequence to know: the build number is a property of CI, not of
-      # the tag. Re-tagging the same commit produces a different build number,
-      # which is correct - Apple is being told "this is a different delivery",
-      # and it is.
+      # the commit. Re-releasing the same commit produces a different build
+      # number, which is correct - Apple is being told "this is a different
+      # delivery", and it is.
       - name: Derive the version and build number
+        id: derive
         env:
-          # $GITHUB_REF_NAME rather than ${{ github.ref_name }}: a tag name is
-          # attacker-supplied text as far as this shell is concerned, and
-          # interpolating it into the script body would let a tag containing
-          # shell metacharacters execute on the runner. Only someone who can
-          # push to this repository can create a tag, but a guard that costs
-          # one line does not need to argue about that.
+          # Through env, never interpolated into the script body.
+          PLAN_VERSION: ${{ needs.plan.outputs.version }}
+          PLAN_MODE: ${{ needs.plan.outputs.mode }}
           RUN_NUMBER: ${{ github.run_number }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF_NAME" == ios-v* ]]; then
-            version="${GITHUB_REF_NAME#ios-v}"
-            # CFBundleShortVersionString: one to three non-negative integers.
-            # Anything else is rejected by App Store Connect, and it is far
-            # cheaper to say so here than after the archive.
-            if ! printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
-              echo "Tag '$GITHUB_REF_NAME' does not carry a 1-3 component numeric version" >&2
-              exit 1
-            fi
-          else
+          version="${PLAN_VERSION:-}"
+          # CFBundleShortVersionString: one to three non-negative integers.
+          # Anything else is rejected by App Store Connect, and it is far
+          # cheaper to say so here than after the archive.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
+            echo "The planned version '$version' is not a 1-3 component numeric version" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             # Manual dispatch archives and exports only; keep its diagnostic
             # build clearly separate from every App Store release version.
-            version="0.0.0"
-            echo "Non-tag diagnostic run; using marketing version $version"
+            if [ "$version" != "0.0.0" ] || [ "$PLAN_MODE" != "dispatch" ]; then
+              echo "A manual dispatch must build the 0.0.0 diagnostic version." >&2
+              exit 1
+            fi
+            echo "Non-release diagnostic run; using marketing version $version"
           fi
+          build_number="${RUN_NUMBER}.${RUN_ATTEMPT}"
           echo "MARKETING_VERSION=$version" >> "$GITHUB_ENV"
-          echo "BUILD_NUMBER=${RUN_NUMBER}.${RUN_ATTEMPT}" >> "$GITHUB_ENV"
-          echo "Building version $version build ${RUN_NUMBER}.${RUN_ATTEMPT}"
+          echo "BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+          echo "build_number=$build_number" >> "$GITHUB_OUTPUT"
+          echo "Building version $version build $build_number ($PLAN_MODE)"
 
       # This must run before Archive: the host is an environment secret rather
       # than a checked-in config value. Keep it out of shell diagnostics and
@@ -871,10 +989,13 @@ jobs:
       # offers no way to pass them off argv. macos-release.yml documents the
       # same residual for `security import`.
       - name: Validate and upload to TestFlight
-        # Tag runs only. A manual dispatch is for exercising the signing
-        # and archive path; it must never be able to publish a build to
-        # App Store Connect, where a bad build number cannot be reused.
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ios-v')
+        id: upload
+        # Pushes to main and ios-v* tags only, and the condition names both
+        # refs itself rather than trusting the plan job's output. A manual
+        # dispatch is for exercising the signing and archive path; it must
+        # never be able to publish a build to App Store Connect, where a bad
+        # build number cannot be reused.
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/ios-v'))
         env:
           ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
@@ -892,6 +1013,7 @@ jobs:
             --api-key "$ASC_KEY_ID" \
             --api-issuer "$ASC_ISSUER_ID" \
             --p8-file-path "$ASC_KEY_PATH"
+          echo "uploaded=true" >> "$GITHUB_OUTPUT"
           echo "Uploaded build $BUILD_NUMBER of version $MARKETING_VERSION."
           echo "App Store Connect processes it asynchronously; it appears in"
           echo "TestFlight once processing finishes."
@@ -949,3 +1071,51 @@ jobs:
             exit 1
           fi
           echo "Signing material removed."
+
+  # TELL THE ISSUES. Comments "Shipped in TestFlight <version> (build <n>)" on
+  # every issue closed by a pull request this build ships: the newest 30
+  # first-parent app commits since the latest (admin-created) release tag,
+  # each mapped to the pull request whose merge commit it is, then to that
+  # PR's closingIssuesReferences. A range rather than this push alone, so a
+  # queued run that GitHub superseded has its pull requests reported by the
+  # build that actually shipped them; the workflow's own earlier comments are
+  # recognised, so the overlap between ranges never comments twice.
+  #
+  # Its own job, on its own runner, never holding the signing environment:
+  # the issues:write token and the signing secrets never share a process.
+  # continue-on-error so a GitHub API hiccup here cannot turn a shipped
+  # build into a failed release.
+  notify:
+    needs: [plan, archive-export-upload]
+    if: >-
+      !cancelled()
+      && github.repository == 'poopaskoopa/wattracker'
+      && github.event_name == 'push'
+      && needs.archive-export-upload.outputs.uploaded == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    timeout-minutes: 10
+    steps:
+      - name: Check out the full history and tags
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Comment on the issues this build closes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          BASE_TAG: ${{ needs.plan.outputs.base_tag }}
+          BUILD_NUMBER: ${{ needs.archive-export-upload.outputs.build_number }}
+        run: >-
+          python3 scripts/ios_release.py notify
+          --repo "$GITHUB_REPOSITORY"
+          --base-tag "$BASE_TAG"
+          --head "$GITHUB_SHA"
+          --version "$VERSION"
+          --build "$BUILD_NUMBER"

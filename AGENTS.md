@@ -443,6 +443,9 @@ is the right outcome.
   #219 did this correctly against #217.
 - Do not start the next item while your PR is unreviewed *if* the next item
   touches the same files. Otherwise carry on; note the dependency in the PR.
+- iOS app changes ship to TestFlight automatically on merge to `main`
+  (`docs/ios-testflight.md`), so do not bump versions or push `ios-v*` tags by
+  hand.
 
 ## Scope
 

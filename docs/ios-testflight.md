@@ -1,14 +1,39 @@
 # Shipping the iOS app to TestFlight
 
-The pipeline is `.github/workflows/ios-release.yml`. Pushing a tag that starts
-with `ios-v` archives, signs, exports and uploads a build to TestFlight. A
-manual `workflow_dispatch` from `main` runs the same archive/export path
-without uploading; manual verification is main-only.
+The pipeline is `.github/workflows/ios-release.yml`. **Every merge to `main`
+that changes the iOS app ships it to TestFlight automatically**: the workflow
+derives the next version, archives, signs, exports, uploads, and comments
+"Shipped in TestFlight <version> (build <n>)" on each issue the shipped pull
+requests closed. Nobody bumps a version or pushes a tag by hand. The workflow
+never creates tags itself; see "Settings the automatic release needs" for why
+that matters.
 
-```sh
-git tag ios-v0.1.0
-git push origin ios-v0.1.0
-```
+"Changes the app" means the merge touches something the App Store archive
+builds: `ios/WatTracker/WatTracker/**`, `ios/WatTracker/WatTracker.xcodeproj/**`,
+`ios/WatTracker/Config/**` or `ios/WatTracker/ExportOptions.plist`. A
+test-only (`WatTrackerTests/**`), shared-vector, doc or workflow change does
+not ship a build. `APP_PATHS` in `scripts/ios_release.py` is the same list,
+and `tests/test_ios_release_workflow.py` fails if the app target in
+`project.pbxproj` ever names a file outside it.
+
+Two manual paths remain:
+
+- **An `ios-v*` tag** (repository admins only) is the escape hatch. It ships
+  exactly the version it names, whatever changed, and is how to bump the minor
+  or major version or to re-ship an unchanged commit before a build expires.
+  The tag must be on a commit that is **on `main` with no app change merged
+  after it** (in practice: tag the tip of `main`), and its version must be
+  **above the last version already shipped** - the newest build in
+  TestFlight, which the latest "Shipped in TestFlight" issue comment also
+  names. Otherwise the run refuses it before anything is signed:
+
+  ```sh
+  git tag ios-v0.2.0
+  git push origin ios-v0.2.0
+  ```
+
+- **A manual `workflow_dispatch` from `main`** runs the same archive/export
+  path as version `0.0.0` without uploading; manual verification is main-only.
 
 `ios-v`, not `v`: `macos-release.yml` and `windows-release.yml` both fire on
 `v*`, and a shared prefix would mean every desktop release tag also started an
@@ -189,7 +214,8 @@ is App Store Connect; they are different websites for the same account.
      internal, never shown to anyone, and cannot be changed later.
    - User Access: Full Access
 
-4. **Push the tag.** From here on, releases are `git tag ios-v… && git push`.
+4. **Push the first tag.** The automatic release counts from the latest
+   `ios-v*` tag, so one must exist. From then on, merges ship by themselves.
 
 ## The owner's release sequence
 
@@ -207,8 +233,9 @@ and every later release:
    default `diagnose_signing` setting. This hosted-runner test archives and
    exports but does not upload; inspect the first failing step and its
    diagnostic if it fails. Manual verification is main-only.
-4. When the test-mode run is satisfactory, create and push the release tag,
-   for example `git tag ios-v0.1.0 && git push origin ios-v0.1.0`.
+4. When the test-mode run is satisfactory, merge the app change to `main` (or,
+   for the very first release or a minor/major bump, push an `ios-v*` tag such
+   as `git tag ios-v0.1.0 && git push origin ios-v0.1.0`).
 5. Wait roughly 10–30 minutes for Apple's processing. Then install the build
    through the TestFlight app and verify the app reaches the production cloud.
 6. To invite riders who are not on the App Store Connect team, create an
@@ -225,6 +252,38 @@ signatures for request authentication, which is the use case Apple's
 `ITSAppUsesNonExemptEncryption = false` declaration covers. The
 declaration is checked into both source plists, so App Store Connect can use
 the answer for every uploaded build.
+
+## Settings the automatic release needs
+
+Repository settings, owner-only, **in this order**. None of them is changed by
+the workflow, and the workflow is safe to merge before either: until step 2,
+the `ios-code-signing` environment's required reviewer still has to approve
+every release, so nothing ships unattended.
+
+1. **Land #478 and its `main` ruleset first.** Once the reviewer is gone, a
+   merge to `main` runs code with the signing secrets, so the merge-time
+   code-owner gate is what stands between a pull request and those secrets.
+2. **Remove the required reviewer from the `ios-code-signing` environment.**
+   Keep its deployment-branch policy (`main` and `ios-v*`) as it is; that
+   policy is what confines the signing secrets to those two refs.
+
+Nothing else. In particular, leave the "iOS release tag policy" ruleset
+exactly as it is: admin-only creation, update and deletion of
+`refs/tags/ios-v*`.
+
+**Why the tag ruleset is part of the signing boundary.** With no reviewer,
+code reaches the signing secrets only through the two refs the environment
+admits: (a) `main`, gated by the code-owner ruleset, and (b) `ios-v*` tags,
+which only admins can create. If anyone else can create an `ios-v*` tag, a
+write collaborator can push a branch workflow holding `contents: write`, use
+its `GITHUB_TOKEN` to tag a commit carrying an altered `ios-release.yml`, and
+`workflow_dispatch` the workflow on that tag (a dispatch made with
+`GITHUB_TOKEN` does start a run). The tag matches the environment's policy, so
+that unreviewed code receives the `.p8` and the `.p12`. **Do not add a bypass
+actor of any kind to that ruleset** (GitHub Actions included), and do not give
+any workflow a path to create `ios-v*` tags. This workflow holds no
+`contents: write` for that reason, and its versions never depend on a tag
+being written.
 
 ## Credentials
 
@@ -319,26 +378,102 @@ not touch the certificate; they are independent credentials with independent
 lifetimes. And re-running the release job does not renew anything — the
 workflow only ever imports the certificate it is given.
 
-## Build numbers
+## Versions and build numbers
 
 The release job sets both version numbers on the `xcodebuild` command line;
 nothing on disk changes.
 
-- `CFBundleShortVersionString` comes from the tag: `ios-v0.1.0` → `0.1.0`. The
-  job rejects a tag that is not one to three dot-separated integers after the
-  prefix.
-- `CFBundleVersion` is `<run_number>.<run_attempt>`.
+**`CFBundleShortVersionString`**, the marketing version:
+
+- On a **tag** push, it is the tag: `ios-v0.1.0` → `0.1.0`. A tag that is not
+  one to three dot-separated integers after the prefix is rejected before
+  anything secret is in scope.
+- On a **merge to `main`**, it is the latest `ios-v*` tag reachable from the
+  commit, with its patch number increased by the number of first-parent
+  commits since that tag that change the app (at least one). On `main` every
+  pull request is one merge commit, so in the normal flow this is simply the
+  previous release plus one: `ios-v0.1.9` → `0.1.10`.
+
+  The workflow never writes tags, so the latest tag is the last one an admin
+  pushed and automatic releases count forward from it: with `ios-v0.1.9`
+  latest, three app merges ship 0.1.10, 0.1.11 and 0.1.12. The version is a
+  function of the commit alone, so a re-run of the same commit gets the same
+  version. A number can be skipped when two merges ship as one build (see
+  "Back-to-back merges"). It assumes `main` is append-only, which the `main`
+  ruleset enforces.
+
+  A merge whose commit already carries an `ios-v*` tag does not ship again;
+  that tag's own run ships it.
+- **A manual tag cannot ship out of order.** Because the tags lag behind
+  the automatic releases, the `plan` job refuses a tag, before the signing job
+  starts, when:
+  - its commit is not on `main` (`ios-v0.2.0` on an unmerged hotfix would
+    ship, and then `main` would ship 0.1.13 after it);
+  - an app change has been merged to `main` after its commit (the automatic
+    release has already shipped past it, so it would put an older build on
+    top; this is also what stops a re-run of an old tag run); or
+  - its version is not strictly above the highest version the automatic
+    release can already have shipped, at the tagged commit and at the tip of
+    `main` (pushing `ios-v0.1.10` after 0.1.12 shipped would ship 0.1.10 again
+    and make the next merge ship 0.1.11).
+
+  The checks fail closed if the checkout lacks `main`. The error says which
+  rule failed and, for the last one, the version to beat; delete the refused
+  tag and tag the tip of `main` with a higher version.
+- On a **manual dispatch**, it is `0.0.0`, and nothing is uploaded.
+
+**`CFBundleVersion`**, the build number, is `<run_number>.<run_attempt>`.
 
 App Store Connect **rejects** an upload whose build number it has already
 accepted for that version string, and it rejects it after the archive, the
-export and the upload have all run. `run_number` never repeats. `run_attempt`
-is there for the specific case of re-running a failed run from the Actions UI:
-that keeps `run_number`, so without it a re-run would send Apple the exact
-build number it just refused and fail for a reason unrelated to the original
-failure.
+export and the upload have all run. `run_number` never repeats and is shared by
+every trigger of the workflow, so build numbers increase strictly across
+merges, tags and versions. `run_attempt` is there for the specific case of
+re-running a failed run from the Actions UI: that keeps `run_number`, so
+without it a re-run would send Apple the exact build number it just refused
+and fail for a reason unrelated to the original failure.
 
-The consequence: the build number is a property of the CI run, not of the tag.
-Re-tagging the same commit produces a different build number, which is correct.
+The consequence: the build number is a property of the CI run, not of the
+commit. Re-releasing the same commit produces a different build number, which
+is correct.
+
+### Re-running a release
+
+**Only re-run the newest release run.** "Re-run failed jobs" keeps the
+original `plan` job's result and goes straight to signing, so the version and
+the checks above are not recomputed. Re-running an older failed run after a
+newer one has shipped would upload an older version on top of a newer one.
+To recover an older failed release, do not re-run it: merge the next app
+change (it ships everything up to it), or have an admin tag the tip of `main`
+with a version above the newest build in TestFlight.
+
+### Back-to-back merges
+
+The workflow's concurrency group allows one release running and one waiting
+per trigger kind, and never cancels a running one, so nothing is ever cut off
+mid-upload. When a third release queues, GitHub cancels the waiting one: the
+newest merge supersedes an older one that has not started. A release that has
+already started is left to finish and upload; the extra TestFlight build that
+costs is harmless.
+
+Tag releases have their own group, so a merge can never cancel a waiting tag
+release. A tag run and a merge run can therefore overlap; they cannot collide
+at App Store Connect, because their build numbers differ.
+
+### Issue comments
+
+After a successful upload a separate job, with `issues: write` and no access
+to the signing environment, comments "Shipped in TestFlight <version> (build
+<n>) via #<pr>." on each issue closed by a pull request the build ships. The
+pull requests are the newest 30 merge commits that change the app between the
+latest `ios-v*` tag and this commit, each resolved through its
+`closingIssuesReferences`. Because no tag is written per release, consecutive
+ranges overlap; the workflow recognises its own earlier comments, so each
+shipped pull request is reported once, by the first build that contains it.
+This build's own pull requests are always the newest in the range, so the
+30-commit window only matters for a pull request whose own comment failed
+more than 30 app merges ago: it is not retried. A failure here never fails
+the release.
 
 ## TestFlight builds expire after 90 days
 
@@ -348,10 +483,12 @@ alike. There is no extension, no renewal, and no setting. The counter starts at
 upload, not at first install, so a build that sat in processing for a day is a
 day closer to expiry when a tester first sees it.
 
-**Re-issuing is just cutting another release.** Push a new `ios-v*` tag; the
-new build gets a fresh 90 days and testers are prompted to update. If nothing
-in the app changed, re-tag the same commit — the build number differs by
-construction, so Apple accepts it.
+**Re-issuing is just cutting another release.** Any merge that changes the
+app does it automatically, and the new build gets a fresh 90 days. If nothing
+in the app changed, an admin pushes an `ios-v*` tag on the current `main`
+commit, one patch above the newest build in TestFlight (the `plan` job
+refuses anything lower) — the build number differs by construction, so Apple
+accepts it.
 
 Two practical notes:
 
@@ -363,10 +500,14 @@ Two practical notes:
 
 ## What the release job does, step by step
 
-1. Checks out the tag with `persist-credentials: false`.
-2. Derives the version from the tag and the build number from the run. Nothing
-   secret is in scope yet, so a malformed tag fails before any credential is
-   written to disk.
+0. A `plan` job on `ubuntu-latest`, with `contents: read` and no secrets,
+   decides whether the run releases, computes the version, and refuses a
+   manual tag that would ship out of order
+   (`scripts/ios_release.py plan`).
+1. Checks out the release commit with `persist-credentials: false`.
+2. Re-validates the planned version and derives the build number from the
+   run. Nothing secret is in scope yet, so a malformed version fails before
+   any credential is written to disk.
 3. Validates the secret-backed production API hostname. This happens before
    the archive and rejects an empty value, whitespace, a URL/path, malformed
    DNS, or the placeholder `api.wattracker.com` without printing the host.
@@ -419,9 +560,9 @@ Two practical notes:
    (`signingStyle` `manual`, `provisioningProfiles` mapping
    `com.wattracker.ios`); a mismatch there re-signs with something else and is
    not caught until Apple rejects the upload.
-9. `xcrun altool --validate-app`, then `--upload-app`. Validation first because
-   it is where a missing app record surfaces in seconds rather than after a
-   full upload.
+9. On a merge or a tag but never a dispatch, `xcrun altool --validate-app`,
+   then `--upload-app`. Validation first because it is where a missing app
+   record surfaces in seconds rather than after a full upload.
 10. An `if: always()` step restores the keychain search list, deletes the
    signing keychain, and removes the API key, the templated plist, the archive,
    the export and both DerivedData trees — and fails the job if either the
@@ -429,6 +570,8 @@ Two practical notes:
    but this cleanup is still required for deterministic failure handling and
    protects any workspace or diagnostic state retained while the job is
    running.
+11. After a successful upload, a `notify` job comments on the closed issues
+   (see "Issue comments").
 
 **No `.ipa` is uploaded as a build artifact, on purpose.** A
 distribution-signed `.ipa` embeds `embedded.mobileprovision`, whose
@@ -521,3 +664,15 @@ keeps out of the tree. Nothing needs it: the build's destination is TestFlight.
 - A duplicate-build-number rejection should be impossible. If it happens, the
   workflow was re-run in a way that reused `run_number` and `run_attempt`
   together; cut a new tag.
+- `Tag 'ios-v…' is not above X` in the `plan` job — the tag is at or below a
+  version the automatic release may already have shipped. Delete the tag and
+  push one above X.
+- `Tag 'ios-v…' is not on main` / `is behind main` in the `plan` job — the
+  tagged commit is unmerged, or app changes have shipped from `main` since it.
+  Delete the tag and tag the tip of `main` instead.
+- `No ios-v* tag is reachable from this commit` in the `plan` job — the
+  automatic release has nothing to count from. Push one release tag by hand.
+- A merge to `main` that should have shipped did not start a run — check that
+  it touched one of the app paths at the top of this page. GitHub also stops
+  matching path filters after a push's first 300 changed files. Push an
+  `ios-v*` tag to ship it by hand.

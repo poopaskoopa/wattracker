@@ -220,14 +220,19 @@ def test_workflow_pins_verifies_and_imports_apple_root_and_wwdr_before_identity_
     assert wwdr_import < p12_import < validity_check
 
 
-def test_workflow_uses_manual_diagnostic_version_and_upload_is_tag_only():
+def test_workflow_uses_manual_diagnostic_version_and_upload_is_main_or_tag_push_only():
+    # The behavioural checks of this gate live in test_ios_release_workflow.py;
+    # this keeps the string-level guarantee next to the other signing checks.
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    assert 'version="0.0.0"' in workflow
+    assert 'if [ "$version" != "0.0.0" ] || [ "$PLAN_MODE" != "dispatch" ]; then' in workflow
     assert "Manual dispatch archives and exports only" in workflow
     upload_start = workflow.index("- name: Validate and upload to TestFlight")
     upload_end = workflow.find("\n      - name:", upload_start + 1)
     upload = workflow[upload_start:] if upload_end == -1 else workflow[upload_start:upload_end]
-    assert "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ios-v')" in upload
+    assert (
+        "if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || "
+        "startsWith(github.ref, 'refs/tags/ios-v'))\n"
+    ) in upload
     assert "if: startsWith(github.ref, 'refs/tags/ios-v')" not in upload
 
 
