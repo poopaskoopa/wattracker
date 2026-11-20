@@ -126,14 +126,82 @@ final class RideDisplayTests: XCTestCase {
 
         let zones: JSONValue = .object([
             "heart_rate": .object(["zones": .array([
-                .object(["label": .string("Z1"), "seconds": .number(0)]),
+                .object(["label": .string("Z1"), "seconds": .number(0), "duration": .string("0:00")]),
                 .object(["label": .string("Z2"), "seconds": .number(60), "percent": .number(25)]),
                 .object(["seconds": .number(180), "percent": .number(75)])
             ])])
         ])
         let rows = try XCTUnwrap(ZoneGroup.extract(from: zones).first?.rows)
-        // The dropped zero-time Z1 must not shift the zones behind it.
-        XCTAssertEqual(rows.map(\.zone), [2, 3])
+        // Keeping zero-time Z1 preserves both payload order and zone numbering.
+        XCTAssertEqual(rows.map(\.zone), [1, 2, 3])
+        XCTAssertEqual(rows[0].label, "Z1")
+        XCTAssertEqual(rows[0].seconds, 0)
+        XCTAssertEqual(rows[0].durationText, "0:00")
+    }
+
+    func testAllZeroPowerZonesKeepEveryRowAndColors() throws {
+        let values: [JSONValue] = (1...7).map { zone in
+            .object(["label": .string("Z\(zone)"), "seconds": .number(0),
+                     "percent": .number(0)])
+        }
+        let groups = ZoneGroup.extract(from: .object([
+            "power": .object(["zones": .array(values)])
+        ]))
+        XCTAssertEqual(groups.count, 1)
+        let rows = try XCTUnwrap(groups.first?.rows)
+        XCTAssertEqual(rows.map(\.id), (0..<7).map { "power-\($0)" })
+        XCTAssertEqual(rows.map(\.label), (1...7).map { "Z\($0)" })
+        XCTAssertEqual(rows.map(\.zone), Array(1...7))
+        for row in rows {
+            XCTAssertEqual(row.seconds, 0)
+            XCTAssertEqual(row.durationText, "0:00")
+            XCTAssertEqual(row.percent, 0)
+            XCTAssertEqual(ZoneStyle.barFraction(percent: row.percent), 0)
+        }
+        for row in rows.suffix(2) {
+            XCTAssertEqual(ZoneStyle.barRgb(zone: row.zone), 0xa82828)
+            XCTAssertEqual(ZoneStyle.labelRgb(zone: row.zone), 0xff7a8a)
+        }
+    }
+
+    func testHeartRateKeepsFiveZonesWhenOnlyZoneTwoIsReached() throws {
+        let values: [JSONValue] = (1...5).map { zone in
+            .object(["label": .string("Z\(zone)"),
+                     "seconds": .number(zone == 2 ? 60 : 0),
+                     "percent": .number(zone == 2 ? 100 : 0)])
+        }
+        let groups = ZoneGroup.extract(from: .object([
+            "heart_rate": .object(["zones": .array(values)])
+        ]))
+        let rows = try XCTUnwrap(groups.first?.rows)
+        XCTAssertEqual(rows.map(\.label), (1...5).map { "Z\($0)" })
+        XCTAssertEqual(rows.map(\.seconds), [0, 60, 0, 0, 0])
+        XCTAssertEqual(rows.map(\.percent), [0, 100, 0, 0, 0])
+    }
+
+    func testEmptyZoneArraysDoNotInventGroups() {
+        XCTAssertTrue(ZoneGroup.extract(from: .object([
+            "power": .object(["zones": .array([])]),
+            "heart_rate": .object(["zones": .array([])])
+        ])).isEmpty)
+    }
+
+    func testZoneTimesDropMissingOrNonNumericAndClampInvalidToZero() throws {
+        let values: [JSONValue] = [
+            .object(["label": .string("missing")]),
+            .object(["seconds": .string("0")]),
+            .object(["seconds": .number(-1)]),
+            .object(["seconds": .number(.nan)]),
+            .object(["seconds": .number(.infinity)]),
+            .object(["seconds": .number(-.infinity)])
+        ]
+        let groups = ZoneGroup.extract(from: .object([
+            "power": .object(["zones": .array(values)])
+        ]))
+        let rows = try XCTUnwrap(groups.first?.rows)
+        XCTAssertEqual(rows.map(\.id), ["power-2", "power-3", "power-4", "power-5"])
+        XCTAssertEqual(rows.map(\.seconds), [0, 0, 0, 0])
+        XCTAssertEqual(rows.map(\.durationText), ["0:00", "0:00", "0:00", "0:00"])
     }
 
     func testZoneBarFractionClampsAndTreatsMissingAsZero() {
@@ -264,9 +332,9 @@ final class RideDisplayTests: XCTestCase {
         ])
         let groups = ZoneGroup.extract(from: zones)
         XCTAssertEqual(groups.map(\.id), ["power", "heart_rate"])
-        XCTAssertEqual(groups[0].rows.map(\.seconds), [61, 539])
-        XCTAssertEqual(groups[0].rows.map(\.label), ["Recovery", "Z2"])
-        XCTAssertEqual(groups[0].rows.map(\.percent), [10.25, 89.75])
+        XCTAssertEqual(groups[0].rows.map(\.seconds), [61, 539, 0])
+        XCTAssertEqual(groups[0].rows.map(\.label), ["Recovery", "Z2", "empty"])
+        XCTAssertEqual(groups[0].rows.map(\.percent), [10.25, 89.75, 0])
         XCTAssertEqual(groups[1].rows.map(\.seconds), [600])
         XCTAssertEqual(groups[1].rows.map(\.label), ["Z1"])
         XCTAssertEqual(groups[1].rows.map(\.percent), [100])
