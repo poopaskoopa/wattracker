@@ -6,10 +6,12 @@ import datetime as _dt
 import hashlib
 import logging
 import os
+import sqlite3
 import tempfile
 import time
 import xml.etree.ElementTree as _ET
-from typing import Callable, Dict, List, Optional
+from dataclasses import dataclass, replace
+from typing import Callable, Dict, List, Literal, Optional
 
 import numpy as np
 
@@ -1239,7 +1241,72 @@ def _completion_activity_date(started, timezone) -> Optional[_dt.date]:
         return None
 
 
-def plan_workout_completion_verified(user_id: int, workout: dict) -> bool:
+@dataclass(frozen=True)
+class RpeTarget:
+    kind: Literal["activity", "plan", "standalone"]
+    record_id: int
+    current: Optional[int]
+    tunes_ftp: bool
+
+
+def _rpe_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Inspect known local tables, tolerating older snapshot schemas."""
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def resolve_rpe_target(
+    user_id: int, activity_id: int, *, conn: Optional[sqlite3.Connection] = None,
+) -> Optional[RpeTarget]:
+    """Resolve the single RPE owner, using only the supplied DB when present."""
+    if conn is None:
+        owned = db.connect(read_only=True)
+        try:
+            return resolve_rpe_target(user_id, activity_id, conn=owned)
+        finally:
+            owned.close()
+    row = conn.execute(
+        "SELECT * FROM activities WHERE user_id = ? AND id = ?",
+        (user_id, activity_id),
+    ).fetchone()
+    activity = dict(row) if row else None
+    if not activity or activity.get("duplicate_of") is not None:
+        return None
+    fallback = RpeTarget("activity", activity_id, activity.get("rpe"), False)
+    for kind, table in (("plan", "plan_workouts"), ("standalone", "standalone_workouts")):
+        if not {"id", "user_id", "completed_activity_id", "rpe"} <= _rpe_columns(conn, table):
+            continue
+        row = conn.execute(
+            f"SELECT * FROM {table} WHERE user_id = ? AND completed_activity_id = ? "
+            "ORDER BY id ASC LIMIT 1", (user_id, activity_id),
+        ).fetchone()
+        if row is None:
+            continue
+        workout = dict(row)
+        if kind == "plan" and not plan_workout_completion_verified(user_id, workout, conn=conn):
+            return fallback
+        return RpeTarget(kind, workout["id"], workout["rpe"], True)
+    return fallback
+
+
+def set_ride_rpe(user_id: int, activity_id: int, rpe: int) -> RpeTarget:
+    """Rate a ride through its resolved owner; workout ratings feed FTP."""
+    if type(rpe) is not int or not 1 <= rpe <= 10:
+        raise ValueError("rpe must be an integer between 1 and 10")
+    target = resolve_rpe_target(user_id, activity_id)
+    if target is None:
+        raise LookupError("activity not found")
+    if target.tunes_ftp:
+        saved = save_workout_rpe(user_id, target.kind, target.record_id, rpe)
+    else:
+        saved = db.set_activity_rpe(user_id, target.record_id, rpe)
+    if not saved:
+        raise LookupError("activity not found")
+    return replace(target, current=rpe)
+
+
+def plan_workout_completion_verified(
+    user_id: int, workout: dict, *, conn: Optional[sqlite3.Connection] = None,
+) -> bool:
     """Whether a stored completion is strong enough to expose RPE feedback.
 
     Legacy prescriptions without an objective profile retain their historical
@@ -1253,7 +1320,35 @@ def plan_workout_completion_verified(user_id: int, workout: dict) -> bool:
     if not _requires_power_profile(workout):
         return True
     duration = float(workout.get("duration_s") or 0)
-    activity = db.get_activity(user_id, workout["completed_activity_id"])
+    if conn is None:
+        activity = db.get_activity(user_id, workout["completed_activity_id"])
+        timezone = db.get_user_settings(user_id).get("timezone")
+    else:
+        row = conn.execute(
+            "SELECT * FROM activities WHERE user_id = ? AND id = ?",
+            (user_id, workout["completed_activity_id"]),
+        ).fetchone()
+        activity = dict(row) if row else None
+        settings_columns = _rpe_columns(conn, "user_settings")
+        settings = None
+        if {"user_id", "timezone"} <= settings_columns:
+            settings = conn.execute(
+                "SELECT * FROM user_settings WHERE user_id = ?", (user_id,),
+            ).fetchone()
+        settings = dict(settings) if settings else {}
+        timezone = settings.get("timezone")
+        if activity and not db._activity_is_visible(
+            activity, settings.get("history_start_date"), timezone,
+        ):
+            activity = None
+        if activity:
+            correction_columns = _rpe_columns(conn, "power_sample_corrections")
+            ranges = []
+            if {"user_id", "activity_id", "start_index", "end_index", "undone_at"} <= correction_columns:
+                ranges = db._correction_ranges(
+                    conn, user_id, [workout["completed_activity_id"]],
+                ).get(workout["completed_activity_id"], [])
+            activity["streams"] = db._effective_streams(activity.get("streams"), ranges)
     if not activity or duration <= 0:
         return False
     started = parse_naive(activity.get("start_time"))
@@ -1264,7 +1359,6 @@ def plan_workout_completion_verified(user_id: int, workout: dict) -> bool:
         return False
     if started is None:
         return False
-    timezone = db.get_user_settings(user_id).get("timezone")
     activity_date = _completion_activity_date(started, timezone)
     if (
         activity_date != completed
