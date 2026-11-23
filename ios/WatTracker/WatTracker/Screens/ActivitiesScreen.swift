@@ -425,7 +425,7 @@ struct StreamCharts: View {
                             if expanded {
                                 Rectangle().fill(.clear).contentShape(Rectangle())
                                     .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-                                        select(at: value.location, frame: frame, proxy: proxy, xs: xs)
+                                        select(at: value.location, frame: frame, proxy: proxy, xs: xs, dragging: true)
                                     })
                             } else {
                                 // Taps only: vertical drags belong to the surrounding ScrollView.
@@ -460,9 +460,11 @@ struct StreamCharts: View {
         .onTapGesture { selectedMinutes = nil }
     }
 
-    private func select(at point: CGPoint, frame: CGRect, proxy: ChartProxy, xs: [Double]) {
-        guard frame.contains(point),
-              let x: Double = proxy.value(atX: point.x - frame.minX),
+    private func select(
+        at point: CGPoint, frame: CGRect, proxy: ChartProxy, xs: [Double], dragging: Bool = false
+    ) {
+        guard let plotX = StreamSelection.plotX(at: point, frame: frame, dragging: dragging),
+              let x: Double = proxy.value(atX: plotX),
               let index = StreamSelection.nearestIndex(xs: xs, at: x) else {
             selectedMinutes = nil
             return

@@ -279,6 +279,13 @@ enum StreamSelection {
         Array(Set(series.flatMap(\.points).map(\.minutes))).sorted()
     }
 
+    /// Expanded scrubbing clamps to an edge sample even in the label gutters
+    /// or beyond the plot vertically. Inline taps outside the plot clear.
+    static func plotX(at point: CGPoint, frame: CGRect, dragging: Bool) -> Double? {
+        guard dragging || frame.contains(point) else { return nil }
+        return min(max(point.x, frame.minX), frame.maxX) - frame.minX
+    }
+
     /// Binary search; an exact midpoint belongs to the earlier sample.
     static func nearestIndex(xs: [Double], at x: Double) -> Int? {
         guard !xs.isEmpty, x.isFinite else { return nil }
