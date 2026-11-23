@@ -38,6 +38,7 @@ contract is:
 | `POST /api/v1/devices/pair` | read | one-time pairing code | — |
 | `GET /api/v1/devices` | read | signed writer-or-device request + conditional attested subject | `read` |
 | `POST /api/v1/devices/{credential_id}/revoke` | read | signed writer-or-device request + conditional attested subject | `read` |
+| `POST /api/v1/devices/{credential_id}/capabilities` | read | signed desktop writer only + conditional attested subject | `write` |
 | `GET /api/v1/context` | read | reader context + conditional attested subject | — |
 | `GET /api/v1/context/calendar` | read | reader context | — |
 | `GET /api/v1/context/activities` | read | reader context | — |
@@ -435,6 +436,30 @@ caller-supplied subject header. A subject remains an optional additional
 binding only for a separately configured proxy deployment; an invitation bound
 to a subject cannot be redeemed when that attestation is absent. Pairing and
 refresh continue to work without an identity provider on the device.
+
+## Allowing a phone to edit ride RPE
+
+Newly paired devices still receive only `read`. In desktop Settings, each live
+paired device has an **Allow this device to edit rides** toggle. It grants or
+withdraws `annotate`; it never grants `write`. The phone learns its current
+capabilities on context refresh. This grant prepares the capability required
+by the cloud RPE-edit routes; it does not itself add those routes.
+
+`POST /api/v1/devices/{credential_id}/capabilities` accepts exactly
+`{"annotate": true}` or `{"annotate": false}`, up to 256 bytes. It uses the
+signed writer envelope, idempotency key `device-capabilities`, revision `0`,
+and a digest of the entire body. Only a desktop writer carrying `write` may
+call it; even a phone with `write` cannot grant capabilities. Scope comes only
+from that writer. Phone callers and missing, revoked, inactive, writer or
+out-of-scope targets receive the same 404. Invalid signed envelopes receive
+401; invalid bodies receive 400. The public shutdown check runs before auth
+and returns the neutral 503 with `Retry-After: 300`.
+
+The registry updates the device through the CloudAuth backend's etag
+compare-and-set, rechecking its live status and scope on every retry. A
+concurrent revocation cannot be overwritten by a stale grant. The read
+identity already has the CloudAuth update permission, so this needs no Bicep
+change. Deployment and the owner's end-to-end drill are slice S5 of #497.
 
 ## Revoking a lost device
 

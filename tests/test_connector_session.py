@@ -968,3 +968,18 @@ def test_the_refused_api_key_says_only_that_it_refused(client):
     assert response.status_code == 403
     assert "Sign in with your password first." in response.text
     assert "Settings saved." not in response.text
+
+
+def test_a_connector_session_cannot_grant_cloud_annotation(client, monkeypatch):
+    uid, token = _paired(client)
+    calls = []
+    with _connector_window(client, token) as window:
+        sync = window.app.state.cloud_sync
+        monkeypatch.setattr(sync, "set_device_capabilities", lambda *args: (calls.append(args), True)[1])
+        monkeypatch.setattr(sync, "list_devices", lambda *args: [])
+        response = window.post("/settings/cloud/devices/" + "a" * 64 + "/capabilities", data={"annotate": "true"})
+        assert response.status_code == 403
+        assert calls == []
+    response = client.post("/settings/cloud/devices/" + "a" * 64 + "/capabilities", data={"annotate": "true"}, follow_redirects=False)
+    assert response.status_code == 303
+    assert calls == [(uid, "a" * 64, True)]

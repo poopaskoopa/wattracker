@@ -524,6 +524,18 @@ class DesktopCloudSync:
         except Exception:
             return False
 
+    def set_device_capabilities(self, user_id: int, credential_id: str, annotate: bool) -> bool:
+        user_id = self._user_id(user_id)
+        # Withdrawing a grant remains possible even while publication is off.
+        try:
+            capabilities = self._client(user_id).set_device_capabilities(credential_id, annotate)
+            for device in self._devices_cache.get(user_id, []):
+                if device.get("credential_id") == credential_id:
+                    device["capabilities"] = sorted(capabilities)
+            return True
+        except Exception:
+            return False
+
     def wipe_cloud_data(self, user_id: int) -> Optional[bool]:
         """Permanently remove the user's cloud scope, with no blind retry."""
         user_id = self._user_id(user_id)
