@@ -199,3 +199,132 @@ def test_activities_page_shows_linked_and_activity_rpe(client):
     assert response.text.count("RPE 7") == 1
     assert response.text.count("RPE 4") == 1
     assert response.text.count(">Rate</a>") == 1
+
+
+@pytest.mark.parametrize("kind", ["verified_plan", "unverified_plan", "standalone", "unlinked"])
+@pytest.mark.parametrize("workout_rpe", [4, None])
+def test_shared_rpe_target_matches_snapshot_and_setter(client, monkeypatch, kind, workout_rpe):
+    from wattracker import config
+    from wattracker.cloud.snapshot import snapshot_objects
+    from wattracker.ingest import importer
+
+    uid = _register(client)
+    aid = _insert(uid, seconds=600)
+    assert db.set_activity_rpe(uid, aid, 7)
+    wid = None
+    if kind.endswith("plan"):
+        plan = db.create_plan(uid, "RPE", "2026-06-01", 1)
+        xml = '<workout_file><workout><SteadyState Duration="600" Power="0.8"/></workout></workout_file>'
+        wid = db.add_plan_workout(plan, uid, "2026-06-01", "Endurance", "endurance", 600, 20, xml)
+        completed = "2026-06-01" if kind == "verified_plan" else "2026-05-01"
+        assert db.mark_plan_workout_completed(uid, wid, aid, completed)
+        if workout_rpe is not None:
+            assert db.set_plan_workout_rpe(uid, wid, workout_rpe)
+    elif kind == "standalone":
+        wid = db.add_standalone_workout(uid, "rpe", "2026-06-01", "Endurance", "endurance", 600, 20, "{}", 250)
+        assert db.mark_standalone_completed(uid, wid, aid, "2026-06-01", None, None)
+        if workout_rpe is not None:
+            assert db.set_standalone_rpe(uid, wid, workout_rpe)
+    expected_kind = {"verified_plan": "plan", "standalone": "standalone"}.get(kind, "activity")
+    target = importer.resolve_rpe_target(uid, aid)
+    assert target == importer.RpeTarget(expected_kind, wid if expected_kind != "activity" else aid, 7 if expected_kind == "activity" else workout_rpe, expected_kind != "activity")
+    # Snapshot must use its own connection, even when verifying a power profile.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(importer, "db_path", lambda: pytest.fail("default DB path accessed"))
+        scoped.setattr(db, "db_path", lambda: pytest.fail("default DB path accessed"))
+        activity = next(o for o in snapshot_objects(config.db_path(), uid) if o.object_id == f"activity-{aid}")
+    assert activity.data.get("rpe") == target.current
+    assert ("rpe" in activity.data) is (target.current is not None)
+    assert activity.data.get("rpe_tunes_ftp", False) is target.tunes_ftp
+    assert client.get(f"/api/activity/{aid}").json().get("linked_workout", {}).get("rpe_eligible", False) is target.tunes_ftp
+
+    calls = []
+    original_save = importer.save_workout_rpe
+    def save(*args, **kwargs):
+        calls.append(args)
+        return original_save(*args, **kwargs)
+    monkeypatch.setattr(importer, "save_workout_rpe", save)
+    response = client.post(f"/api/activity/{aid}/rpe", json={"rpe": 6})
+    assert response.status_code == 200
+    assert response.json() == {"id": aid, "rpe": 6}
+    assert importer.resolve_rpe_target(uid, aid).current == 6
+    if target.tunes_ftp:
+        assert calls == [(uid, expected_kind, wid, 6)]
+        assert db.get_activity(uid, aid)["rpe"] == 7
+    else:
+        assert calls == []
+        assert db.get_activity(uid, aid)["rpe"] == 6
+
+
+@pytest.mark.parametrize("bad", [True, False, "5", 5.0, None])
+def test_activity_rpe_rejects_non_integer(client, bad):
+    uid = _register(client)
+    aid = _insert(uid)
+    assert client.post(f"/api/activity/{aid}/rpe", json={"rpe": bad}).status_code == 400
+    assert db.get_activity(uid, aid)["rpe"] is None
+
+
+def test_resolver_and_setter_refuse_missing_duplicate_and_other_user(client):
+    from wattracker.ingest import importer
+
+    uid = _register(client)
+    primary = _insert(uid)
+    duplicate = _insert(uid, seconds=900)
+    with db.connect() as conn:
+        conn.execute("UPDATE activities SET duplicate_of=? WHERE id=?", (primary, duplicate))
+    other = db.create_user("other", "unused-password")
+    for user, activity in [(uid, 999999), (uid, duplicate), (other, primary)]:
+        assert importer.resolve_rpe_target(user, activity) is None
+        with pytest.raises(LookupError):
+            importer.set_ride_rpe(user, activity, 5)
+    assert client.post(f"/api/activity/{duplicate}/rpe", json={"rpe": 5}).status_code == 404
+
+
+@pytest.mark.parametrize("bad", [0, 11, True, "5", 5.0, None])
+def test_shared_setter_never_coerces_or_clears(client, bad):
+    from wattracker.ingest import importer
+
+    uid = _register(client)
+    aid = _insert(uid)
+    db.set_activity_rpe(uid, aid, 7)
+    with pytest.raises(ValueError):
+        importer.set_ride_rpe(uid, aid, bad)
+    assert db.get_activity(uid, aid)["rpe"] == 7
+
+
+def test_resolver_tolerates_missing_workout_tables_and_columns():
+    from wattracker.ingest import importer
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.executescript("""
+            CREATE TABLE activities (id INTEGER, user_id INTEGER, rpe INTEGER);
+            INSERT INTO activities VALUES (1, 2, 7);
+            CREATE TABLE plan_workouts (id INTEGER, user_id INTEGER);
+        """)
+        assert importer.resolve_rpe_target(2, 1, conn=conn) == importer.RpeTarget("activity", 1, 7, False)
+    finally:
+        conn.close()
+
+
+def test_connection_verification_uses_timezone_and_corrected_power(client):
+    from wattracker.ingest import importer
+
+    uid = _register(client)
+    aid = _insert(uid, seconds=600, start="2026-06-02T01:00:00")
+    db.save_user_settings(uid, {"timezone": "America/New_York"})
+    plan = db.create_plan(uid, "Timezone", "2026-06-01", 1)
+    xml = '<workout_file><workout><SteadyState Duration="600" Power="0.8"/></workout></workout_file>'
+    wid = db.add_plan_workout(plan, uid, "2026-06-01", "Endurance", "endurance", 600, 20, xml)
+    assert db.mark_plan_workout_completed(uid, wid, aid, "2026-06-01")
+    workout = db.get_plan_workout(uid, wid)
+    assert importer.plan_workout_completion_verified(uid, workout)
+    assert importer.resolve_rpe_target(uid, aid).kind == "plan"
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO power_sample_corrections (user_id, activity_id, start_index, end_index, ftp_basis, created) "
+            "VALUES (?, ?, 0, 599, 250, '2026-06-03')", (uid, aid),
+        )
+    assert not importer.plan_workout_completion_verified(uid, workout)
+    assert importer.resolve_rpe_target(uid, aid).kind == "activity"

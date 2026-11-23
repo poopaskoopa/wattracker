@@ -2575,16 +2575,9 @@ def create_app() -> FastAPI:
             link = db.linked_workout_for_activity(uid, a["id"])
             a["linked_workout"] = link
             if link:
-                if link["kind"] == "plan":
-                    workout = db.get_plan_workout(uid, link["id"])
-                    verified = bool(
-                        workout
-                        and importer.plan_workout_completion_verified(uid, workout)
-                    )
-                else:
-                    verified = True  # standalone links are verified once completed
-                if verified:
-                    a["rpe"] = link["rpe"]
+                target = importer.resolve_rpe_target(uid, a["id"])
+                if target and target.tunes_ftp:
+                    a["rpe"] = target.current
             a["duration_fmt"] = races.format_duration(a.get("duration_s"))
             a["has_duplicate"] = a["id"] in merged
         return _ctx(
@@ -2916,13 +2909,8 @@ def create_app() -> FastAPI:
         # only expose the link when the completion is verified.
         link = db.linked_workout_for_activity(uid, activity_id)
         if link:
-            if link["kind"] == "plan":
-                w = db.get_plan_workout(uid, link["id"])
-                verified = bool(
-                    w and importer.plan_workout_completion_verified(uid, w)
-                )
-            else:
-                verified = True  # standalone links are verified once completed
+            target = importer.resolve_rpe_target(uid, activity_id)
+            verified = bool(target and target.tunes_ftp)
             detail["linked_workout"] = {
                 "kind": link["kind"],
                 "id": link["id"],
@@ -3199,21 +3187,17 @@ def create_app() -> FastAPI:
 
     @app.post("/api/activity/{activity_id}/rpe")
     def api_activity_rpe(
-        request: Request, activity_id: int, rpe: int = Body(..., embed=True)
+        request: Request, activity_id: int, rpe: object = Body(None, embed=True)
     ):
-        """Store a subjective effort rating (1-10) on an unmatched activity."""
+        """Rate the activity or its eligible workout through the shared resolver."""
         uid = _uid(request)
         try:
-            rpe_val = int(rpe)
-        except (TypeError, ValueError):
-            return JSONResponse({"error": "rpe must be an integer"}, status_code=400)
-        if rpe_val < 1 or rpe_val > 10:
-            return JSONResponse(
-                {"error": "rpe must be between 1 and 10"}, status_code=400
-            )
-        if not db.set_activity_rpe(uid, activity_id, rpe_val):
+            target = importer.set_ride_rpe(uid, activity_id, rpe)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except LookupError:
             return JSONResponse({"error": "activity not found"}, status_code=404)
-        return JSONResponse({"id": activity_id, "rpe": rpe_val})
+        return JSONResponse({"id": activity_id, "rpe": target.current})
 
     @app.post("/api/activity/{activity_id}/weight")
     def api_activity_weight(
