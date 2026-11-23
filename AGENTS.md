@@ -193,7 +193,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
    format. It must reuse `CombinedChartSeries`'s x values, and vertical scroll in
    activity detail must keep working. Android is not ported; say so in the PR's `Android:` line.
 
-2. **#498: one shared RPE target resolver + snapshot override fix (Python).**
+2. **#498: one shared RPE target resolver + snapshot override fix (Python). (PR #504)**
    Spec in the issue body. No iOS files, so it can run while #495 is in review.
    Unblocks #494 and #501.
 
