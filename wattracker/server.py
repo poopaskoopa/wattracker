@@ -195,7 +195,7 @@ class _DesktopCloudSyncUnavailable:
         return None
 
     def __getattr__(self, name):
-        if name in {"enroll", "sync_once", "mint_pairing_code", "list_devices", "revoke_device"}:
+        if name in {"enroll", "sync_once", "mint_pairing_code", "list_devices", "revoke_device", "set_device_capabilities"}:
             def unavailable(*args, **kwargs):
                 raise RuntimeError("cloud synchronization is unavailable")
             return unavailable
@@ -5051,6 +5051,29 @@ def create_app() -> FastAPI:
         message = (
             "Paired device revoked."
             if revoked else "Paired device could not be revoked. Try again."
+        )
+        return _cloud_settings_redirect(request, message)
+
+    @app.post("/settings/cloud/devices/{credential_id}/capabilities")
+    def settings_cloud_capabilities(
+        request: Request, credential_id: str, annotate: str = Form("")
+    ):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        if _from_connector(request):
+            return _refuse_connector_session(request, uid)
+        if annotate not in {"true", "false"}:
+            return PlainTextResponse("Invalid annotation setting", status_code=400)
+        sync = getattr(app.state, "cloud_sync")
+        try:
+            changed = sync.set_device_capabilities(uid, credential_id, annotate == "true")
+            sync.list_devices(uid)
+        except Exception:
+            changed = False
+        message = (
+            "Paired device permissions updated." if changed
+            else "Paired device permissions could not be updated. Try again."
         )
         return _cloud_settings_redirect(request, message)
 

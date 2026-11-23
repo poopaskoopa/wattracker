@@ -203,7 +203,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
    route, and the plan and standalone RPE routes refuse connector sessions. Flag the PR for
    security review.
 
-4. **#499: cloud `annotate` device capability, desktop-only grant (Python).**
+4. **#499: cloud `annotate` device capability, desktop-only grant (Python). (PR #505)**
    Spec in the issue body. Security review required. Independent of 1-3, so take
    it whenever the items above are waiting on review.
 

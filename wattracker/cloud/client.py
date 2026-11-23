@@ -40,6 +40,7 @@ WIPE_PATH = "/api/v1/account/wipe"
 PAIRING_IDEMPOTENCY_KEY = "device-pairing-code"
 DEVICE_LIST_IDEMPOTENCY_KEY = "device-list"
 DEVICE_REVOKE_IDEMPOTENCY_KEY = "device-revoke"
+DEVICE_CAPABILITIES_IDEMPOTENCY_KEY = "device-capabilities"
 WIPE_IDEMPOTENCY_KEY = "account-wipe"
 OFFLINE_MESSAGE = "Cloud sync offline — local data and features are unaffected."
 SYNC_ENDPOINT_NOT_CONFIGURED = "Cloud sync endpoint is not configured."
@@ -469,6 +470,31 @@ class CloudSyncClient:
         )
         status, payload = self._request("POST", path, b"", headers=headers)
         return status == 200 and payload.get("revoked") is True
+
+    def set_device_capabilities(self, credential_id: str, annotate: bool) -> frozenset[str]:
+        """Set one phone's annotation grant using a signed writer request."""
+        if not isinstance(credential_id, str) or not _CREDENTIAL_ID_RE.fullmatch(credential_id):
+            raise ValueError("credential_id is invalid")
+        if type(annotate) is not bool:
+            raise ValueError("annotate must be a boolean")
+        path = DEVICES_PATH + "/" + credential_id + "/capabilities"
+        body = json.dumps({"annotate": annotate}, separators=(",", ":")).encode()
+        headers = self._signed_headers(
+            "POST", path, body,
+            idempotency_key=DEVICE_CAPABILITIES_IDEMPOTENCY_KEY, revision=0,
+        )
+        status, payload = self._request("POST", path, body, headers=headers)
+        expected = frozenset({"read", "annotate"} if annotate else {"read"})
+        values = payload.get("capabilities")
+        if (
+            status != 200 or set(payload) != {"credential_id", "capabilities"}
+            or payload.get("credential_id") != credential_id
+            or not isinstance(values, list)
+            or any(not isinstance(value, str) or value not in {"read", "write", "annotate"} for value in values)
+            or len(values) != len(set(values)) or frozenset(values) != expected
+        ):
+            raise CloudEnrollmentError("device capabilities request failed")
+        return expected
 
     def wipe_scope(self) -> Optional[bool]:
         """Request one irreversible wipe without retrying an ambiguous result.

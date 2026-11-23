@@ -265,6 +265,17 @@
     <table><thead><tr><th>Paired device</th><th></th></tr></thead><tbody>
     {% for device in cloud_sync.devices %}
       <tr><td>{{ device.label or device.id or device.credential_id }}</td><td>
+        {% if not device.revoked %}
+        <form method="post" action="/settings/cloud/devices/{{ device.id or device.credential_id }}/capabilities">
+          <label><input type="checkbox" name="annotate" value="true"
+                        {% if 'annotate' in (device.capabilities or []) %}checked{% endif %}
+                        onchange="this.form.querySelector('[name=annotate][type=hidden]').disabled = this.checked; this.form.requestSubmit()">
+            Allow this device to edit rides</label>
+          <input type="hidden" name="annotate" value="false"
+                 {% if 'annotate' in (device.capabilities or []) %}disabled{% endif %}>
+          <p class="hint">Lets this phone or tablet set RPE on rides from the last 30 days.</p>
+        </form>
+        {% endif %}
         <form method="post" action="/settings/cloud/devices/{{ device.id or device.credential_id }}/revoke">
           <button type="submit" class="danger-btn">Revoke</button>
         </form>

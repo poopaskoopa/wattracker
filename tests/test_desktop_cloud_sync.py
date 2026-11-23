@@ -1283,3 +1283,36 @@ def test_disabled_scheduler_round_publishes_nothing(tmp_path):
     assert status.retry == 0
     assert status.last_error is None
     assert status.last_success is None
+
+
+@pytest.mark.parametrize("annotate", [True, False])
+def test_device_capabilities_update_cache_while_publication_disabled(tmp_path, annotate):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    credentials = _credentials()
+    captured = []
+    capabilities = ["annotate", "read"] if annotate else ["read"]
+    def transport(url, headers, body, method):
+        captured.append((url, headers, body, method))
+        return 200, json.dumps({"credential_id": "b" * 64, "capabilities": capabilities}).encode()
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    sync = DesktopCloudSync(str(path), store, transport=transport)
+    db.save_cloud_sync_state(user_id, {"read_endpoint": "https://cloud.example", "enabled": False}, path=str(path))
+    sync._devices_cache[user_id] = [{"credential_id": "b" * 64, "capabilities": ["read"]}]
+    assert sync.set_device_capabilities(user_id, "b" * 64, annotate)
+    assert sync.status(user_id).devices[0]["capabilities"] == capabilities
+    assert len(captured) == 1
+    assert captured[0][0] == "https://cloud.example/api/v1/devices/" + "b" * 64 + "/capabilities"
+    assert json.loads(captured[0][2]) == {"annotate": annotate}
+
+
+def test_device_capability_failure_does_not_change_cached_grant(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    credentials = _credentials()
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    sync = DesktopCloudSync(str(path), store, transport=lambda *args: (404, b'{}'))
+    db.save_cloud_sync_state(user_id, {"read_endpoint": "https://cloud.example", "enabled": False}, path=str(path))
+    sync._devices_cache[user_id] = [{"credential_id": "b" * 64, "capabilities": ["read", "annotate"]}]
+    assert not sync.set_device_capabilities(user_id, "b" * 64, False)
+    assert sync.status(user_id).devices[0]["capabilities"] == ["read", "annotate"]

@@ -86,6 +86,8 @@ _DEVICE_LIST_IDEMPOTENCY_KEY = "device-list"
 _DEVICE_LIST_REVISION = 0
 _DEVICE_REVOKE_IDEMPOTENCY_KEY = "device-revoke"
 _DEVICE_REVOKE_REVISION = 0
+_DEVICE_CAPABILITIES_IDEMPOTENCY_KEY = "device-capabilities"
+_MAX_DEVICE_CAPABILITIES_BODY_BYTES = 256
 _MAX_DEVICE_ADMIN_BODY_BYTES = 4 * 1024
 # A wipe carries no caller-selected data.  Its fixed signed envelope prevents
 # a request body, header, or path segment from becoming a scope selector.
@@ -1709,6 +1711,50 @@ def create_cloud_app(
             return Response(
                 body_bytes,
                 media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @app.post("/api/v1/devices/{credential_id}/capabilities")
+        async def set_device_capabilities(request: Request, credential_id: str) -> Response:
+            """Only the desktop writer may grant or withdraw phone annotation."""
+            _require_public_api_for_device_or_reader(state)
+            try:
+                credential = _writer_auth(
+                    state, request, capability="write", writer_only=True
+                )
+            except HTTPException as exc:
+                if exc.status_code == 401:
+                    return _not_found()
+                raise
+            try:
+                body = await _bounded_body(request, _MAX_DEVICE_CAPABILITIES_BODY_BYTES)
+            except HTTPException:
+                return _error(400, "invalid capabilities request")
+            verified = _verified_scope(
+                state, request, credential, body,
+                idempotency_key=_DEVICE_CAPABILITIES_IDEMPOTENCY_KEY,
+                revision=0,
+            )
+            if verified is None:
+                return _error(401, "writer authorization required")
+            try:
+                payload = json.loads(body)
+            except (ValueError, UnicodeError):
+                return _error(400, "invalid capabilities request")
+            if (
+                not isinstance(payload, dict) or set(payload) != {"annotate"}
+                or type(payload["annotate"]) is not bool
+            ):
+                return _error(400, "invalid capabilities request")
+            namespace, scope = verified
+            capabilities = frozenset({"read", "annotate"} if payload["annotate"] else {"read"})
+            outcome = state.credentials.set_device_capabilities_in_scope(
+                credential_id, namespace, scope, capabilities
+            )
+            if outcome is None:
+                return _not_found()
+            return JSONResponse(
+                {"credential_id": credential_id, "capabilities": sorted(outcome)},
                 headers={"Cache-Control": "no-store"},
             )
 

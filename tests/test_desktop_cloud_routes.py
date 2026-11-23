@@ -50,6 +50,9 @@ class FakeSync:
     def revoke_device(self, uid, credential_id):
         self.calls.append(("revoke", credential_id))
         return self.revoke_result
+    def set_device_capabilities(self, uid, credential_id, annotate):
+        self.calls.append(("capabilities", credential_id, annotate))
+        return True
     def wipe_cloud_data(self, uid):
         self.calls.append(("wipe", uid))
         return self.wipe_result
@@ -301,7 +304,7 @@ def test_sync_route_only_queues(client):
 @pytest.mark.parametrize("path", [
     "/settings/cloud", "/settings/cloud/sync",
     "/settings/cloud/pairing", "/settings/cloud/devices",
-    "/settings/cloud/wipe",
+    "/settings/cloud/wipe", "/settings/cloud/devices/device-1/capabilities",
 ])
 def test_cloud_state_changes_require_same_origin(client, path):
     web, sync = client
@@ -581,3 +584,41 @@ def test_pairing_and_sync_stay_gated_while_disabled(cold_disabled_cloud):
     assert web.post("/settings/cloud/sync", follow_redirects=False).status_code == 303
     assert sync.sync_once(uid) == []
     assert captured == []
+
+
+@pytest.mark.parametrize("annotate", ["true", "false"])
+def test_desktop_capability_route_submits_boolean_and_refreshes(client, annotate):
+    web, sync = client
+    response = web.post("/settings/cloud/devices/device-1/capabilities", data={"annotate": annotate})
+    assert response.status_code == 200
+    assert "Paired device permissions updated." in response.text
+    assert ("capabilities", "device-1", annotate == "true") in sync.calls
+    assert any(call[0] == "list" for call in sync.calls)
+
+
+@pytest.mark.parametrize("annotate", ["", "1", "on", "no"])
+def test_desktop_capability_route_rejects_non_boolean_form(client, annotate):
+    web, sync = client
+    response = web.post("/settings/cloud/devices/device-1/capabilities", data={"annotate": annotate})
+    assert response.status_code == 400
+    assert not sync.calls
+
+
+def test_device_annotation_toggle_reflects_grant_and_omits_revoked_devices(client):
+    import re
+    web, sync = client
+    sync.state["devices"] = [
+        {"credential_id": "a" * 64, "capabilities": ["read"], "label": "Read only"},
+        {"credential_id": "b" * 64, "capabilities": ["read", "annotate"], "label": "Editor"},
+        {"credential_id": "c" * 64, "capabilities": ["read", "annotate"], "label": "Gone", "revoked": True},
+    ]
+    page = web.get("/settings").text
+    for device_id, granted in [("a", False), ("b", True)]:
+        action = f'action="/settings/cloud/devices/{device_id * 64}/capabilities"'
+        assert action in page
+        form = page.split(action, 1)[1].split("</form>", 1)[0]
+        checkbox = re.search(r'<input type="checkbox"[^>]*>', form).group()
+        assert bool(re.search(r"\schecked(?:\s|>|=)", checkbox)) is granted
+        assert "Allow this device to edit rides" in form
+        assert "Lets this phone or tablet set RPE on rides from the last 30 days." in form
+    assert f'action="/settings/cloud/devices/{"c" * 64}/capabilities"' not in page

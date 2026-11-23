@@ -3474,6 +3474,63 @@ class CredentialRegistry:
             )
             return True
 
+    def set_device_capabilities_in_scope(
+        self,
+        credential_id: str,
+        namespace: str,
+        local_user_scope: str,
+        capabilities: frozenset[str],
+    ) -> frozenset[str] | None:
+        """Replace a live phone's capabilities without racing a revocation.
+
+        The backend retries the transform against the current etag. A refusal
+        raises out of the transform, so no row is created or rewritten. In
+        particular, a retry after a concurrent revoke cannot restore its old
+        active state. Writer rows are never considered device rows.
+        """
+        if not isinstance(capabilities, frozenset) or capabilities not in (
+            frozenset({"read"}), frozenset({"read", "annotate"}),
+        ):
+            raise ValueError("invalid device capabilities")
+        if not isinstance(credential_id, str) or not _HEX_ID_RE.fullmatch(credential_id):
+            return None
+        try:
+            namespace_text = _require_namespace(namespace)
+            scope_text = _require_local_scope(local_user_scope)
+        except (TypeError, ValueError):
+            return None
+
+        class Refused(Exception):
+            pass
+
+        def transform(value):
+            if value is None:
+                raise Refused
+            try:
+                credential = _device_from_value(credential_id, value)
+            except (KeyError, TypeError, ValueError):
+                raise Refused from None
+            if (
+                credential.revoked or not credential.active
+                or not hmac.compare_digest(credential.namespace, namespace_text)
+                or not hmac.compare_digest(credential.local_user_scope, scope_text)
+            ):
+                raise Refused
+            return _device_value(replace(credential, capabilities=capabilities))
+
+        with self._lock:
+            digest = self._credential_digest(credential_id)
+            try:
+                if self._backend is not None:
+                    value = self._backend.update("device", digest.hex(), transform)
+                else:
+                    credential = self._find_device_locked(credential_id)
+                    value = transform(None if credential is None else _device_value(credential))
+            except Refused:
+                return None
+            self._devices[digest] = _device_from_value(credential_id, value)
+            return self._devices[digest].capabilities
+
     def list_devices_for_scope(
         self,
         namespace: str,
