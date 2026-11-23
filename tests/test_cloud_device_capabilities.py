@@ -71,7 +71,8 @@ def test_target_refusals_are_identical_and_leave_state_unchanged(deployment, kin
     if kind == "revoked":
         deployment.state.credentials.revoke_device(target)
     elif kind == "inactive":
-        registry = deployment.state.credentials
+        # An inactive, unrevoked row violates DeviceCredential's invariant;
+        # this covers refusal to decode corrupt state, not a live status.
         key = hashlib.sha256(target.encode()).hexdigest()
         value = deployment.backend.read("device", key)
         value["active"] = False
@@ -97,6 +98,21 @@ def test_strict_bounded_body(deployment, body):
     response = _post(deployment, writer, device.credential_id, body=body)
     assert response.status_code == 400, response.text
     assert deployment.state.credentials.lookup_device(device.credential_id).capabilities == {"read"}
+
+
+@pytest.mark.parametrize("size, status", [(256, 200), (257, 400)])
+def test_valid_signed_body_obeys_256_byte_boundary(deployment, size, status):
+    writer = _rider(deployment)
+    device, _ = _device(deployment, writer)
+    body = b'{"annotate":true}'.ljust(size, b" ")
+    assert len(body) == size
+    assert json.loads(body) == {"annotate": True}
+
+    response = _post(deployment, writer, device.credential_id, body=body)
+
+    assert response.status_code == status, response.text
+    expected = {"read", "annotate"} if status == 200 else {"read"}
+    assert deployment.state.credentials.lookup_device(device.credential_id).capabilities == expected
 
 
 @pytest.mark.parametrize("failure", ["signature", "stale", "replay", "idem", "revision", "body"])
