@@ -84,6 +84,16 @@ final class DashboardModel {
     }
 
     private(set) var state: State = .starting
+    /// The newest rides for the dashboard strip. Read from the activities
+    /// route, not the dashboard's (which carries no `activity` objects), so a
+    /// failure here never takes the dashboard down with it.
+    private(set) var recentRides: [RideSummary] = []
+    static let recentRideLimit = 5
+    /// The session `recentRides` came from. The strip is scoped to it.
+    @ObservationIgnored private var ridesSession: (any ReadSession)?
+    /// Bumped by every `start`, so a read a newer start has superseded drops
+    /// its answer instead of overwriting the newer one's.
+    @ObservationIgnored private var requestGeneration = 0
     var selectedWindow: LoadWindow = .sixWeeks
     let wake = CloudWakeNotice()
 
@@ -101,21 +111,39 @@ final class DashboardModel {
     /// holding one that still believes it is paired, rendering a signed-out
     /// rider's numbers until something forces a reload.
     func start(session: (any ReadSession)?, userInitiated: Bool = false) async {
+        requestGeneration += 1
+        let generation = requestGeneration
         state = .starting
         // No session means the gate has not produced one: no credential yet,
         // or the signing key could not be read. Both are the shell's to
         // explain, and neither is a dashboard this screen can fill.
         guard let session else {
             state = .unpaired
+            recentRides = []
+            ridesSession = nil
             return
         }
 
-        switch await session.deviceState {
+        // The view keeps this model while `.task(id: gate.backend)` restarts
+        // it on a backend switch, so the strip must be cleared here, before
+        // anything of the new backend's is shown. Otherwise a new backend
+        // with no activities cache and a failed activities read would show
+        // its own metrics beside the previous backend's rides.
+        if !Self.isSameSession(ridesSession, session) {
+            recentRides = []
+            ridesSession = session
+        }
+
+        let deviceState = await session.deviceState
+        guard generation == requestGeneration else { return }
+        switch deviceState {
         case .unpaired:
             state = .unpaired
+            recentRides = []
             return
         case .removed:
             state = .removed
+            recentRides = []
             return
         case .paired:
             break
@@ -127,16 +155,25 @@ final class DashboardModel {
         if let cached = session.cached(.dashboard) {
             apply(cached)
         }
+        applyRecentRides(session.cached(.activities))
 
         if userInitiated { await session.retryNowIfWaking() }
         do {
-            apply(try await wake.during(session) { try await session.load(.dashboard) })
+            let dashboard = try await wake.during(session) { try await session.load(.dashboard) }
+            guard generation == requestGeneration else { return }
+            apply(dashboard)
+            await refreshRecentRides(session, generation: generation)
         } catch let failure as CloudSession.Failure {
+            // A read that a newer start has superseded (a backend switch, or
+            // a later refresh) must not touch what that newer start shows.
+            guard generation == requestGeneration else { return }
             switch failure {
             case .notPaired:
                 state = .unpaired
+                recentRides = []
             case .deviceRemoved:
                 state = .removed
+                recentRides = []
             default:
                 // A cached, usable dashboard remains visible if the refresh
                 // fails for an ordinary network reason. The session normally
@@ -147,9 +184,53 @@ final class DashboardModel {
                 state = .error(failure.description)
             }
         } catch {
+            guard generation == requestGeneration else { return }
             if case .ready = state { return }
             state = .error(error.localizedDescription)
         }
+    }
+
+    /// Best effort: the strip is a bonus on top of a dashboard that has
+    /// already loaded. An ordinary failure leaves whatever rides are showing,
+    /// which are always this session's (`start` clears them on a switch);
+    /// a revoked or unpaired device clears them with the rest of the screen.
+    private func refreshRecentRides(_ session: any ReadSession, generation: Int) async {
+        do {
+            let activities = try await session.load(.activities)
+            guard generation == requestGeneration else { return }
+            applyRecentRides(activities)
+        } catch let failure as CloudSession.Failure {
+            guard generation == requestGeneration else { return }
+            switch failure {
+            case .notPaired:
+                state = .unpaired
+                recentRides = []
+            case .deviceRemoved:
+                state = .removed
+                recentRides = []
+            default:
+                break
+            }
+        } catch {}
+    }
+
+    private func applyRecentRides(_ snapshot: CloudSnapshot?) {
+        guard let snapshot else { return }
+        recentRides = Self.recentRides(from: snapshot)
+    }
+
+    /// Both production sessions (`CloudSession`, `LocalSession`) are actors,
+    /// so this is object identity. The model holds the session it compares
+    /// against, so a deallocated session's address cannot be reused by a new
+    /// one and pass as the same. A value-type conformer would never compare
+    /// equal, which only costs a refresh its strip, never shows a stale one.
+    private static func isSameSession(_ lhs: (any ReadSession)?, _ rhs: any ReadSession) -> Bool {
+        guard let lhs else { return false }
+        return (lhs as AnyObject) === (rhs as AnyObject)
+    }
+
+    static func recentRides(from snapshot: CloudSnapshot) -> [RideSummary] {
+        Array(RideSummary.newestFirst(snapshot.items).prefix(recentRideLimit))
     }
 
     private func apply(_ snapshot: CloudSnapshot) {
@@ -285,6 +366,16 @@ struct DashboardData: Sendable, Equatable {
         }
     }
 
+    /// One positive, finite TSS day per load point, ready to draw as a bar.
+    /// Zero, negative, missing and non-finite days draw nothing, as on Android.
+    static func tssBars(_ points: [LoadPoint]) -> [(date: Date, tss: Double)] {
+        points.compactMap { point in
+            guard let date = date(point.date), let tss = point.tss,
+                  tss.isFinite, tss > 0 else { return nil }
+            return (date, tss)
+        }
+    }
+
     /// Parse both the date-only load-point wire value and the timestamp shape
     /// used by the other cloud collections. The formatter is local to the
     /// call because DateFormatter is mutable and the screen may map data from
@@ -414,7 +505,67 @@ private struct DashboardContent: View {
                     )
                 }
             }
+
+            if !model.recentRides.isEmpty {
+                RecentRidesStrip(rides: model.recentRides)
+            }
         }
+    }
+}
+
+/// What one Recent rides row prints. Pure so the strings are testable without
+/// a view. The date goes through `RideFormatting.date`, which parses the
+/// timestamp, rather than slicing the first ten characters of it.
+struct RecentRideLine: Equatable {
+    let date: String
+    let detail: String
+    let load: String
+
+    init(_ summary: ActivitySummary) {
+        date = RideFormatting.date(summary.startTime)
+        detail = RideFormatting.duration(summary.durationS)
+            + " · " + RideFormatting.distance(summary.distanceM)
+        var parts: [String] = []
+        if let np = summary.np, np.isFinite { parts.append(RideFormatting.watts(np) + " NP") }
+        if let tss = summary.tss, tss.isFinite { parts.append(RideFormatting.decimal(tss, 0) + " TSS") }
+        load = parts.joined(separator: " · ")
+    }
+}
+
+private struct RecentRidesStrip: View {
+    let rides: [RideSummary]
+
+    var body: some View {
+        Panel {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Recent rides")
+                    .font(.headline)
+                    .foregroundStyle(Palette.textBright)
+                ForEach(rides) { ride in
+                    let line = RecentRideLine(ride.summary)
+                    HStack(alignment: .center, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(line.date)
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(Palette.textBright)
+                            Text(line.detail)
+                                .font(.caption)
+                                .foregroundStyle(Palette.muted)
+                        }
+                        Spacer(minLength: 8)
+                        Text(line.load)
+                            .font(.footnote.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(Palette.accent)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(Palette.surfaceInset, in: RoundedRectangle(cornerRadius: 6))
+                    .accessibilityElement(children: .combine)
+                }
+            }
+        }
+        .accessibilityIdentifier("dashboard-recent-rides")
     }
 }
 
@@ -482,9 +633,12 @@ private struct LoadSeriesPoint: Identifiable {
         case ctl = "CTL"
         case atl = "ATL"
         case tsb = "TSB"
+        /// Daily training stress, drawn as bars under the lines.
+        case tss = "TSS"
 
         var color: Color {
             switch self {
+            case .tss: return Palette.muted.opacity(0.25)
             case .ctl: return Color(hex: 0x1baf7a)
             case .atl: return Color(hex: 0xc98500)
             case .tsb: return Color(hex: 0x3987e5)
@@ -501,6 +655,8 @@ private struct LoadSeriesPoint: Identifiable {
 private struct LoadChart: View {
     let points: [LoadPoint]
     @Binding var window: LoadWindow
+
+    private var bars: [(date: Date, tss: Double)] { DashboardData.tssBars(points) }
 
     private var series: [LoadSeriesPoint] {
         points.flatMap { point -> [LoadSeriesPoint] in
@@ -551,16 +707,27 @@ private struct LoadChart: View {
                     .frame(maxWidth: 360)
                 }
 
-                if series.isEmpty {
+                if series.isEmpty && bars.isEmpty {
                     EmptyChart(message: "No load history yet")
                 } else {
-                    Chart(series) { point in
-                        LineMark(
-                            x: .value("Date", point.date),
-                            y: .value("Load", point.value)
-                        )
-                        .foregroundStyle(by: .value("Series", point.metric.rawValue))
-                        .interpolationMethod(.linear)
+                    Chart {
+                        // Bars first so the lines draw over them. One chart,
+                        // one y axis: a 250-TSS day sets the top of the axis.
+                        ForEach(bars, id: \.date) { bar in
+                            BarMark(
+                                x: .value("Date", bar.date, unit: .day),
+                                y: .value("Load", bar.tss)
+                            )
+                            .foregroundStyle(by: .value("Series", LoadSeriesPoint.Metric.tss.rawValue))
+                        }
+                        ForEach(series) { point in
+                            LineMark(
+                                x: .value("Date", point.date),
+                                y: .value("Load", point.value)
+                            )
+                            .foregroundStyle(by: .value("Series", point.metric.rawValue))
+                            .interpolationMethod(.linear)
+                        }
                     }
                     .chartForegroundStyleScale(
                         domain: LoadSeriesPoint.Metric.allCases.map(\.rawValue),
