@@ -194,11 +194,15 @@ class KeystoreDeviceCredentialStoreTest {
         assertEquals(device, store.load())
         assertEquals(local, store.loadLocal())
         assertEquals("a healthy vault is not an unhealthy store", StoreHealth.Durable, store.health)
+        assertFalse("and no member is unreadable", store.cloudMemberUnparsed)
+        assertFalse(store.localMemberUnparsed)
 
         // A second store on the same file is what a relaunch is.
         val relaunched = storeOn(file)
         assertEquals(device, relaunched.load())
         assertEquals(local, relaunched.loadLocal())
+        assertFalse(relaunched.cloudMemberUnparsed)
+        assertFalse(relaunched.localMemberUnparsed)
     }
 
     @Test
@@ -579,6 +583,10 @@ class KeystoreDeviceCredentialStoreTest {
         // would read as "looked and found nothing" and one such launch would
         // delete the rider's stored choice for that backend (#484 review, 2).
         assertEquals("an unparsed member leaves that backend unconcluded", StoreHealth.Unread, store.health)
+        // The per-member flags: the cloud member is unreadable, the desktop
+        // one is served -- one flag per member, not one flag for the vault.
+        assertTrue("the unreadable member is flagged", store.cloudMemberUnparsed)
+        assertFalse("and the served one is not", store.localMemberUnparsed)
 
         store.saveLocal(local.copy(token = "connector-SECRET-new"))
         val rewritten = file.readText(Charsets.UTF_8)
@@ -587,6 +595,8 @@ class KeystoreDeviceCredentialStoreTest {
             rewritten.contains("\"signing_namespace\":\"ns-1\""),
         )
         assertTrue("and the written one is the new value", rewritten.contains("connector-SECRET-new"))
+        assertTrue("and the cloud member stays unreadable", store.cloudMemberUnparsed)
+        assertFalse("and the desktop member reads cleanly", store.localMemberUnparsed)
     }
 
     // MARK: - Writes

@@ -20,10 +20,10 @@ import com.wattracker.android.cloud.LocalClient
 import com.wattracker.android.cloud.LocalCredentials
 import com.wattracker.android.cloud.ReadModel
 import com.wattracker.android.cloud.RemoveDeviceResult
+import com.wattracker.android.cloud.SelectionGuard
 import com.wattracker.android.cloud.SharedPreferencesRemovalGate
 import com.wattracker.android.cloud.decideStartupSelection
-import com.wattracker.android.cloud.observeCloudBackend
-import com.wattracker.android.cloud.observeLocalBackend
+import com.wattracker.android.cloud.launchObservations
 import com.wattracker.android.cloud.resolveBackend
 import com.wattracker.android.cloud.StoreHealth
 import kotlinx.coroutines.CancellationException
@@ -76,15 +76,16 @@ object WatTrackerApp {
 
     private val _selectionFlow = MutableStateFlow(BackendSelection.Automatic)
 
-    /** Guards [selectionGeneration]. */
-    private val selectionLock = Any()
-
     /**
-     * Bumped on every [setSelection]. [applySelection] drops a resolve whose
-     * generation moved under it, so an IO-thread refresh cannot write a backend
-     * the rider has already replaced.
+     * The generation the rider's choice carries, and the guarded write.
+     * [SelectionGuard.snapshot] reads the counter and the selection together,
+     * so no resolve can capture a pre-change selection under a post-change
+     * generation (the #484 review's finding B); [SelectionGuard.dropIfStale]
+     * drops a resolve whose generation moved under it, so an IO-thread refresh
+     * cannot write a backend the rider has already replaced.
      */
-    private var selectionGeneration = 0
+    private val selectionGuard = SelectionGuard()
+
 
     /** What the rider asked for. It is not what the screens read. */
     val selectionFlow: StateFlow<BackendSelection> = _selectionFlow.asStateFlow()
@@ -178,9 +179,11 @@ object WatTrackerApp {
      * first run. Only an explicit backend is persisted.
      */
     fun setSelection(context: Context, selection: BackendSelection) {
-        // Bumped before the flow is written, so any resolve already in flight on
-        // an IO thread is stale the moment it reads the counter back.
-        synchronized(selectionLock) { selectionGeneration += 1 }
+        // The guard bumps the generation and records the selection under one
+        // lock, the same lock [applySelection]'s snapshot reads under, so a
+        // resolve cannot capture a generation under one selection and write
+        // under the next (the #484 review's finding B).
+        selectionGuard.set(selection)
         _selectionFlow.value = selection
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         if (selection.isOverride) {
@@ -211,27 +214,24 @@ object WatTrackerApp {
      * Called from the init dispatcher, from the main thread on a Settings
      * change, and from the IO context of a pairing or removal.
      *
-     * A resolve reads the selection, then two pairing flags, then writes. On the
-     * IO thread that sequence can straddle a main-thread [setSelection]: an
-     * `Automatic` refresh that read `Local` just before the rider chose `Cloud`
-     * would write `Local` afterwards, and because [refreshBackend] returns early
-     * once an override is set, nothing would correct it until the next restart.
+     * The selection and the generation are read together, under the lock, and
+     * the generation is checked against the same lock before the write. That
+     * is what closes the window: an IO-thread resolve captures the generation
+     * and the selection it must decide from, a main-thread [setSelection]
+     * lands and bumps the counter, and the stale resolve drops its result
+     * instead of writing the selection the rider just replaced. Reading the
+     * selection outside the lock would let a resolve capture the pre-change
+     * selection under the post-change generation and pass the check.
      * iOS guards the same window with `selectionGeneration` (the #298/#308 fix).
-     * So the generation is captured first and checked before the write: a stale
-     * resolve drops its result instead of overwriting the newer one. No screen
-     * reads a torn value either way, because each writes one complete
-     * [DataSource] into a `StateFlow`.
+     * Each write is one complete [DataSource], so no screen reads a torn value.
      */
     private fun applySelection() {
-        val generation = synchronized(selectionLock) { selectionGeneration }
-        val resolved = resolveBackend(
-            _selectionFlow.value,
-            session?.isPaired == true,
-            localClient?.isPaired == true,
-        )
-        synchronized(selectionLock) {
-            if (selectionGeneration != generation) return
-            _dataSourceFlow.value = resolved
+        selectionGuard.dropIfStale(selectionGuard.snapshot()) { selection ->
+            _dataSourceFlow.value = resolveBackend(
+                selection,
+                session?.isPaired == true,
+                localClient?.isPaired == true,
+            )
         }
     }
 
@@ -349,6 +349,11 @@ object WatTrackerApp {
         val storedOverride = storedName?.let { name ->
             BackendSelection.entries.firstOrNull { it.name == name && it.isOverride }
         }
+        // The generation the startup decision is allowed to write under: the
+        // snapshot the stored preference was captured under. If a Settings
+        // write lands before the tail of this function runs, the counter moves
+        // past this and the write below is dropped instead of overwriting it.
+        val startupSnapshot = selectionGuard.snapshot()
 
         val db = openDatabase(context)
         val credentials = openCredentialStore(context)
@@ -417,12 +422,21 @@ object WatTrackerApp {
         // built, and a vault the Keystore would not open, are `Unknown` rather
         // than `Unpaired`: nothing saw them, so nothing proved the stored choice
         // wrong, and a bad launch must not delete a rider's pick.
-        val cloudObservation = observeCloudBackend(
-            sessionBuilt = cloudSession != null,
-            paired = cloudSession?.isPaired == true,
-            vaultHealth = credentials.health,
+        //
+        // The pairing flags are read first and the vault health after them:
+        // `local.isPaired` triggers the vault's first read, so passing
+        // `credentials.health` as a plain argument would report `Durable`
+        // from before that read, and a launch whose signer failed to build
+        // (no session, nothing read yet) would see the desktop as a seen-
+        // unpaired backend and delete a stored `Local` choice.
+        val observations = launchObservations(
+            cloudSessionBuilt = cloudSession != null,
+            cloudPaired = { cloudSession?.isPaired == true },
+            localPaired = { local.isPaired },
+            vaultHealth = { credentials.health },
+            cloudMemberUnparsed = { credentials.cloudMemberUnparsed },
+            localMemberUnparsed = { credentials.localMemberUnparsed },
         )
-        val localObservation = observeLocalBackend(vaultHealth = credentials.health, paired = local.isPaired)
 
         // An override for a backend that was *seen* unpaired is dropped here,
         // once, so it cannot pin the app to a pairing screen while the other
@@ -431,13 +445,21 @@ object WatTrackerApp {
         // recognise: it can only have been edited by hand, and leaving it would
         // mean re-reading the same garbage every launch. The decision is
         // [decideStartupSelection]'s so a mutation in this wiring is not silent.
-        val startup = decideStartupSelection(storedName, storedOverride, cloudObservation, localObservation)
-        if (startup.deleteStoredPreference) prefs.edit().remove(KEY_BACKEND_OVERRIDE).apply()
-        _selectionFlow.value = startup.selection
-        // Through the same guarded path as a Settings change: the init
-        // dispatcher is not the main thread, and a rider who opens Settings
-        // before this lands must not have their choice overwritten by it.
-        applySelection()
+        val startup = decideStartupSelection(storedName, storedOverride, observations.cloud, observations.local)
+
+        // Nothing may be written over a choice the rider made after the pref
+        // read above: the startup decision was computed from that read, and a
+        // Settings write in between made a new choice the decision neither
+        // saw nor should override. The generation is the honest check for it
+        // -- a Settings write bumps it, and so the snapshot this decision was
+        // computed under no longer matches. The guarded write is the same one
+        // every Settings change uses, and the flow write stays consistent
+        // with the counter bump.
+        val applied = selectionGuard.dropIfStale(startupSnapshot) {
+            if (startup.deleteStoredPreference) prefs.edit().remove(KEY_BACKEND_OVERRIDE).apply()
+            _selectionFlow.value = startup.selection
+        }
+        if (applied) applySelection()
     }
 
     private fun openDatabase(context: Context): WatTrackerDatabase {

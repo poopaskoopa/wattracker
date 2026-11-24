@@ -39,6 +39,21 @@ interface DeviceCredentialStore {
      */
     val health: StoreHealth
         get() = StoreHealth.Durable
+
+    /**
+     * True when the cloud member is on disk but this build could not parse it.
+     * The file was read and the envelope opened -- the pairing is sitting
+     * there, it is only this build that cannot read it -- so each backend gets
+     * its own answer rather than the whole vault. `health` answers the same
+     * question for both halves; this is the per-member half a startup
+     * observation needs.
+     */
+    val cloudMemberUnparsed: Boolean
+        get() = false
+
+    /** The local-credentials half of [cloudMemberUnparsed]. */
+    val localMemberUnparsed: Boolean
+        get() = false
 }
 
 /** What a store promises about the next launch. */
@@ -88,6 +103,11 @@ class InMemoryDeviceCredentialStore : DeviceCredentialStore {
 
     /** A pairing made here lasts one launch, which is what [StoreHealth.Unavailable] means. */
     override val health: StoreHealth get() = StoreHealth.Unavailable
+
+    // Nothing on disk to be unreadable, and nothing raw kept: the in-memory
+    // store holds parsed values or nothing.
+    override val cloudMemberUnparsed: Boolean get() = false
+    override val localMemberUnparsed: Boolean get() = false
 
     override fun load(): PairedDevice? = stored
     override fun save(device: PairedDevice) {
@@ -198,6 +218,14 @@ class KeystoreDeviceCredentialStore internal constructor(
     @Volatile
     private var vaultUnread = false
 
+    /** True when the cloud member is on disk but this build cannot parse it. */
+    @Volatile
+    private var unreadCloudMember = false
+
+    /** True when the local member is on disk but this build cannot parse it. */
+    @Volatile
+    private var unreadLocalMember = false
+
     /**
      * Sticky for this launch once anything says the *key* is the problem rather
      * than the file. Not cleared by a later success: the store holds one key
@@ -239,6 +267,10 @@ class KeystoreDeviceCredentialStore internal constructor(
             else -> StoreHealth.Durable
         }
 
+    override val cloudMemberUnparsed: Boolean get() = unreadCloudMember
+
+    override val localMemberUnparsed: Boolean get() = unreadLocalMember
+
     override fun load(): PairedDevice? = readVault().pairedDevice.parsed
 
     override fun loadLocal(): LocalCredentials? = readVault().localCredentials.parsed
@@ -277,8 +309,13 @@ class KeystoreDeviceCredentialStore internal constructor(
 
         /** True when a member is on disk as JSON this build cannot parse. */
         val hasUnparsedMember: Boolean
-            get() = (pairedDevice.parsed == null && pairedDevice.raw != null) ||
-                (localCredentials.parsed == null && localCredentials.raw != null)
+            get() = cloudMemberUnparsed || localMemberUnparsed
+
+        val cloudMemberUnparsed: Boolean
+            get() = pairedDevice.parsed == null && pairedDevice.raw != null
+
+        val localMemberUnparsed: Boolean
+            get() = localCredentials.parsed == null && localCredentials.raw != null
     }
 
     /** What one look at [file] established. */
@@ -344,6 +381,8 @@ class KeystoreDeviceCredentialStore internal constructor(
             if (!file.exists()) {
                 vaultUnreadable = false
                 vaultUnread = false
+                unreadCloudMember = false
+                unreadLocalMember = false
                 return ReadResult.Opened(Vault().also { cachedVault = it })
             }
             file.readBytes()
@@ -352,6 +391,8 @@ class KeystoreDeviceCredentialStore internal constructor(
             // is concluded about it, and the next read answers again. A mutation
             // on top of this attempt is refused, not applied.
             vaultUnread = true
+            unreadCloudMember = false
+            unreadLocalMember = false
             return ReadResult.ReadFailed
         }
 
@@ -369,6 +410,8 @@ class KeystoreDeviceCredentialStore internal constructor(
             // this branch a provider hiccup would be reported as "the vault is
             // bad", which is the advice M1 exists to stop.
             vaultUnread = true
+            unreadCloudMember = false
+            unreadLocalMember = false
             return ReadResult.ReadFailed
         } catch (_: Exception) {
             // Only an authenticated refusal (AEADBadTagException) or this build's
@@ -377,13 +420,19 @@ class KeystoreDeviceCredentialStore internal constructor(
             // describes. Either way it is a verdict about the file.
             vaultUnreadable = true
             vaultUnread = false
+            unreadCloudMember = false
+            unreadLocalMember = false
             return ReadResult.Unopenable
         }
         vaultUnreadable = false
         // A member this build cannot parse is kept as raw JSON so the next write
         // re-emits it, but `load()` answers null for it. That is not "no
         // pairing": a pairing is sitting in the file and only this build cannot
-        // read it, so the launch concluded nothing about that backend.
+        // read it, so the launch concluded nothing about that backend. The flag
+        // is per member: a failed parse of the cloud half must not leave the
+        // desktop half unconcluded too.
+        unreadCloudMember = vault.cloudMemberUnparsed
+        unreadLocalMember = vault.localMemberUnparsed
         vaultUnread = vault.hasUnparsedMember
         cachedVault = vault
         return ReadResult.Opened(vault)
@@ -452,6 +501,8 @@ class KeystoreDeviceCredentialStore internal constructor(
             }
             vaultUnreadable = false
             vaultUnread = false
+            unreadCloudMember = vault.cloudMemberUnparsed
+            unreadLocalMember = vault.localMemberUnparsed
             cachedVault = vault
         } catch (e: CredentialStoreException) {
             throw e
@@ -468,6 +519,8 @@ class KeystoreDeviceCredentialStore internal constructor(
         if (!file.exists()) {
             vaultUnreadable = false
             vaultUnread = false
+            unreadCloudMember = false
+            unreadLocalMember = false
             cachedVault = Vault()
             return
         }
@@ -476,6 +529,8 @@ class KeystoreDeviceCredentialStore internal constructor(
         }
         vaultUnreadable = false
         vaultUnread = false
+        unreadCloudMember = false
+        unreadLocalMember = false
         cachedVault = Vault()
     }
 

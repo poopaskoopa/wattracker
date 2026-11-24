@@ -88,19 +88,27 @@ enum class BackendObservation {
  * in-memory store that stands in never opens the file on disk, so a pairing may
  * be sitting in it unread and nothing about it has been seen.
  * [StoreHealth.Unread] is the same answer for a different reason: the file is
- * there, but this launch could not read it (a transient I/O or provider failure,
- * or a member this build cannot parse), so again nothing was seen. Neither is
- * evidence against a stored choice.
+ * there, but this launch could not read it (a transient I/O or provider failure),
+ * so again nothing was seen. Neither is evidence against a stored choice.
+ * A member this build cannot parse is the same answer with a per-member twist:
+ * the file was read and the envelope opened, and the pairing is sitting there --
+ * only this build cannot read it, so the launch concluded nothing about that
+ * backend. The flag is per member, so a cloud half this build cannot parse does
+ * not leave the desktop half unconcluded either.
  * [StoreHealth.UnreadableVault] is the opposite -- the file was opened, and the
  * key behind it is gone -- so the pairing behind it is genuinely gone, and that
  * is a look that says unpaired.
  */
-fun observeLocalBackend(vaultHealth: StoreHealth, paired: Boolean): BackendObservation = when {
+fun observeLocalBackend(
+    vaultHealth: StoreHealth,
+    paired: Boolean,
+    memberUnparsed: Boolean = false,
+): BackendObservation = when {
     vaultHealth == StoreHealth.Unavailable -> BackendObservation.Unknown
     // Paired before Unread: a vault with one unparsed member still serves the
     // member that parsed, so a desktop paired from it really is paired.
     paired -> BackendObservation.Paired
-    vaultHealth == StoreHealth.Unread -> BackendObservation.Unknown
+    (vaultHealth == StoreHealth.Unread) || memberUnparsed -> BackendObservation.Unknown
     else -> BackendObservation.Unpaired
 }
 
@@ -117,6 +125,8 @@ fun observeLocalBackend(vaultHealth: StoreHealth, paired: Boolean): BackendObser
  * vault's health is the cloud's health too -- without this, a Keystore-refused
  * vault would read as a seen-unpaired cloud and delete an explicit `Cloud`
  * override, which is the mistake [observeLocalBackend] exists to avoid.
+ * A member this build cannot parse is the same shape: the envelope opened, the
+ * pairing is on disk, this build cannot read it.
  *
  * [StoreHealth.UnreadableVault] is deliberately not `Unknown`: the envelope
  * opened and this installation cannot use it, so the pairing behind it is gone.
@@ -126,12 +136,61 @@ fun observeCloudBackend(
     sessionBuilt: Boolean,
     paired: Boolean,
     vaultHealth: StoreHealth,
+    memberUnparsed: Boolean = false,
 ): BackendObservation = when {
     !sessionBuilt -> BackendObservation.Unknown
     vaultHealth == StoreHealth.Unavailable -> BackendObservation.Unknown
     paired -> BackendObservation.Paired
-    vaultHealth == StoreHealth.Unread -> BackendObservation.Unknown
+    (vaultHealth == StoreHealth.Unread) || memberUnparsed -> BackendObservation.Unknown
     else -> BackendObservation.Unpaired
+}
+
+/**
+ * What one launch concludes about the two backends, in the right order.
+ *
+ * A failure is read in one direction: the pairing flags are read first and
+ * the vault's health is read after them. `local.isPaired` triggers the vault's
+ * first read -- the cloud session's constructor does the same on the common
+ * path -- and health answers from that read, so reading health first would
+ * report `Durable` for a vault whose read has not happened yet: a Keystore
+ * outage that leaves both the signer and the cipher broken would then read
+ * the desktop as a seen-unpaired backend and delete a stored `Local` choice.
+ *
+ * The seam takes plain booleans so the ordering is pinned by a test instead
+ * of by the caller's argument list, where Kotlin's left-to-right evaluation
+ * is easy to get wrong.
+ */
+data class LaunchObservations(
+    val cloud: BackendObservation,
+    val local: BackendObservation,
+)
+
+fun launchObservations(
+    cloudSessionBuilt: Boolean,
+    cloudPaired: () -> Boolean,
+    localPaired: () -> Boolean,
+    vaultHealth: () -> StoreHealth,
+    cloudMemberUnparsed: () -> Boolean,
+    localMemberUnparsed: () -> Boolean,
+): LaunchObservations {
+    // Read the pairing flags first, then health. The paired closures may read
+    // the vault; health must answer from that read, not from before it.
+    val cloudPairedValue = cloudPaired()
+    val localPairedValue = localPaired()
+    val health = vaultHealth()
+    return LaunchObservations(
+        cloud = observeCloudBackend(
+            sessionBuilt = cloudSessionBuilt,
+            paired = cloudPairedValue,
+            vaultHealth = health,
+            memberUnparsed = cloudMemberUnparsed(),
+        ),
+        local = observeLocalBackend(
+            vaultHealth = health,
+            paired = localPairedValue,
+            memberUnparsed = localMemberUnparsed(),
+        ),
+    )
 }
 
 /**
@@ -197,4 +256,44 @@ fun decideStartupSelection(
         // parses to a null `stored` -- is deleted rather than re-read forever.
         deleteStoredPreference = storedName != null && !kept,
     )
+}
+
+/**
+ * The rider's choice and the generation it was made under, one guard.
+ *
+ * The review's finding B was a window, not a lock: a resolve that reads the
+ * generation first and the selection after can capture the pre-change
+ * selection under the post-change generation, pass the check, and write the
+ * backend the rider just replaced. Both reads happen together, under the lock
+ * that also bumps the counter on a set, so no read can straddle a write.
+ *
+ * This is the pure half: [snapshot] is the read a resolve starts from,
+ * [dropIfStale] is the guarded write. The Application owns the prefs side
+ * and the flows; this owns only the invariant the tests pin.
+ */
+class SelectionGuard {
+    private val lock = Any()
+    private var generation = 0
+    private var current: BackendSelection = BackendSelection.Automatic
+
+    /** The generation and the selection, read together, never torn. */
+    fun snapshot(): Pair<Int, BackendSelection> = synchronized(lock) { generation to current }
+
+    /** Record the rider's choice; everything snapshotted before it is stale. */
+    fun set(selection: BackendSelection) = synchronized(lock) {
+        generation += 1
+        current = selection
+    }
+
+    /**
+     * The guarded write: a resolve drops its result unless the generation it
+     * snapshotted is still the one this guard holds.
+     */
+    fun dropIfStale(snapshotted: Pair<Int, BackendSelection>, resolve: (BackendSelection) -> Unit): Boolean {
+        synchronized(lock) {
+            if (generation != snapshotted.first) return false
+        }
+        resolve(synchronized(lock) { current })
+        return true
+    }
 }

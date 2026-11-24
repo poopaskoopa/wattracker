@@ -184,6 +184,76 @@ class BackendSelectionTest {
     }
 
     @Test
+    fun anUnparsedCloudMemberLeavesTheCloudUnconcludedButNotTheDesktop() {
+        // The review's finding D: one whole-vault flag would leave both
+        // backends unconcluded when one member fails to parse. The pairing
+        // that parsed is a real, served pairing.
+        assertEquals(
+            BackendObservation.Unknown,
+            observeCloudBackend(sessionBuilt = true, paired = false, vaultHealth = StoreHealth.Durable, memberUnparsed = true),
+        )
+        assertEquals(
+            BackendObservation.Paired,
+            observeLocalBackend(StoreHealth.Durable, paired = true, memberUnparsed = false),
+        )
+    }
+
+    @Test
+    fun anUnparsedLocalMemberLeavesTheDesktopUnconcludedButNotTheCloud() {
+        assertEquals(
+            BackendObservation.Unknown,
+            observeLocalBackend(StoreHealth.Durable, paired = false, memberUnparsed = true),
+        )
+        assertEquals(
+            BackendObservation.Paired,
+            observeCloudBackend(sessionBuilt = true, paired = true, vaultHealth = StoreHealth.Durable, memberUnparsed = false),
+        )
+    }
+
+    @Test
+    fun theLaunchObservationsReadThePairingFlagsBeforeTheHealth() {
+        // The review's finding A: the health must answer from the vault read
+        // the pairing flags trigger, not from before it. A plain
+        // `vaultHealth` argument that reports Durable would read the desktop
+        // as a seen-unpaired backend when the signer failed to build and
+        // nothing had read the vault yet.
+        val readOrder = mutableListOf<String>()
+        val observations = launchObservations(
+            cloudSessionBuilt = false,
+            cloudPaired = { readOrder += "cloudPaired"; false },
+            localPaired = { readOrder += "localPaired"; false },
+            vaultHealth = { readOrder += "health"; StoreHealth.Durable },
+            cloudMemberUnparsed = { readOrder += "cloudMemberUnparsed"; false },
+            localMemberUnparsed = { readOrder += "localMemberUnparsed"; false },
+        )
+        assertEquals(
+            listOf("cloudPaired", "localPaired", "health", "cloudMemberUnparsed", "localMemberUnparsed"),
+            readOrder,
+        )
+        assertEquals(BackendObservation.Unknown, observations.cloud)
+        assertEquals(BackendObservation.Unpaired, observations.local)
+    }
+
+    @Test
+    fun theLaunchObservationsReportTheHealthReadAfterTheVault() {
+        // The same trap from the other side: health is read after the paired
+        // flags, so a health that reports Unread must be seen by the
+        // observation, not by a stale read.
+        val readOrder = mutableListOf<String>()
+        val observations = launchObservations(
+            cloudSessionBuilt = true,
+            cloudPaired = { readOrder += "cloudPaired"; false },
+            localPaired = { readOrder += "localPaired"; false },
+            vaultHealth = { readOrder += "health"; StoreHealth.Unread },
+            cloudMemberUnparsed = { false },
+            localMemberUnparsed = { false },
+        )
+        assertTrue("the pairing flags were read before health", readOrder.indexOf("health") > readOrder.indexOf("localPaired"))
+        assertEquals(BackendObservation.Unknown, observations.cloud)
+        assertEquals(BackendObservation.Unknown, observations.local)
+    }
+
+    @Test
     fun aKeptOverrideSurvivesAndNothingIsDeleted() {
         val startup = decideStartupSelection(
             storedName = "Cloud",
@@ -245,5 +315,43 @@ class BackendSelectionTest {
     fun aBackendMapsToTheChoiceThatNamesIt() {
         assertEquals(BackendSelection.Cloud, BackendSelection.of(DataSource.Cloud))
         assertEquals(BackendSelection.Local, BackendSelection.of(DataSource.Local))
+    }
+
+    @Test
+    fun theGuardSnapshotsTheGenerationAndTheSelectionTogether() {
+        // The review's finding B: a resolve that reads the generation first
+        // and the selection after can pass the check with the wrong selection.
+        val guard = SelectionGuard()
+        val (generation, _) = guard.snapshot()
+        guard.set(BackendSelection.Cloud)
+        val (_, after) = guard.snapshot()
+        // A snapshot taken before the set must not resolve into the new
+        // generation: the write is dropped, not applied.
+        val applied = guard.dropIfStale(generation to BackendSelection.Local) { }
+        assertFalse("a stale snapshot drops its resolve", applied)
+        assertEquals(BackendSelection.Cloud, after)
+    }
+
+    @Test
+    fun theGuardAppliesAResolveWhoseGenerationStillHolds() {
+        val guard = SelectionGuard()
+        val snapshot = guard.snapshot()
+        var resolved: BackendSelection? = null
+        val applied = guard.dropIfStale(snapshot) { resolved = it }
+        assertTrue(applied)
+        assertEquals(BackendSelection.Automatic, resolved)
+    }
+
+    @Test
+    fun theGuardKeepsEverySetStaleProof() {
+        // Each set moves the counter, so every snapshot taken before any
+        // later set is stale -- the property an IO-thread refresh depends on.
+        val guard = SelectionGuard()
+        val first = guard.snapshot()
+        guard.set(BackendSelection.Local)
+        val second = guard.snapshot()
+        guard.set(BackendSelection.Cloud)
+        assertFalse(guard.dropIfStale(first, { }))
+        assertFalse(guard.dropIfStale(second, { }))
     }
 }
