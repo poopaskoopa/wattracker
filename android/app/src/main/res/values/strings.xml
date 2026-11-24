@@ -36,7 +36,7 @@
     <!-- Two storage failures, not one: the first cannot save a pairing at all,
          the second is holding one it can no longer read (#457). -->
     <string name="settings_cloud_store_unavailable_warning">Warning: this device cannot protect a saved pairing, so pairing is temporary until the app closes.</string>
-    <string name="settings_cloud_vault_unreadable_warning">Warning: the pairing saved on this device could not be read. Pairing again will replace it.</string>
+    <string name="settings_cloud_vault_unreadable_warning">Warning: the pairing saved on this device could not be read, so it is not in use. Pairing again replaces it.</string>
 
     <string name="settings_local_paired_title">Local Desktop Paired</string>
     <string name="settings_local_unpaired_title">Pair Local Desktop</string>

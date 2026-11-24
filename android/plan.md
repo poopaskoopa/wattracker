@@ -17,7 +17,7 @@ repo-root `AGENTS.md` still governs everything repo-wide.
 ground truth, the per-step implementation notes, the reviews and their fixes,
 and the validation sequence.
 
-**Resume point (2026-11-03). Steps 1–6 are merged, and #457's credential-store work is merged too (PR #459, `ec6aab0`). Step 7 (#199) is the only step left, and the only work in this directory that is not yet on `main`.**
+**Resume point (2026-11-03). Steps 1–6 are merged, and #457's credential-store work is merged too (PR #459, `ec6aab0`). Step 7 (#199) is the only step left, and the only work in this directory that is not yet on `main`. #478 (the CODEOWNERS gate) is on `main` at `a8916c9`.**
 
 - **Merged:** Step 1 (#193, PR #257), Step 2 (#194, PR #304), Step 3 (#195, PR #376, landed through #403), Step 4 (#196, PR #419, `736f290`), Step 5 (#197, PR #450, 2026-10-25), Step 6 (#198, PR #456, 2026-10-27), and PR #459 (#457, `ec6aab0`, 2026-11-03) — the credential store on the Keystore instead of `security-crypto`, which closed #457. All three of its review rounds (2026-10-30, 2026-10-31, 2026-11-02) are addressed, and its device run is the 2026-11-03 note further down.
 - **Open issues:** #194, #195, #196, #197 and #198 stay open only for their device checks. #193 is closed. #192 (the epic) is open.
@@ -78,7 +78,9 @@ Verification: `:app:testDebugUnitTest` -- **353 green**; `:app:assembleDebug` gr
 - **The old-prefs cleanup, on a phone that actually held old data.** This install carried `shared_prefs/wattracker_device_credential.xml` from a 2026-09-26 build; after the in-place update (`adb install -r`, data kept) that file is gone, `legacy_credential_store_dropped` is recorded in `wattracker_app_prefs.xml`, and the app reports unpaired. That is the waiver above seen from the outside: one developer-install pairing lost, nothing leaked, no rider affected.
 - **The store started `Durable` on real Keystore hardware** -- key load-or-create, read-back, `assertNonExportable`, and the probe's round trip all passed, so the fallback never fired and Settings showed no warning.
 - **Pair → relaunch → still paired, twice.** `saveLocal()` wrote `files/wattracker_device_credentials`: mode `0600`, **183 bytes = 12 IV + 155 body + 16 tag**, exactly the envelope the JVM suite pins; pulled off the device and hex-dumped, no plaintext anywhere in it, and no `.tmp` left behind. Force-stop and relaunch: still paired (`Paired: 2026-11-03 02:19`), and the Dashboard's reads went through (`POST /api/connector/session` 200, then `/api/state`, `/api/load`, `/api/curve`, `/api/activities` all 200). That round trip is the one that settles the `getIV()` question -- the envelope this `AndroidKeyStore` key wrote opened under the same key in a later process.
-- **The unreadable-vault warning, on screen, with storage broken on purpose.** Overwriting the vault with 40 random bytes left the app reporting unpaired, kept the file exactly where it is, and rendered `settings_cloud_vault_unreadable_warning` ("the pairing saved on this device could not be read. Pairing again will replace it"). Re-pairing replaced it (back to 183 bytes) and the next relaunch was paired again -- a save may replace an unopenable vault, and the replacement survives.
+- **The unreadable-vault warning, on screen, with storage broken on purpose.** Overwriting the vault with 40 random bytes left the app reporting unpaired, kept the file exactly where it is, and rendered `settings_cloud_vault_unreadable_warning` ("the pairing saved on this device could not be read, so it is not in use. Pairing again replaces it"). Re-pairing replaced it (back to 183 bytes) and the next relaunch was paired again -- a save may replace an unopenable vault, and the replacement survives.
+
+   The current copy matches this observed text. It was changed to the same words in the review fix, so the run record and the shipped string agree.
 - **`Remove this device`** deletes the vault file entirely (the empty-vault path).
 
 Still not verified by device: `settings_cloud_store_unavailable_warning` (needs a Keystore that will not hand over a usable key, which no `adb` access on an unrooted phone can arrange -- the probe path that makes it reachable is JVM-tested only); the alias-replacement recovery (needs a corrupted Keystore entry); the **cloud** half of the vault on hardware -- the desktop-token half is what the phone covered, same envelope and same code path, and the cloud binding needs an emulator or a build-time authority override. Screenshots and the pulled vault bytes are kept untracked under the session's artifacts directory, not in the repo.
@@ -2104,10 +2106,13 @@ through the API, so moving them means re-supplying them by hand. Filed as
    `environment: android-code-signing` on the release job once it exists, and
    keep `android.yml` free of it, because a PR build needs no signing material.
 
-   The environment is only half the gate. The other half is CODEOWNERS:
-   `.github/CODEOWNERS` (#478) owns `/.github/` but leaves `android/` unowned,
-   so the Gradle signing config can change with no owner review. Add
-   `/android/app/build.gradle.kts` there once #478 lands.
+   The environment is only half the gate. The other half is CODEOWNERS, and
+   it is deliberately an open owner decision, not a code change: #478 owns
+   `/.github/` and leaves `android/` unowned, listing
+   `android/app/build.gradle.kts` and `android/AGENTS.md` as unowned and pinning
+   that in `tests/test_codeowners.py` (`UNOWNED`). Adding that path here would
+   turn the suite red. If the owner wants it owned, the change is to reverse
+   #478's unowned list, which is the owner's call.
 
    The owner also verifies the gate the way #478 does: a workflow on another
    branch that names the environment must fail to read the secrets.

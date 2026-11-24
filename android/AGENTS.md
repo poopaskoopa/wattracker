@@ -8,7 +8,7 @@ belong with this directory. `plan.md` is the step-by-step plan; `README.md` is
 what the plan assumes of the machine around it. Neither repeats the rules here.
 
 ## Golden rules
-1. **ASD-STE-100 in all communication** — keep comments and commit messages short. 
+1. **ASD-STE-100 in all communication** — keep comments and commit messages short.
    Use US English.
 2. **Test in the emulator first** — ask the user before using any connected
    devices.
