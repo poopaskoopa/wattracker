@@ -77,10 +77,18 @@ jobs:
       # exercise them, and an R8-stripped Room entity fails at runtime in a
       # release build, which is the most expensive place to discover it.
       #
-      # -PallowPlaceholderHost is required for as long as #102 is open: the
+      # -PallowPlaceholderHost is required here, and only here: the
       # placeholder-host guard in app/build.gradle.kts refuses assembleRelease
       # without it, on purpose. The flag suppresses that guard and nothing else,
       # and the guard is verified to still fire without it.
+      #
+      # This job is unsigned and never ships, so the placeholder is harmless to
+      # it. It is deliberately NOT the release path: android-release.yml builds
+      # the signed bundle from an admin-created android/v* tag, takes the real
+      # cloud authority from the android-code-signing environment secret (#468),
+      # and never passes this flag, so a placeholder bundle fails there instead
+      # of shipping. Retire the flag from this job only when no placeholder path
+      # remains at all.
       - name: Build and unit-test
         working-directory: android
         run: >-
