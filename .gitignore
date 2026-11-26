@@ -102,6 +102,12 @@ captures/
 # public repository is a key you have to revoke.
 *.jks
 *.keystore
+# Google Cloud service-account keys (e.g. the Play upload key, held in the
+# android-code-signing environment). Console downloads are named
+# <project>-<12 hex>.json.
+*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json
+*service-account*.json
+*service_account*.json
 *.xcuserstate
 *.xcuserdatad/
 xcuserdata/
