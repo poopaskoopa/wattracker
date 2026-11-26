@@ -10,9 +10,12 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -30,10 +33,12 @@ from .limits import (
     QuotaManager,
     QuotaPolicy,
 )
+from .edits import EDIT_QUEUE_KIND, EditQueue, EditQueueFull, drop_revoked_submitter
 from .build_info import COMMIT as BUILD_COMMIT
 from .models import ModelError, SyncBatch
 from .security import (
     CredentialRegistry,
+    DeviceCredential,
     DEFAULT_DEVICE_CAPABILITIES,
     DEVICE_SIGNATURE_ALGORITHMS,
     DevicePairingRegistry,
@@ -89,6 +94,11 @@ _DEVICE_REVOKE_REVISION = 0
 _DEVICE_CAPABILITIES_IDEMPOTENCY_KEY = "device-capabilities"
 _MAX_DEVICE_CAPABILITIES_BODY_BYTES = 256
 _MAX_DEVICE_ADMIN_BODY_BYTES = 4 * 1024
+_EDIT_STATUS_IDEMPOTENCY_KEY = "edit-status"
+_EDIT_PULL_IDEMPOTENCY_KEY = "edit-pull"
+_EDIT_ACK_IDEMPOTENCY_KEY = "edit-ack"
+_MAX_EDIT_BODY_BYTES = 1024
+_MAX_EDIT_ACK_BODY_BYTES = 8 * 1024
 # A wipe carries no caller-selected data.  Its fixed signed envelope prevents
 # a request body, header, or path segment from becoming a scope selector.
 _WIPE_IDEMPOTENCY_KEY = "account-wipe"
@@ -97,6 +107,7 @@ _WIPE_PATH = "/api/v1/account/wipe"
 # A credential id is 32 bytes of hex.  The path parameter is bounded before it
 # reaches the registry so an enormous path cannot be used to probe anything.
 _MAX_CREDENTIAL_ID_CHARS = 64
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -217,7 +228,12 @@ def _build_quota_manager(
             kill_switch = DurableKillSwitch(kill_backend)
         except ValueError:
             kill_switch = None
-    return QuotaManager(policy, counters=counters, kill_switch=kill_switch)
+    return QuotaManager(
+        policy,
+        counters=counters,
+        kill_switch=kill_switch,
+        utcnow=lambda: datetime.fromtimestamp(config.clock(), timezone.utc),
+    )
 
 
 @dataclass
@@ -393,6 +409,22 @@ def _error(
     if code is not None:
         body["code"] = code
     return JSONResponse(body, status_code=status, headers=headers)
+
+
+def _strict_json_object(body: bytes) -> dict[str, Any]:
+    """Decode one JSON object while refusing duplicate member names."""
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate JSON member")
+            result[key] = value
+        return result
+
+    value = json.loads(body, object_pairs_hook=pairs)
+    if not isinstance(value, dict):
+        raise ValueError("JSON object required")
+    return value
 
 
 def _safe_limit(raw: Optional[str]) -> int:
@@ -1018,6 +1050,191 @@ def create_cloud_app(
         )
 
     if read_enabled():
+        def edit_queue() -> EditQueue:
+            backend = getattr(state.credentials, "_backend", None)
+            if backend is None:
+                raise SecurityStateUnavailable("edit queue unavailable")
+            return EditQueue(
+                backend,
+                clock=config.clock,
+                resolve_device=state.credentials.resolve_device,
+            )
+
+        @app.post("/api/v1/edits")
+        async def submit_edit(request: Request) -> Response:
+            _require_public_api_for_device_or_reader(state)
+            credential = _writer_auth(state, request, capability="annotate")
+            if not isinstance(credential, DeviceCredential):
+                raise HTTPException(status_code=401, detail="writer authorization required")
+            try:
+                raw = await _bounded_body(request, _MAX_EDIT_BODY_BYTES)
+            except HTTPException as exc:
+                return _error(exc.status_code, "request body too large" if exc.status_code == 413 else "invalid edit request")
+            verified = _verify_writer_request(state, request, credential, raw)
+            if verified is None:
+                return _error(401, "writer authorization required")
+            namespace, scope, idem, revision = verified
+            if revision != 0:
+                return _error(401, "writer authorization required")
+            try:
+                payload = _strict_json_object(raw)
+            except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+                return _error(400, "invalid edit request")
+            if set(payload) != {"edit_id", "activity_id", "rpe", "base_rpe"}:
+                return _error(400, "invalid edit request")
+            edit_id = payload["edit_id"]
+            activity_id = payload["activity_id"]
+            rpe = payload["rpe"]
+            base_rpe = payload["base_rpe"]
+            if not isinstance(edit_id, str) or re.fullmatch(r"[0-9a-f]{32}", edit_id) is None:
+                return _error(400, "invalid edit request")
+            if not _safe_compare_text(idem, edit_id):
+                return _error(401, "writer authorization required")
+            if (
+                isinstance(activity_id, bool)
+                or not isinstance(activity_id, int)
+                or not 1 <= activity_id <= (2**53 - 1)
+                or isinstance(rpe, bool)
+                or not isinstance(rpe, int)
+                or not 1 <= rpe <= 10
+                or (base_rpe is not None and (
+                    isinstance(base_rpe, bool)
+                    or not isinstance(base_rpe, int)
+                    or not 1 <= base_rpe <= 10
+                ))
+                or rpe == base_rpe
+            ):
+                return _error(400, "invalid edit request")
+            try:
+                activity = await run_in_threadpool(
+                    state.store.get, namespace, scope, f"activity-{activity_id}"
+                )
+            except Exception:
+                raise SecurityStateUnavailable("activity lookup unavailable")
+            if activity is None or getattr(activity, "deleted", False) or getattr(activity, "kind", None) != "activity":
+                return _not_found()
+            try:
+                state.quotas.admit_edit(namespace, scope, credential.credential_id)
+                with state.quotas.backend_slot(namespace):
+                    status, expires_at = await run_in_threadpool(
+                        edit_queue().submit,
+                        namespace,
+                        scope,
+                        edit_id=edit_id,
+                        activity_id=activity_id,
+                        rpe=rpe,
+                        base_rpe=base_rpe,
+                        submitted_by=credential.credential_id,
+                    )
+            except EditQueueFull:
+                return _error(429, "edit queue full", retry_after=60, code="edit_queue_full")
+            except QuotaExceeded as exc:
+                return _error(exc.status_code, "read quota exceeded", retry_after=exc.retry_after)
+            if status == "conflict":
+                return _error(409, "edit id already used")
+            response = {"edit_id": edit_id, "status": status}
+            if expires_at is not None:
+                response["expires_at"] = expires_at
+            code = 200 if status in {"applied", "conflict", "rejected", "expired"} else 202
+            return JSONResponse(response, status_code=code, headers={"Cache-Control": "no-store"})
+
+        @app.get("/api/v1/edits")
+        async def edit_status(request: Request) -> Response:
+            _require_public_api_for_device_or_reader(state)
+            credential = _writer_auth(state, request, capability="annotate")
+            if not isinstance(credential, DeviceCredential):
+                raise HTTPException(status_code=401, detail="writer authorization required")
+            try:
+                raw = await _bounded_body(request, 0)
+            except HTTPException:
+                return _error(400, "invalid edit status request")
+            verified = _verified_scope(
+                state, request, credential, raw,
+                idempotency_key=_EDIT_STATUS_IDEMPOTENCY_KEY, revision=0,
+            )
+            if verified is None:
+                return _error(401, "writer authorization required")
+            namespace, scope = verified
+            try:
+                state.quotas.admit_read(namespace, scope, response_bytes=0)
+                with state.quotas.backend_slot(namespace):
+                    edits = await run_in_threadpool(
+                        edit_queue().status, namespace, scope, credential.credential_id
+                    )
+            except QuotaExceeded as exc:
+                return _error(exc.status_code, "read quota exceeded", retry_after=exc.retry_after)
+            return JSONResponse({"edits": edits}, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/v1/edits/pull")
+        async def pull_edits(request: Request) -> Response:
+            _require_public_api_for_device_or_reader(state)
+            credential = _writer_auth(state, request, capability="write", writer_only=True)
+            try:
+                raw = await _bounded_body(request, 0)
+            except HTTPException:
+                return _error(400, "invalid edit pull request")
+            verified = _verified_scope(
+                state, request, credential, raw,
+                idempotency_key=_EDIT_PULL_IDEMPOTENCY_KEY, revision=0,
+            )
+            if verified is None:
+                return _error(401, "writer authorization required")
+            namespace, scope = verified
+            try:
+                state.quotas.admit_read(namespace, scope, response_bytes=0)
+                with state.quotas.backend_slot(namespace):
+                    edits = await run_in_threadpool(edit_queue().pull, namespace, scope)
+            except QuotaExceeded as exc:
+                return _error(exc.status_code, "read quota exceeded", retry_after=exc.retry_after)
+            return JSONResponse({"edits": edits}, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/v1/edits/ack")
+        async def ack_edits(request: Request) -> Response:
+            _require_public_api_for_device_or_reader(state)
+            credential = _writer_auth(state, request, capability="write", writer_only=True)
+            try:
+                raw = await _bounded_body(request, _MAX_EDIT_ACK_BODY_BYTES)
+            except HTTPException as exc:
+                return _error(exc.status_code, "request body too large" if exc.status_code == 413 else "invalid edit ack request")
+            verified = _verified_scope(
+                state, request, credential, raw,
+                idempotency_key=_EDIT_ACK_IDEMPOTENCY_KEY, revision=0,
+            )
+            if verified is None:
+                return _error(401, "writer authorization required")
+            try:
+                payload = _strict_json_object(raw)
+            except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+                return _error(400, "invalid edit ack request")
+            results = payload.get("results")
+            if (
+                set(payload) != {"results"}
+                or not isinstance(results, list)
+                or len(results) > 50
+            ):
+                return _error(400, "invalid edit ack request")
+            seen: set[str] = set()
+            for item in results:
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"edit_id", "status"}
+                    or not isinstance(item["edit_id"], str)
+                    or re.fullmatch(r"[0-9a-f]{32}", item["edit_id"]) is None
+                    or item["edit_id"] in seen
+                    or not isinstance(item["status"], str)
+                    or item["status"] not in {"applied", "conflict", "rejected"}
+                ):
+                    return _error(400, "invalid edit ack request")
+                seen.add(item["edit_id"])
+            namespace, scope = verified
+            try:
+                state.quotas.admit_read(namespace, scope, response_bytes=0)
+                with state.quotas.backend_slot(namespace):
+                    count = await run_in_threadpool(edit_queue().ack, namespace, scope, results)
+            except QuotaExceeded as exc:
+                return _error(exc.status_code, "read quota exceeded", retry_after=exc.retry_after)
+            return JSONResponse({"acked": count}, headers={"Cache-Control": "no-store"})
+
         @app.post("/api/v1/enrollment/start")
         async def enrollment_start(request: Request) -> Response:
             # Disabled keeps enrollment's refusal uniform and, critically,
@@ -1695,6 +1912,28 @@ def create_cloud_app(
                 # Unknown, malformed, another rider's namespace, another local
                 # scope, or not a device at all -- one answer for all of them.
                 return _not_found()
+            backend = getattr(state.credentials, "_backend", None)
+            if backend is not None:
+                try:
+                    removed = drop_revoked_submitter(
+                        backend,
+                        credential.namespace,
+                        credential.local_user_scope,
+                        credential_id,
+                        clock=config.clock,
+                    )
+                    _log.info(
+                        "revoked device edit cleanup credential_id=%s count=%d",
+                        credential_id,
+                        removed,
+                    )
+                except Exception:
+                    # Revocation is already durable. Pull-time live resolution
+                    # is authoritative if this optimization cannot complete.
+                    _log.warning(
+                        "revoked device edit cleanup failed credential_id=%s",
+                        credential_id,
+                    )
             body_bytes = json.dumps(
                 {"revoked": True}, separators=(",", ":")
             ).encode()

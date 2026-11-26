@@ -1414,6 +1414,6 @@ def test_the_wipe_entry_point_is_exported_and_carries_its_decision_in_source():
         b"wattracker-cloud-kill-switch-v1\x00deployment"
     ).hexdigest()
     assert json.loads(json.dumps(sorted(WIPE_RECORD_KINDS))) == [
-        "context", "device", "device-pairing", "invitation", "writer",
+        "context", "device", "device-pairing", "edit-queue", "invitation", "writer",
     ]
     assert DEVICE_SEEN_RECORD_KIND not in WIPE_RECORD_KINDS

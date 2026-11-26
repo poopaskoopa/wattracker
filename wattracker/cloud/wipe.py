@@ -158,6 +158,7 @@ WIPE_RECORD_KINDS: Final[tuple[str, ...]] = (
     "context",
     "invitation",
     "device-pairing",
+    "edit-queue",
 )
 
 #: Restated by name, and checked again at call time.  ``kill-switch`` and

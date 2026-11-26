@@ -461,6 +461,39 @@ concurrent revocation cannot be overwritten by a stale grant. The read
 identity already has the CloudAuth update permission, so this needs no Bicep
 change. Deployment and the owner's end-to-end drill are slice S5 of #497.
 
+### Edit queue
+
+The read plane stores phone edits as intents; it never changes the published
+snapshot. A phone with the live `annotate` capability submits and checks only
+its own edits. The desktop writer pulls the scope queue and acknowledges each
+result:
+
+```
+POST /api/v1/edits       phone submit
+GET  /api/v1/edits       phone status
+POST /api/v1/edits/pull  desktop pull
+POST /api/v1/edits/ack   desktop acknowledge
+```
+
+Submit bodies contain exactly a 32-character lowercase hexadecimal `edit_id`,
+an integer `activity_id`, an `rpe` from 1 to 10, and `base_rpe` from 1 to 10
+or `null`. The body is limited to 1 KiB. Idempotency is bound to `edit_id`;
+the same pending body is safe to retry, a changed body conflicts, and a retry
+whose settled status is retained returns that status instead of re-queuing.
+Settled statuses are capped at 100, so a high volume of settlements can evict
+an older status before its seven-day age limit. A newer edit for the same
+activity replaces its pending edit. A queue holds at most 50 pending edits,
+and durable daily limits allow 60 submissions per device and 200 per rider
+scope.
+
+The desktop pull is oldest first, contains at most 50 edits, and excludes
+submitter identity. Ack accepts up to 50 `applied`, `conflict`, or `rejected`
+results in an 8 KiB body; unknown ids are ignored. Phone status is bounded to
+50 pending and 100 settled entries and reports `pending`, `applied`, `conflict`,
+`rejected`, or `expired`. Pending entries expire after 14 days and settled
+status is retained for 7 days. Revoked or no-longer-annotating devices are
+filtered from pull and their pending edits settle as `rejected`.
+
 ## Revoking a lost device
 
 A phone goes missing. The rider does not have to be at the desktop, and they
