@@ -340,7 +340,7 @@ def _maximal_queue(namespace, scope, submitted_by):
     }
 
 
-def test_full_maximal_queue_status_pull_and_ack_fit_by_dropping_oldest_settled(deployment):
+def test_full_maximal_queue_status_pull_and_ack_prune_settled_but_reject_pending_overflow(deployment):
     writer = _rider(deployment)
     device, private = _device(deployment, writer)
     _grant(deployment, writer, device, True, "grant")
@@ -360,6 +360,7 @@ def test_full_maximal_queue_status_pull_and_ack_fit_by_dropping_oldest_settled(d
     after_pull = deployment.backend.read(EDIT_QUEUE_KIND, key)
     assert len(after_pull["settled"]) < 100
     assert _serialized_size(after_pull) <= _PAYLOAD_LIMIT
+    assert after_pull["settled"] == full["settled"][-len(after_pull["settled"]):]
 
     deployment.backend.write(EDIT_QUEUE_KIND, key, full)
     ack = _writer_request(
@@ -372,13 +373,32 @@ def test_full_maximal_queue_status_pull_and_ack_fit_by_dropping_oldest_settled(d
     assert ack.json() == {"acked": 1}
     after_ack = deployment.backend.read(EDIT_QUEUE_KIND, key)
     assert _serialized_size(after_ack) <= _PAYLOAD_LIMIT
+    assert after_ack["settled"][-1]["edit_id"] == "0" * 32
 
+    # Settled history can be trimmed; pending edits must never be discarded to fit.
     pending_only = dict(full, pending=full["pending"] + [dict(full["pending"][0], edit_id="f" * 32)], settled=[])
     deployment.backend.write(EDIT_QUEUE_KIND, key, pending_only)
     with pytest.raises(EditQueueFull):
         EditQueue(deployment.backend, clock=deployment.clock).ack(
             writer.namespace, "scope", []
         )
+
+
+def test_full_maximal_queue_keeps_newest_settled_and_prunes_oldest(deployment):
+    writer = _rider(deployment)
+    device, _private = _device(deployment, writer)
+    key = edit_queue_key(writer.namespace, "scope")
+    full = _maximal_queue(writer.namespace, "scope", device.credential_id)
+    deployment.backend.write(EDIT_QUEUE_KIND, key, full)
+
+    assert EditQueue(deployment.backend, clock=deployment.clock).ack(
+        writer.namespace, "scope", []
+    ) == 0
+
+    trimmed = deployment.backend.read(EDIT_QUEUE_KIND, key)
+    assert len(trimmed["settled"]) < len(full["settled"])
+    assert trimmed["settled"] == full["settled"][-len(trimmed["settled"]):]
+    assert trimmed["settled"][-1]["edit_id"] == full["settled"][-1]["edit_id"]
 
 
 def test_submit_binds_attested_subject_when_required(deployment):
@@ -426,6 +446,39 @@ def test_submit_binds_attested_subject_when_required(deployment):
     }, separators=(",", ":")).encode()
     accepted = deployment.client.post("/api/v1/edits", content=matched_body, headers=headers)
     assert accepted.status_code == 202
+
+
+def test_submit_requires_attested_subject_header_when_configured(deployment):
+    writer = _rider(deployment)
+    private, public = generate_signing_keypair()
+    device = deployment.state.credentials.register_device_for_scope(
+        writer.namespace, "scope", public, subject="entra-user"
+    )
+    _grant(deployment, writer, device, True, "grant")
+    _activity(deployment, writer, 1)
+    deployment.config = replace(
+        deployment.config,
+        require_gateway_proof=True,
+        gateway_proof_value="test-gateway-secret",
+        require_verified_subject=True,
+    )
+    deployment.state.config = deployment.config
+
+    body = json.dumps({
+        "edit_id": "c" * 32, "activity_id": 1, "rpe": 5, "base_rpe": 4,
+    }, separators=(",", ":")).encode()
+    headers = _envelope(
+        device, "POST", "/api/v1/edits", nonce="subject-missing",
+        idem="c" * 32, body=body, signer=_device_signer(private),
+    )
+    headers["X-Gateway-Request-Proof"] = "test-gateway-secret"
+    del headers["X-Verified-Entra-Subject"]
+
+    refused = deployment.client.post("/api/v1/edits", content=body, headers=headers)
+    assert refused.status_code == 401
+    assert deployment.backend.read(
+        EDIT_QUEUE_KIND, edit_queue_key(writer.namespace, "scope")
+    ) is None
 
 
 def test_pull_resolves_devices_before_backend_update_and_filters_scope(deployment, monkeypatch):
