@@ -168,6 +168,8 @@ class EditQueue:
             queue["settled"] = queue["settled"][-_SETTLED_LIMIT:]
             if len(queue["pending"]) > _PENDING_LIMIT or len(queue["settled"]) > _SETTLED_LIMIT:
                 raise EditQueueFull("edit queue full")
+            while queue["settled"] and _serialized_size(queue) > _PAYLOAD_LIMIT:
+                queue["settled"].pop(0)
             if _serialized_size(queue) > _PAYLOAD_LIMIT:
                 raise EditQueueFull("edit queue full")
             return queue
@@ -235,7 +237,12 @@ class EditQueue:
         return result["status"], result.get("expires_at")
 
     def status(self, namespace: str, scope: str, submitted_by: str) -> list[dict[str, Any]]:
-        queue = self._update(namespace, scope, lambda _queue, _now: None)
+        key = edit_queue_key(namespace, scope)
+        try:
+            current = self._backend.read(EDIT_QUEUE_KIND, key)
+        except Exception as exc:
+            raise SecurityStateUnavailable("edit queue unavailable") from exc
+        queue = _pruned(current, namespace, scope, float(self._clock()))
         rows = []
         for item in queue["pending"]:
             if item["submitted_by"] == submitted_by:
@@ -255,20 +262,34 @@ class EditQueue:
     def pull(self, namespace: str, scope: str) -> list[dict[str, Any]]:
         key = edit_queue_key(namespace, scope)
         try:
-            if self._backend.read(EDIT_QUEUE_KIND, key) is None:
+            current = self._backend.read(EDIT_QUEUE_KIND, key)
+            if current is None:
                 return []
         except Exception as exc:
             raise SecurityStateUnavailable("edit queue unavailable") from exc
+        submitters = {
+            item["submitted_by"]
+            for item in current.get("pending", [])
+            if isinstance(item, Mapping) and isinstance(item.get("submitted_by"), str)
+        } if isinstance(current, Mapping) else set()
+        resolved = {
+            submitter: self._resolve_device(submitter) if self._resolve_device else None
+            for submitter in submitters
+        }
         result: list[dict[str, Any]] = []
 
         def transform(queue: dict[str, Any], now: float) -> None:
             result.clear()
             kept = []
-            resolved: dict[str, Any] = {}
+            pullable = []
             for item in queue["pending"]:
                 submitter = item["submitted_by"]
                 if submitter not in resolved:
-                    resolved[submitter] = self._resolve_device(submitter) if self._resolve_device else None
+                    # A concurrent submit may add a new device after the
+                    # pre-resolution read. Keep it for the next pull, where
+                    # its credential can be resolved outside the CAS lock.
+                    kept.append(item)
+                    continue
                 device = resolved[submitter]
                 if (
                     device is None
@@ -283,8 +304,9 @@ class EditQueue:
                     })
                 else:
                     kept.append(item)
+                    pullable.append(item)
             queue["pending"] = kept
-            result.extend(sorted(kept, key=lambda item: (item["created_at"], item["edit_id"]))[:_PENDING_LIMIT])
+            result.extend(sorted(pullable, key=lambda item: (item["created_at"], item["edit_id"]))[:_PENDING_LIMIT])
 
         self._update(namespace, scope, transform)
         return [{field: item[field] for field in ("edit_id", "activity_id", "rpe", "base_rpe", "created_at")} for item in result]

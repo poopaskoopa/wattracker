@@ -1073,6 +1073,17 @@ def create_cloud_app(
             verified = _verify_writer_request(state, request, credential, raw)
             if verified is None:
                 return _error(401, "writer authorization required")
+            ok, verified_subject = _subject_binding(state, request)
+            stored_subject = getattr(credential, "subject", None)
+            if (
+                not ok
+                or (
+                    stored_subject is not None
+                    and verified_subject is not None
+                    and not _safe_compare_text(stored_subject, verified_subject)
+                )
+            ):
+                return _error(401, "writer authorization required")
             namespace, scope, idem, revision = verified
             if revision != 0:
                 return _error(401, "writer authorization required")
