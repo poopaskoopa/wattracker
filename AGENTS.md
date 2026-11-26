@@ -194,10 +194,12 @@ states on `main` when the PR is merge-committed. Four such commits are on
    activity detail must keep working. Android is not ported; say so in the PR's `Android:` line.
 
 2. **#501: desktop pull, apply and ack of cloud RPE edits (Python). (PR #512)**
-   The spec is the issue body plus the integrator's two addendum comments. Addendum 2 is the
-   owner's decision C2 on #497 (2026-11-26): cloud-applied ratings never feed FTP. That
-   needs a source column, so this item owns **`SCHEMA_VERSION` 38 → 39**. PR #512 was reviewed
-   not ready: two scheduler hot loops in `next_due`, plus the C2 rework. Security review.
+   The spec is the issue body plus **addendum 4** on the issue, which supersedes addenda 2 and 3.
+   On 2026-11-26 the owner reversed decision C2 (see #497): a phone rating counts exactly like a
+   desktop rating, and the last rating wins, including for FTP. The item still owns
+   **`SCHEMA_VERSION` 38 → 39**, now for a table of applied edit ids so that a redelivered edit is
+   never applied twice. PR #512 at `c7006ed` has its scheduler fixes verified; it needs the
+   addendum 4 rework. Security review.
 
 3. **#510: cloud edit queue review follow-ups (Python).** Spec in the issue body.
    Light security review. Must land before #502's device run, which uses the
