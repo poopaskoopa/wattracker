@@ -193,10 +193,11 @@ states on `main` when the PR is merge-committed. Four such commits are on
    format. It must reuse `CombinedChartSeries`'s x values, and vertical scroll in
    activity detail must keep working. Android is not ported; say so in the PR's `Android:` line.
 
-2. **#501: desktop pull, apply and ack of cloud RPE edits (Python).** Unblocked:
-   #498 and #500 have merged. The spec is the issue body plus the integrator's addendum
-   comment (ack after a replaced edit; revocation between pull and apply). Security
-   review, and its merge **waits on the owner's decision 2 on #497**. Open the PR anyway.
+2. **#501: desktop pull, apply and ack of cloud RPE edits (Python). (PR #512)**
+   The spec is the issue body plus the integrator's two addendum comments. Addendum 2 is the
+   owner's decision C2 on #497 (2026-11-26): cloud-applied ratings never feed FTP. That
+   needs a source column, so this item owns **`SCHEMA_VERSION` 38 → 39**. PR #512 was reviewed
+   not ready: two scheduler hot loops in `next_due`, plus the C2 rework. Security review.
 
 3. **#510: cloud edit queue review follow-ups (Python).** Spec in the issue body.
    Light security review. Must land before #502's device run, which uses the
