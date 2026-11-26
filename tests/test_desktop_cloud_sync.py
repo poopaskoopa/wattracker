@@ -1108,6 +1108,95 @@ def test_edit_pull_schedule_decays_and_caps_idle_polls(tmp_path):
     assert idle.due(172_800)
 
 
+def test_next_due_clears_expired_unsupported_window_without_backlog_burst():
+    schedule = EditPullSchedule(clock=lambda: 0.0)
+    schedule.start(0)
+    schedule.pulled(0, has_edits=False)
+    schedule.unsupported(10)
+    assert schedule.next_due(86_409) == 86_410
+    assert schedule.unsupported_until == 86_410
+    assert schedule.next_due(86_410) == 86_410
+    assert schedule.unsupported_until is None
+    assert schedule.anchor == 86_410
+    schedule.pulled(86_410, has_edits=False)
+    assert schedule.next_due(86_410) == 87_010
+
+
+@pytest.mark.parametrize("failure_mode", ["daily-cap", "expired-404"])
+def test_scheduler_requeue_bounds_sync_once_calls_under_frozen_clock(
+    tmp_path, failure_mode,
+):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    now = 86_400 * 10 + 100
+    db.save_cloud_sync_state(user_id, {"enabled": True}, path=str(path))
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(MemorySecrets()), clock=lambda: now,
+    )
+    schedule = sync._edit_schedule(user_id)
+    schedule.start(now)
+    if failure_mode == "daily-cap":
+        schedule.pulls_today = 8
+        schedule.immediate = True
+    else:
+        schedule.anchor = now - 90_000
+        schedule.slot = 1
+        schedule.immediate = False
+        schedule.unsupported_until = now - 1
+
+    calls = []
+    first_call = threading.Event()
+
+    def sync_cycle(_uid):
+        if failure_mode == "expired-404":
+            assert schedule.due(now)
+            schedule.pulled(now, has_edits=False)
+        calls.append(now)
+        first_call.set()
+        return []
+
+    sync.sync_once = sync_cycle
+    with sync._scheduler_lock:
+        sync._scheduled[user_id] = now
+    sync._stop_event.clear()
+    worker = threading.Thread(target=sync._run_scheduler, daemon=True)
+    sync._worker = worker
+    worker.start()
+    try:
+        assert first_call.wait(1)
+        time.sleep(0.05)
+        assert len(calls) == 1
+        with sync._scheduler_lock:
+            assert sync._scheduled[user_id] > now
+    finally:
+        sync.stop()
+
+
+def test_idle_sync_does_not_construct_client(tmp_path, monkeypatch):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    now = 1_000.0
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(MemorySecrets()), clock=lambda: now,
+    )
+    db.save_cloud_sync_state(
+        user_id,
+        {
+            "enabled": True,
+            "read_endpoint": "https://read.example",
+            "sync_endpoint": "https://sync.example",
+        },
+        path=str(path),
+    )
+    schedule = sync._edit_schedule(user_id)
+    schedule.start(now)
+    schedule.pulled(now, has_edits=False)
+    monkeypatch.setattr(sync, "_snapshot_gate_unchanged", lambda _uid: True)
+    monkeypatch.setattr(
+        sync, "_client", lambda _uid: pytest.fail("idle sync read credentials"),
+    )
+
+    assert sync.sync_once(user_id) == []
+
+
 def test_same_count_activity_edit_invalidates_snapshot_gate(tmp_path):
     path, user_id = _fixture_db(tmp_path, count=1)
     store = CloudCredentialStore(MemorySecrets())

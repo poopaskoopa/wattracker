@@ -1299,6 +1299,7 @@ def set_ride_rpe(
     user_id: int, activity_id: int, rpe: int, *,
     conn: Optional[sqlite3.Connection] = None,
     expected_current: object = _RPE_EXPECTATION_UNSET,
+    path: Optional[str] = None,
 ) -> RpeTarget:
     """Rate a ride through its resolved owner; workout ratings feed FTP.
 
@@ -1309,7 +1310,7 @@ def set_ride_rpe(
         raise ValueError("rpe must be an integer between 1 and 10")
     owned = conn is None
     if owned:
-        conn = db.connect()
+        conn = db.connect(path)
     try:
         if owned:
             conn.execute("BEGIN IMMEDIATE")
@@ -1323,10 +1324,11 @@ def set_ride_rpe(
         if target.tunes_ftp:
             saved = save_workout_rpe(
                 user_id, target.kind, target.record_id, rpe, conn=conn,
+                path=path,
             )
         else:
             saved = db.set_activity_rpe(
-                user_id, target.record_id, rpe, conn=conn,
+                user_id, target.record_id, rpe, path=path, conn=conn,
             )
         if not saved:
             raise LookupError("activity not found")
@@ -1341,7 +1343,7 @@ def set_ride_rpe(
         if owned and conn is not None:
             conn.close()
     if owned and target.tunes_ftp:
-        apply_rpe_ftp_feedback(user_id)
+        apply_rpe_ftp_feedback(user_id, path=path)
     return updated
 
 
@@ -1401,30 +1403,40 @@ def apply_cloud_rpe_edit(
             conn.rollback()
             return "conflict"
         else:
-            try:
-                target = set_ride_rpe(
-                    user_id, activity_id, rpe, conn=conn,
+            if target.tunes_ftp:
+                saved = save_workout_rpe(
+                    user_id, target.kind, target.record_id, rpe,
+                    conn=conn, path=path, source="cloud",
                     expected_current=base_rpe,
                 )
-            except RpeCompareAndSetConflict:
-                conn.rollback()
-                return "conflict"
+                if not saved:
+                    conn.rollback()
+                    return "conflict"
+                target = replace(target, current=rpe)
+            else:
+                try:
+                    saved = db.set_activity_rpe(
+                        user_id, target.record_id, rpe, path=path, conn=conn,
+                    )
+                except RpeCompareAndSetConflict:
+                    conn.rollback()
+                    return "conflict"
+                if not saved:
+                    conn.rollback()
+                    return "conflict"
+                target = replace(target, current=rpe)
             conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    if target.tunes_ftp:
-        # Keep feedback synchronous with the applied outcome.  If it fails,
-        # the caller must not ack; a redelivery sees the already-equal RPE and
-        # retries this idempotent recomputation without rewriting the rating.
-        apply_rpe_ftp_feedback(user_id, now_utc)
     return "applied"
 
 
 def plan_workout_completion_verified(
     user_id: int, workout: dict, *, conn: Optional[sqlite3.Connection] = None,
+    path: Optional[str] = None,
 ) -> bool:
     """Whether a stored completion is strong enough to expose RPE feedback.
 
@@ -1440,8 +1452,10 @@ def plan_workout_completion_verified(
         return True
     duration = float(workout.get("duration_s") or 0)
     if conn is None:
-        activity = db.get_activity(user_id, workout["completed_activity_id"])
-        timezone = db.get_user_settings(user_id).get("timezone")
+        activity = db.get_activity(
+            user_id, workout["completed_activity_id"], path=path,
+        )
+        timezone = db.get_user_settings(user_id, path=path).get("timezone")
     else:
         row = conn.execute(
             "SELECT * FROM activities WHERE user_id = ? AND id = ?",
@@ -1985,7 +1999,8 @@ def _neutral_rpe(workout_type: str, hard_s: Optional[int] = None) -> int:
 
 
 def apply_rpe_ftp_feedback(
-    user_id: int, now: Optional[_dt.datetime] = None
+    user_id: int, now: Optional[_dt.datetime] = None, *,
+    path: Optional[str] = None,
 ) -> Optional[float]:
     """Apply one bounded FTP step from multiple new compliant hard workouts.
 
@@ -2011,8 +2026,8 @@ def apply_rpe_ftp_feedback(
     by definition nothing was applied).
     """
     now = now or utc_now()
-    settings = db.get_user_settings(user_id)
-    latest = db.latest_ftp(user_id)
+    settings = db.get_user_settings(user_id, path=path)
+    latest = db.latest_ftp(user_id, path=path)
     # A measured ramp test is the rider's own number just as a typed one is,
     # and accepting one deliberately clears ``user_settings.ftp`` - so keying
     # this on the setting alone dropped that rider into a gap where the
@@ -2034,15 +2049,17 @@ def apply_rpe_ftp_feedback(
         ftp_date = latest["date"]
     since = (now.date() - _dt.timedelta(days=FTP_FEEDBACK_WINDOW_DAYS)).isoformat()
     evidence = []
-    for item in db.unused_feedback_evidence(user_id, since):
+    for item in db.unused_feedback_evidence(user_id, since, path=path):
         if float(item.get("compliance") or 0) < PROFILE_MIN_COMPLIANCE:
             continue
         # Plan completions must still verify (linked activity, matching date,
         # duration and objective profile) before their RPE can move FTP; a stale
         # or weak completion link is treated as unverified rather than trusted.
         if item.get("kind") == "plan":
-            workout = db.get_plan_workout(user_id, int(item["id"]))
-            if not plan_workout_completion_verified(user_id, workout or {}):
+            workout = db.get_plan_workout(user_id, int(item["id"]), path=path)
+            if not plan_workout_completion_verified(
+                user_id, workout or {}, path=path,
+            ):
                 continue
         item["neutral_rpe"] = _neutral_rpe(
             item["type"], _zwo_hard_seconds(item.get("zwo"))
@@ -2083,15 +2100,16 @@ def apply_rpe_ftp_feedback(
         db.record_ftp_suggestion(
             user_id, ftp_date, current, updated, chosen,
             summary=[_evidence_summary(e) for e in chosen],
+            path=path,
         )
         return None
     if abs(updated - current) < 0.1:
         batch = db.apply_feedback_batch(
-            user_id, ftp_date, current, 0.0, chosen
+            user_id, ftp_date, current, 0.0, chosen, path=path,
         )
         return current if batch is not None else None
     batch = db.apply_feedback_batch(
-        user_id, ftp_date, updated, delta, chosen
+        user_id, ftp_date, updated, delta, chosen, path=path,
     )
     return updated if batch is not None else None
 
@@ -2112,14 +2130,16 @@ def _evidence_summary(item: dict) -> dict:
 def save_workout_rpe(
     user_id: int, kind: str, workout_id: int, rpe: int,
     now: Optional[_dt.datetime] = None,
-    *, conn: Optional[sqlite3.Connection] = None,
+    *, conn: Optional[sqlite3.Connection] = None, path: Optional[str] = None,
+    source: Literal["desktop", "cloud"] = "desktop",
+    expected_current: object = _RPE_EXPECTATION_UNSET,
 ) -> bool:
-    """Save/correct a rating, reversing its prior feedback batch first."""
-    if kind not in ("plan", "standalone"):
+    """Save a workout rating; desktop writes also reverse and rerun FTP feedback."""
+    if kind not in ("plan", "standalone") or source not in ("desktop", "cloud"):
         return False
     owned = conn is None
     if owned:
-        conn = db.connect()
+        conn = db.connect(path)
     try:
         if owned:
             conn.execute("BEGIN IMMEDIATE")
@@ -2129,15 +2149,40 @@ def save_workout_rpe(
                 if owned:
                     conn.rollback()
                 return False
-        db.rollback_feedback_for_workout(user_id, kind, workout_id, conn=conn)
-        if kind == "plan":
-            saved = db.set_plan_workout_rpe(
-                user_id, workout_id, rpe, conn=conn,
-            )
+        elif source == "cloud":
+            workout = db.get_standalone_workout(user_id, workout_id, conn=conn)
         else:
-            saved = db.set_standalone_rpe(
-                user_id, workout_id, rpe, conn=conn,
+            workout = db.get_standalone_workout(user_id, workout_id, conn=conn)
+        if not workout or workout.get("completed_activity_id") is None:
+            if owned:
+                conn.rollback()
+            return False
+        if (
+            expected_current is not _RPE_EXPECTATION_UNSET
+            and workout.get("rpe") != expected_current
+        ):
+            if owned:
+                conn.rollback()
+            return False
+        if source == "cloud":
+            table = "plan_workouts" if kind == "plan" else "standalone_workouts"
+            cursor = conn.execute(
+                f"UPDATE {table} SET rpe=?, rpe_source='cloud' "
+                "WHERE user_id=? AND id=? AND completed_activity_id IS NOT NULL "
+                "AND rpe IS ?",
+                (rpe, user_id, workout_id, workout.get("rpe")),
             )
+            saved = cursor.rowcount == 1
+        else:
+            db.rollback_feedback_for_workout(user_id, kind, workout_id, conn=conn)
+            if kind == "plan":
+                saved = db.set_plan_workout_rpe(
+                    user_id, workout_id, rpe, path=path, conn=conn,
+                )
+            else:
+                saved = db.set_standalone_rpe(
+                    user_id, workout_id, rpe, path=path, conn=conn,
+                )
         if owned:
             conn.commit()
     except Exception:
@@ -2147,8 +2192,8 @@ def save_workout_rpe(
     finally:
         if owned:
             conn.close()
-    if saved and owned:
-        apply_rpe_ftp_feedback(user_id, now)
+    if saved and owned and source == "desktop":
+        apply_rpe_ftp_feedback(user_id, now, path=path)
     return saved
 
 

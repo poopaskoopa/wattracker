@@ -31,7 +31,7 @@ from .timeutil import (
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 38
+SCHEMA_VERSION = 39
 
 
 def _restrict_db_files(path: str) -> None:
@@ -507,6 +507,10 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
     ],
     36: [_backfill_plan_completion_dates],
     37: [_migrate_cloud_sync_endpoints],
+    38: [
+        "ALTER TABLE plan_workouts ADD COLUMN rpe_source TEXT",
+        "ALTER TABLE standalone_workouts ADD COLUMN rpe_source TEXT",
+    ],
 }
 
 _DROP = """
@@ -696,6 +700,7 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     adjustment_id     INTEGER,
     adjustment_state  TEXT,
     adjustment_source_id INTEGER,
+    rpe_source        TEXT,
     FOREIGN KEY(plan_id) REFERENCES plans(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
@@ -720,6 +725,7 @@ CREATE TABLE IF NOT EXISTS standalone_workouts (
     effective_ftp         REAL,
     feedback_applied      INTEGER NOT NULL DEFAULT 0,
     feedback_batch_id     INTEGER,
+    rpe_source            TEXT,
     created               TEXT NOT NULL,
     UNIQUE(user_id, export_key),
     FOREIGN KEY(user_id) REFERENCES users(id)
@@ -3547,7 +3553,7 @@ def set_plan_workout_rpe(
         conn = connect(path)
     try:
         cur = conn.execute(
-            "UPDATE plan_workouts SET rpe = ? "
+            "UPDATE plan_workouts SET rpe = ?, rpe_source = NULL "
             "WHERE user_id = ? AND id = ? AND completed_activity_id IS NOT NULL",
             (int(rpe), user_id, workout_id),
         )
@@ -3742,7 +3748,8 @@ def set_standalone_rpe(
         conn = connect(path)
     try:
         cur = conn.execute(
-            "UPDATE standalone_workouts SET rpe=? WHERE user_id=? AND id=? "
+            "UPDATE standalone_workouts SET rpe=?, rpe_source=NULL "
+            "WHERE user_id=? AND id=? "
             "AND completed_activity_id IS NOT NULL",
             (int(rpe), user_id, workout_id),
         )
@@ -3835,8 +3842,11 @@ def linked_workout_for_activity(
 
 def get_standalone_workout(
     user_id: int, workout_id: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> Optional[dict]:
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         row = conn.execute(
             "SELECT * FROM standalone_workouts WHERE user_id=? AND id=?",
@@ -3844,7 +3854,8 @@ def get_standalone_workout(
         ).fetchone()
         return _standalone_row(row, True) if row else None
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def unused_feedback_evidence(
@@ -3859,12 +3870,14 @@ def unused_feedback_evidence(
             "SELECT 'plan' AS kind,id,completed_date,type,rpe,compliance,"
             "effective_ftp,zwo_or_segments AS zwo "
             "FROM plan_workouts WHERE user_id=? AND completed_date>=? "
-            "AND rpe IS NOT NULL AND feedback_batch_id IS NULL AND type IN "
+            "AND rpe IS NOT NULL AND feedback_batch_id IS NULL "
+            "AND COALESCE(rpe_source, '') != 'cloud' AND type IN "
             "('threshold','sweet_spot','vo2max') AND compliance IS NOT NULL "
             "AND effective_ftp IS NOT NULL UNION ALL "
             "SELECT 'standalone',id,completed_date,type,rpe,compliance,effective_ftp,zwo "
             "FROM standalone_workouts WHERE user_id=? AND completed_date>=? "
-            "AND rpe IS NOT NULL AND feedback_batch_id IS NULL AND type IN "
+            "AND rpe IS NOT NULL AND feedback_batch_id IS NULL "
+            "AND COALESCE(rpe_source, '') != 'cloud' AND type IN "
             "('threshold','sweet_spot','vo2max') AND compliance IS NOT NULL "
             "AND effective_ftp IS NOT NULL ORDER BY completed_date,id",
             (user_id, since_date, user_id, since_date),

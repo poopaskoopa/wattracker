@@ -3192,7 +3192,9 @@ def create_app() -> FastAPI:
         """Rate the activity or its eligible workout through the shared resolver."""
         uid = _uid(request)
         try:
-            target = importer.set_ride_rpe(uid, activity_id, rpe)
+            target = importer.set_ride_rpe(
+                uid, activity_id, rpe, path=config.db_path(),
+            )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except LookupError:
@@ -4376,7 +4378,9 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         if rpe < 1 or rpe > 10:
             return JSONResponse({"error": "rpe must be between 1 and 10"}, status_code=400)
-        ok = importer.save_workout_rpe(uid, kind, workout_id, rpe)
+        ok = importer.save_workout_rpe(
+            uid, kind, workout_id, rpe, path=config.db_path(),
+        )
         if not ok:
             return JSONResponse({"error": "workout not found or incomplete"}, status_code=404)
         target = next_path if next_path in ("/", "/calendar") else "/"
@@ -7116,7 +7120,9 @@ def create_app() -> FastAPI:
                 {"error": "only verified completed workouts can be graded"},
                 status_code=400,
             )
-        importer.save_workout_rpe(uid, "plan", workout_id, rpe_val)
+        importer.save_workout_rpe(
+            uid, "plan", workout_id, rpe_val, path=config.db_path(),
+        )
         updated = db.get_plan_workout(uid, workout_id)
         return JSONResponse(
             {
@@ -7140,7 +7146,9 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": "rpe must be an integer"}, status_code=400)
         if rpe_val < 1 or rpe_val > 10:
             return JSONResponse({"error": "rpe must be between 1 and 10"}, status_code=400)
-        if not importer.save_workout_rpe(uid, "standalone", workout_id, rpe_val):
+        if not importer.save_workout_rpe(
+            uid, "standalone", workout_id, rpe_val, path=config.db_path(),
+        ):
             return JSONResponse({"error": "workout not found or incomplete"}, status_code=404)
         return JSONResponse({"id": workout_id, "rpe": rpe_val})
 
