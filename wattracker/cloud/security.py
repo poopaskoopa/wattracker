@@ -140,6 +140,7 @@ NEVER_SWEEP_RECORD_KINDS: Final = frozenset({
     _PAIRING_SCOPE_GUARD_KIND,
     DEVICE_SEEN_RECORD_KIND,
     "health",         # the startup access probe
+    "edit-queue",      # scope queue is explicitly retained until ack/expiry
 })
 if SWEEPABLE_RECORD_KINDS & NEVER_SWEEP_RECORD_KINDS:  # pragma: no cover
     raise RuntimeError("a sweepable record kind is also marked never-sweep")

@@ -49,6 +49,8 @@ METRIC_UPLOAD_BYTES: Final = "upload_bytes"
 METRIC_OBJECTS: Final = "objects"
 METRIC_READ_BYTES: Final = "read_bytes"
 METRIC_READ_REQUESTS: Final = "read_requests"
+METRIC_EDITS: Final = "edits"
+DEVICE_SUBJECT: Final = "device"
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1089,27 @@ class QuotaManager:
                         "installation read-byte quota exceeded"),
             ),
             now,
+        )
+
+    def admit_edit(
+        self,
+        namespace: str,
+        local_user_scope: str,
+        device_id: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Meter an edit as a read and enforce durable device/scope ceilings."""
+        moment = self._moment(now)
+        self.admit_read(namespace, local_user_scope, response_bytes=0, now=moment)
+        self._charge(
+            (
+                _Charge(SCOPE_SUBJECT, namespace, local_user_scope,
+                        METRIC_EDITS, 1, 200, "edit quota exceeded"),
+                _Charge(DEVICE_SUBJECT, namespace, device_id,
+                        METRIC_EDITS, 1, 60, "device edit quota exceeded"),
+            ),
+            moment,
         )
 
     def record_read_bytes(
