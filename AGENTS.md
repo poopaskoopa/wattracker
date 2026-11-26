@@ -207,7 +207,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
    Spec in the issue body. Security review required. Independent of 1-3, so take
    it whenever the items above are waiting on review.
 
-5. **#500: cloud phone RPE edit queue (Python).** After #499. Security review.
+5. **#500: cloud phone RPE edit queue (Python). (PR #509)** After #499. Security review.
 
 6. **#501: desktop pull, apply and ack of cloud RPE edits (Python).** After #498 and
    #500. Security review, and its merge **waits on the owner's decision 2 on #497**.
