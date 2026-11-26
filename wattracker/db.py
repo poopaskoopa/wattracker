@@ -3376,9 +3376,12 @@ def plan_workouts_in_range(
 
 
 def get_plan_workout(
-    user_id: int, workout_id: int, path: Optional[str] = None
+    user_id: int, workout_id: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> Optional[dict]:
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         row = conn.execute(
             "SELECT * FROM plan_workouts WHERE user_id = ? AND id = ?",
@@ -3386,7 +3389,8 @@ def get_plan_workout(
         ).fetchone()
         return _plan_workout_row(row, include_zwo=True) if row else None
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def delete_plan(
@@ -3530,24 +3534,29 @@ def set_plan_workout_completion(
 
 
 def set_plan_workout_rpe(
-    user_id: int, workout_id: int, rpe: int, path: Optional[str] = None
+    user_id: int, workout_id: int, rpe: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> bool:
     """Set (or overwrite) the perceived-exertion grade of a completed workout.
 
     Scoped to the user and to workouts that have been completed; returns True
     when a row was updated.
     """
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         cur = conn.execute(
             "UPDATE plan_workouts SET rpe = ? "
             "WHERE user_id = ? AND id = ? AND completed_activity_id IS NOT NULL",
             (int(rpe), user_id, workout_id),
         )
-        conn.commit()
+        if owned:
+            conn.commit()
         return cur.rowcount > 0
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 # ------------------------------------------------ standalone exported workouts
@@ -3726,18 +3735,23 @@ def pending_ratings(user_id: int, path: Optional[str] = None) -> List[dict]:
 
 def set_standalone_rpe(
     user_id: int, workout_id: int, rpe: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> bool:
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         cur = conn.execute(
             "UPDATE standalone_workouts SET rpe=? WHERE user_id=? AND id=? "
             "AND completed_activity_id IS NOT NULL",
             (int(rpe), user_id, workout_id),
         )
-        conn.commit()
+        if owned:
+            conn.commit()
         return cur.rowcount > 0
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def set_activity_distance(
@@ -3763,6 +3777,7 @@ def set_activity_distance(
 
 def set_activity_rpe(
     user_id: int, activity_id: int, rpe: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> bool:
     """Set a subjective perceived-exertion rating directly on an activity.
 
@@ -3770,16 +3785,20 @@ def set_activity_rpe(
     matched rides route their rating through the workout so it feeds the FTP
     loop. Scoped to the user; returns True when a row was updated.
     """
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         cur = conn.execute(
             "UPDATE activities SET rpe=? WHERE user_id=? AND id=?",
             (int(rpe), user_id, activity_id),
         )
-        conn.commit()
+        if owned:
+            conn.commit()
         return cur.rowcount > 0
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def linked_workout_for_activity(
@@ -4030,10 +4049,13 @@ def resolve_ftp_suggestion(
 
 def rollback_feedback_for_workout(
     user_id: int, kind: str, workout_id: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> bool:
     """Undo the active batch containing a workout and release its evidence."""
     table = "plan_workouts" if kind == "plan" else "standalone_workouts"
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         row = conn.execute(
             f"SELECT feedback_batch_id FROM {table} WHERE user_id=? AND id=?",
@@ -4073,10 +4095,12 @@ def rollback_feedback_for_workout(
             "WHERE user_id=? AND batch_id=? AND status='pending'",
             (utc_now().isoformat(), user_id, batch_id),
         )
-        conn.commit()
+        if owned:
+            conn.commit()
         return True
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def activity_start_time(

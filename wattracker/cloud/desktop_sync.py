@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 from .. import db
 from ..timeutil import parse_naive
 from .client import (
+    CloudEditsNotSupported,
     CloudEnrollmentError,
     CloudSyncClient,
     SyncResult,
@@ -28,6 +29,9 @@ from .snapshot import (
 )
 
 DEFAULT_BATCH_LIMIT = 100
+_EDIT_PULL_OFFSETS = (0.0, 600.0, 1_800.0, 7_200.0, 21_600.0, 43_200.0, 64_800.0, 86_400.0)
+_EDIT_PULL_LIMIT_PER_DAY = 8
+_EDIT_UNSUPPORTED_BACKOFF = 86_400.0
 
 
 _log = logging.getLogger(__name__)
@@ -35,6 +39,107 @@ _log = logging.getLogger(__name__)
 
 class CloudDependencyUnavailable(RuntimeError):
     """The optional packages required for desktop cloud sync are absent."""
+
+
+class EditPullSchedule:
+    """In-memory pull cadence with bounded idle polling and injectable time."""
+
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
+        self.clock = clock
+        self.anchor: Optional[float] = None
+        self.slot = 0
+        self.day: Optional[int] = None
+        self.pulls_today = 0
+        self.pending = False
+        self.immediate = False
+        self.retry_required = False
+        self.unsupported_until: Optional[float] = None
+
+    @staticmethod
+    def _utc_day(now: float) -> int:
+        return int(now // 86_400)
+
+    def _roll_day(self, now: float) -> None:
+        day = self._utc_day(now)
+        if self.day != day:
+            self.day = day
+            self.pulls_today = 0
+
+    def start(self, now: Optional[float] = None) -> None:
+        current = self.clock() if now is None else float(now)
+        if self.anchor is None:
+            self.anchor = current
+            self.slot = 0
+            self.immediate = True
+        self._roll_day(current)
+
+    def due(self, now: Optional[float] = None) -> bool:
+        current = self.clock() if now is None else float(now)
+        self.start(current)
+        if self.unsupported_until is not None and current < self.unsupported_until:
+            return False
+        if self.pending:
+            return True
+        if self.pulls_today >= _EDIT_PULL_LIMIT_PER_DAY:
+            return False
+        if self.immediate:
+            return True
+        assert self.anchor is not None
+        return current >= self.anchor + _EDIT_PULL_OFFSETS[self.slot]
+
+    def next_due(self, now: Optional[float] = None) -> float:
+        current = self.clock() if now is None else float(now)
+        self.start(current)
+        due = current
+        if self.unsupported_until is not None:
+            due = max(due, self.unsupported_until)
+        elif self.pending or self.immediate:
+            due = current
+        elif self.pulls_today >= _EDIT_PULL_LIMIT_PER_DAY:
+            due = (self._utc_day(current) + 1) * 86_400.0
+        else:
+            assert self.anchor is not None
+            due = max(current, self.anchor + _EDIT_PULL_OFFSETS[self.slot])
+        return due
+
+    def pulled(self, now: float, *, has_edits: bool) -> None:
+        current = float(now)
+        self.start(current)
+        self.pulls_today += 1
+        was_immediate = self.immediate
+        self.immediate = False
+        self.retry_required = False
+        self.pending = bool(has_edits)
+        if not has_edits:
+            if was_immediate:
+                self.slot = max(self.slot, 1)
+            elif self.slot == len(_EDIT_PULL_OFFSETS) - 1:
+                # Once the final +24h slot fires, start a fresh 24h wait.
+                # Leaving the old anchor in place makes this slot immediately
+                # due again after the UTC daily cap rolls over.
+                self.anchor = current
+            else:
+                self.slot += 1
+
+    def published(self, now: float) -> None:
+        """Reset the decay after a successful publish containing objects."""
+        self.anchor = float(now)
+        self.slot = 1
+        self.immediate = False
+
+    def acknowledged(self, *, remaining: bool = False) -> None:
+        self.pending = remaining
+        self.immediate = not remaining
+
+    def retry_pull(self) -> None:
+        self.immediate = True
+        self.retry_required = True
+
+    def unsupported(self, now: float) -> None:
+        self.unsupported_until = float(now) + _EDIT_UNSUPPORTED_BACKOFF
+        self.pending = False
+        self.immediate = False
+        self.retry_required = False
 
 
 class _UnavailableSecretBackend:
@@ -144,6 +249,8 @@ class DesktopCloudSync:
             int,
             tuple[int, tuple[Any, ...], Optional[tuple[float, Optional[float]]]],
         ] = {}
+        self._edit_schedule_lock = threading.Lock()
+        self._edit_schedules: dict[int, EditPullSchedule] = {}
 
     @staticmethod
     def _user_id(user_id: int) -> int:
@@ -358,6 +465,15 @@ class DesktopCloudSync:
         except Exception:
             return False
 
+    def _edit_schedule(self, user_id: int) -> EditPullSchedule:
+        with self._edit_schedule_lock:
+            schedule = self._edit_schedules.get(user_id)
+            if schedule is None:
+                schedule = EditPullSchedule(clock=self.clock)
+                schedule.start(self.clock())
+                self._edit_schedules[user_id] = schedule
+            return schedule
+
     def _client(self, user_id: int) -> CloudSyncClient:
         state = db.get_cloud_sync_state(user_id, path=self.path)
         read_endpoint = state["read_endpoint"]
@@ -442,13 +558,72 @@ class DesktopCloudSync:
                 )
 
     def sync_once(self, user_id: int) -> list[SyncResult]:
-        """Drain prepared snapshot pages while the local kill switch remains on."""
+        """Pull edits before the snapshot gate, then publish and acknowledge."""
         user_id = self._user_id(user_id)
         if not self._state_enabled(user_id):
             return []
-        if self._snapshot_gate_unchanged(user_id):
+        now = float(self.clock())
+        schedule = self._edit_schedule(user_id)
+        edit_acks: list[dict[str, str]] = []
+        pull_error = False
+        unprocessed_edits = False
+        try:
+            client = self._client(user_id)
+        except (CloudCredentialUnavailable, CloudEnrollmentError, SnapshotError, ValueError) as exc:
+            if self._state_enabled(user_id):
+                self._record_failure(user_id, str(exc)[:2048])
             return []
+
+        # A read endpoint can exist before enrollment has supplied a write
+        # endpoint. Keep the unsupported edit route dormant until publishing
+        # is configured, preserving the no-request behavior of sync_once.
+        if client.sync_endpoint is not None and schedule.due(now):
+            try:
+                edits = client.pull_edits()
+            except CloudEditsNotSupported:
+                schedule.pulled(now, has_edits=False)
+                schedule.unsupported(now)
+            except Exception:
+                # A read failure must not prevent normal snapshot publication.
+                schedule.pulled(now, has_edits=False)
+                schedule.retry_pull()
+                pull_error = True
+            else:
+                schedule.pulled(now, has_edits=bool(edits))
+                if edits:
+                    from ..ingest import importer
+
+                    for edit in edits:
+                        try:
+                            status = importer.apply_cloud_rpe_edit(
+                                user_id,
+                                edit.activity_id,
+                                edit.rpe,
+                                edit.base_rpe,
+                                now=_dt.datetime.fromtimestamp(
+                                    now, tz=_dt.timezone.utc,
+                                ),
+                                path=self.path,
+                            )
+                        except Exception:
+                            _log.info(
+                                "cloud RPE edit activity=%s status=deferred",
+                                edit.activity_id,
+                            )
+                            unprocessed_edits = True
+                            continue
+                        _log.info(
+                            "cloud RPE edit activity=%s status=%s rpe=%s",
+                            edit.activity_id,
+                            status,
+                            edit.rpe,
+                        )
+                        edit_acks.append(edit.ack(status))
+                    if unprocessed_edits:
+                        schedule.retry_pull()
+
         snapshot_token = None
+        snapshot_gated = self._snapshot_gate_unchanged(user_id)
 
         def should_continue() -> bool:
             nonlocal snapshot_token
@@ -458,8 +633,7 @@ class DesktopCloudSync:
             return True
 
         try:
-            client = self._client(user_id)
-            results = client.push_snapshot(
+            results = [] if snapshot_gated else client.push_snapshot(
                 self.path,
                 user_id,
                 limit=self.batch_limit,
@@ -476,9 +650,34 @@ class DesktopCloudSync:
             return results
         failed = next((result for result in results if not result.ok), None)
         if failed is None:
-            self._record_success(user_id, snapshot_token)
+            if not snapshot_gated:
+                self._record_success(user_id, snapshot_token)
+            if results:
+                schedule.published(float(self.clock()))
         else:
             self._record_failure(user_id, self._error_text(failed))
+        if failed is None and edit_acks:
+            try:
+                ack_ok = client.ack_edits(edit_acks)
+            except Exception:
+                ack_ok = False
+            if ack_ok:
+                schedule.acknowledged(remaining=unprocessed_edits)
+                if unprocessed_edits:
+                    self._record_failure(
+                        user_id, "Cloud RPE edit application was deferred."
+                    )
+            else:
+                schedule.retry_pull()
+                self._record_failure(user_id, "Cloud RPE edit acknowledgement failed.")
+        elif failed is None and unprocessed_edits:
+            self._record_failure(user_id, "Cloud RPE edit application was deferred.")
+        if failed is None and unprocessed_edits:
+            # A changed publication resets the normal decay schedule. Keep
+            # deferred items due for the next retry cycle after that reset.
+            schedule.retry_pull()
+        if pull_error and failed is None:
+            self._record_failure(user_id, "Cloud RPE edit pull failed.")
         return results
 
     def mint_pairing_code(self, user_id: int) -> Optional[dict[str, Any]]:
@@ -589,8 +788,13 @@ class DesktopCloudSync:
                 enabled_users = []
             for entry in enabled_users:
                 user_id = int(entry["user_id"])
+                schedule = self._edit_schedule(user_id)
+                schedule.start(now)
                 deadline = entry.get("next_retry_at")
-                due = now if deadline is None else max(now, float(deadline))
+                if deadline is None:
+                    due = schedule.next_due(now)
+                else:
+                    due = max(now, float(deadline))
                 self._scheduled[user_id] = min(
                     due, self._scheduled.get(user_id, due)
                 )
@@ -663,6 +867,11 @@ class DesktopCloudSync:
                     due = float(state["next_retry_at"])
                 else:
                     due = self.clock() + self.periodic_interval_seconds
+                schedule = self._edit_schedule(user_id)
+                pull_due = schedule.next_due(self.clock())
+                if state["next_retry_at"] is not None:
+                    pull_due = max(pull_due, float(state["next_retry_at"]))
+                due = min(due, pull_due)
             with self._scheduler_lock:
                 current = self._scheduled.get(user_id)
                 self._scheduled[user_id] = (

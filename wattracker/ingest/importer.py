@@ -1249,6 +1249,13 @@ class RpeTarget:
     tunes_ftp: bool
 
 
+class RpeCompareAndSetConflict(RuntimeError):
+    """The target's local rating changed before a conditional write."""
+
+
+_RPE_EXPECTATION_UNSET = object()
+
+
 def _rpe_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     """Inspect known local tables, tolerating older snapshot schemas."""
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -1288,20 +1295,132 @@ def resolve_rpe_target(
     return fallback
 
 
-def set_ride_rpe(user_id: int, activity_id: int, rpe: int) -> RpeTarget:
-    """Rate a ride through its resolved owner; workout ratings feed FTP."""
+def set_ride_rpe(
+    user_id: int, activity_id: int, rpe: int, *,
+    conn: Optional[sqlite3.Connection] = None,
+    expected_current: object = _RPE_EXPECTATION_UNSET,
+) -> RpeTarget:
+    """Rate a ride through its resolved owner; workout ratings feed FTP.
+
+    A caller may pass its active transaction and ``expected_current`` to make
+    the resolver and update one SQLite compare-and-set operation.
+    """
     if type(rpe) is not int or not 1 <= rpe <= 10:
         raise ValueError("rpe must be an integer between 1 and 10")
-    target = resolve_rpe_target(user_id, activity_id)
-    if target is None:
-        raise LookupError("activity not found")
+    owned = conn is None
+    if owned:
+        conn = db.connect()
+    try:
+        if owned:
+            conn.execute("BEGIN IMMEDIATE")
+        elif not conn.in_transaction:
+            raise RuntimeError("caller-owned RPE connection needs an active transaction")
+        target = resolve_rpe_target(user_id, activity_id, conn=conn)
+        if target is None:
+            raise LookupError("activity not found")
+        if expected_current is not _RPE_EXPECTATION_UNSET and target.current != expected_current:
+            raise RpeCompareAndSetConflict("ride RPE changed")
+        if target.tunes_ftp:
+            saved = save_workout_rpe(
+                user_id, target.kind, target.record_id, rpe, conn=conn,
+            )
+        else:
+            saved = db.set_activity_rpe(
+                user_id, target.record_id, rpe, conn=conn,
+            )
+        if not saved:
+            raise LookupError("activity not found")
+        updated = replace(target, current=rpe)
+        if owned:
+            conn.commit()
+    except Exception:
+        if owned and conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if owned and conn is not None:
+            conn.close()
+    if owned and target.tunes_ftp:
+        apply_rpe_ftp_feedback(user_id)
+    return updated
+
+
+def apply_cloud_rpe_edit(
+    user_id: int,
+    activity_id: int,
+    rpe: object,
+    base_rpe: object,
+    *,
+    now: Optional[_dt.datetime] = None,
+    path: Optional[str] = None,
+) -> Literal["applied", "conflict", "rejected"]:
+    """Apply a cloud rating only if the local ride still matches its base.
+
+    The write transaction starts before target resolution, so the owner and
+    current RPE cannot change between comparison and update.  Only a local
+    row selected by ``user_id`` can be modified.
+    """
+    if (
+        type(user_id) is not int or user_id < 1
+        or type(activity_id) is not int or not 1 <= activity_id <= 2**53 - 1
+        or type(rpe) is not int or not 1 <= rpe <= 10
+        or (base_rpe is not None and (
+            type(base_rpe) is not int or not 1 <= base_rpe <= 10
+        ))
+        or base_rpe == rpe
+    ):
+        return "rejected"
+    now = now or utc_now()
+    now_utc = (
+        now.replace(tzinfo=_dt.timezone.utc)
+        if now.tzinfo is None else now.astimezone(_dt.timezone.utc)
+    )
+    conn = db.connect(path)
+    target = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        target = resolve_rpe_target(user_id, activity_id, conn=conn)
+        if target is None:
+            conn.rollback()
+            return "rejected"
+        activity = conn.execute(
+            "SELECT start_time FROM activities WHERE user_id = ? AND id = ?",
+            (user_id, activity_id),
+        ).fetchone()
+        started = parse_naive(activity["start_time"]) if activity is not None else None
+        if started is None:
+            conn.rollback()
+            return "rejected"
+        started = started.replace(tzinfo=_dt.timezone.utc)
+        if started < now_utc - _dt.timedelta(days=30):
+            conn.rollback()
+            return "rejected"
+        if target.current == rpe:
+            conn.commit()
+        elif target.current != base_rpe:
+            conn.rollback()
+            return "conflict"
+        else:
+            try:
+                target = set_ride_rpe(
+                    user_id, activity_id, rpe, conn=conn,
+                    expected_current=base_rpe,
+                )
+            except RpeCompareAndSetConflict:
+                conn.rollback()
+                return "conflict"
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     if target.tunes_ftp:
-        saved = save_workout_rpe(user_id, target.kind, target.record_id, rpe)
-    else:
-        saved = db.set_activity_rpe(user_id, target.record_id, rpe)
-    if not saved:
-        raise LookupError("activity not found")
-    return replace(target, current=rpe)
+        # Keep feedback synchronous with the applied outcome.  If it fails,
+        # the caller must not ack; a redelivery sees the already-equal RPE and
+        # retries this idempotent recomputation without rewriting the rating.
+        apply_rpe_ftp_feedback(user_id, now_utc)
+    return "applied"
 
 
 def plan_workout_completion_verified(
@@ -1993,20 +2112,42 @@ def _evidence_summary(item: dict) -> dict:
 def save_workout_rpe(
     user_id: int, kind: str, workout_id: int, rpe: int,
     now: Optional[_dt.datetime] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> bool:
     """Save/correct a rating, reversing its prior feedback batch first."""
     if kind not in ("plan", "standalone"):
         return False
-    if kind == "plan":
-        workout = db.get_plan_workout(user_id, workout_id)
-        if not plan_workout_completion_verified(user_id, workout or {}):
-            return False
-    db.rollback_feedback_for_workout(user_id, kind, workout_id)
-    if kind == "plan":
-        saved = db.set_plan_workout_rpe(user_id, workout_id, rpe)
-    else:
-        saved = db.set_standalone_rpe(user_id, workout_id, rpe)
-    if saved:
+    owned = conn is None
+    if owned:
+        conn = db.connect()
+    try:
+        if owned:
+            conn.execute("BEGIN IMMEDIATE")
+        if kind == "plan":
+            workout = db.get_plan_workout(user_id, workout_id, conn=conn)
+            if not plan_workout_completion_verified(user_id, workout or {}, conn=conn):
+                if owned:
+                    conn.rollback()
+                return False
+        db.rollback_feedback_for_workout(user_id, kind, workout_id, conn=conn)
+        if kind == "plan":
+            saved = db.set_plan_workout_rpe(
+                user_id, workout_id, rpe, conn=conn,
+            )
+        else:
+            saved = db.set_standalone_rpe(
+                user_id, workout_id, rpe, conn=conn,
+            )
+        if owned:
+            conn.commit()
+    except Exception:
+        if owned:
+            conn.rollback()
+        raise
+    finally:
+        if owned:
+            conn.close()
+    if saved and owned:
         apply_rpe_ftp_feedback(user_id, now)
     return saved
 

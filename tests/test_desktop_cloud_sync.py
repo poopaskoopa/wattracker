@@ -19,7 +19,11 @@ from wattracker.cloud.client import (
     validate_cloud_endpoint,
 )
 from wattracker.cloud.credentials import CloudCredentialStore, CloudCredentialUnavailable
-from wattracker.cloud.desktop_sync import CloudDependencyUnavailable, DesktopCloudSync
+from wattracker.cloud.desktop_sync import (
+    CloudDependencyUnavailable,
+    DesktopCloudSync,
+    EditPullSchedule,
+)
 from wattracker.cloud.models import SyncBatch
 from wattracker.cloud.security import PublicKeyUnavailable
 from wattracker.cloud.snapshot import snapshot_objects
@@ -90,6 +94,24 @@ def _credentials():
     )
 
 
+def _configured_edit_sync(path, user_id, transport, *, clock):
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(_credentials(), user_id=user_id)
+    db.save_cloud_sync_state(
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
+    )
+    return DesktopCloudSync(
+        str(path), store, transport=transport, clock=clock,
+        include_derived=False,
+    )
+
+
 def _two_rider_sync(tmp_path):
     path, first_user_id = _fixture_db(tmp_path, count=1)
     second_user_id = db.create_user("second-rider", "not-a-password", path=str(path))
@@ -149,6 +171,8 @@ def test_desktop_sync_publishes_streams_by_default(tmp_path):
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -182,6 +206,8 @@ def test_stream_option_gate_uploads_only_new_stream_objects(tmp_path):
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -472,6 +498,8 @@ def test_offline_queue_retry_and_drain_preserves_snapshot_ledger(tmp_path):
     responses = [(503, b'{"detail":"offline"}'), (200, b'{"revision":1}')]
 
     def transport(_url, _headers, _body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 404, b"{}"
         return responses.pop(0)
 
     sync = DesktopCloudSync(
@@ -504,6 +532,8 @@ def test_default_batch_limit_uses_the_measured_100_object_page(tmp_path):
     bodies = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         bodies.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -543,6 +573,8 @@ def test_timeout_then_retry_replays_same_batch_and_records_success(tmp_path):
     requests = []
 
     def transport(_url, headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 404, b"{}"
         wire = json.loads(body)
         requests.append((dict(headers), wire))
         batch = SyncBatch.from_wire(wire)
@@ -591,6 +623,8 @@ def test_disable_between_pages_stops_before_the_next_outbound_request(tmp_path):
     sync = None
 
     def transport(url, _headers, _body):
+        if url.endswith("/api/v1/edits/pull"):
+            return 404, b"{}"
         calls.append(url)
         sync.set_enabled(user_id, False)
         return 200, b'{"revision":1}'
@@ -832,6 +866,8 @@ def test_unchanged_sync_skips_snapshot_rebuild(tmp_path, monkeypatch):
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -861,6 +897,217 @@ def test_unchanged_sync_skips_snapshot_rebuild(tmp_path, monkeypatch):
         sync.stop()
 
 
+def test_edit_pull_runs_before_snapshot_gate_and_publish_precedes_ack(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = [dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()]
+    edit = {
+        "edit_id": "a" * 32, "activity_id": 1, "rpe": 6,
+        "base_rpe": None, "created_at": now[0],
+    }
+    calls = []
+    published = []
+    pull_count = 0
+
+    def transport(url, _headers, body):
+        nonlocal pull_count
+        if url.endswith("/api/v1/edits/pull"):
+            calls.append("pull")
+            pull_count += 1
+            return 200, json.dumps({"edits": [] if pull_count == 1 else [edit]}).encode()
+        if url.endswith("/api/v1/sync/batches"):
+            calls.append("publish")
+            published.append(json.loads(body))
+            return 200, b'{"revision":1}'
+        if url.endswith("/api/v1/edits/ack"):
+            calls.append("ack")
+            assert json.loads(body) == {
+                "results": [{"edit_id": "a" * 32, "status": "applied"}]
+            }
+            return 200, b'{"acked":1}'
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now[0])
+    try:
+        first_results = sync.sync_once(user_id)
+        assert first_results and all(result.ok for result in first_results)
+        now[0] += 600
+        results = sync.sync_once(user_id)
+    finally:
+        sync.stop()
+
+    assert results and all(result.ok for result in results)
+    assert calls == ["pull", "publish", "pull", "publish", "ack"]
+    activity = next(obj for obj in published[1]["objects"] if obj["kind"] == "activity")
+    assert activity["data"]["rpe"] == 6
+    assert db.get_activity(user_id, 1, path=str(path))["rpe"] == 6
+
+
+def test_failed_publish_retries_edit_without_duplicate_write(tmp_path, monkeypatch):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()
+    edit = {
+        "edit_id": "b" * 32, "activity_id": 1, "rpe": 6,
+        "base_rpe": None, "created_at": now,
+    }
+    calls = []
+    publish_attempts = 0
+    writes = []
+    original_set = db.set_activity_rpe
+
+    def set_activity_rpe(*args, **kwargs):
+        writes.append((args, kwargs))
+        return original_set(*args, **kwargs)
+
+    monkeypatch.setattr(db, "set_activity_rpe", set_activity_rpe)
+
+    def transport(url, _headers, body):
+        if url.endswith("/api/v1/edits/pull"):
+            calls.append("pull")
+            return 200, json.dumps({"edits": [edit]}).encode()
+        if url.endswith("/api/v1/sync/batches"):
+            calls.append("publish")
+            nonlocal publish_attempts
+            publish_attempts += 1
+            if publish_attempts == 1:
+                return 503, b'{"detail":"offline"}'
+            return 200, b'{"revision":2}'
+        if url.endswith("/api/v1/edits/ack"):
+            calls.append("ack")
+            return 200, b'{"acked":1}'
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now)
+    try:
+        results = sync.sync_once(user_id)
+        assert results and not results[0].ok
+        assert calls == ["pull", "publish"]
+        assert sync._edit_schedule(user_id).pending
+        retry = sync.sync_once(user_id)
+        assert retry and all(result.ok for result in retry)
+    finally:
+        sync.stop()
+    assert calls == ["pull", "publish", "pull", "publish", "ack"]
+    assert len(writes) == 1
+    assert db.get_activity(user_id, 1, path=str(path))["rpe"] == 6
+
+
+def test_replaced_edit_stale_ack_is_noop_then_new_edit_conflicts(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()
+    assert db.set_activity_rpe(user_id, 1, 4, path=str(path))
+    first = {
+        "edit_id": "c" * 32, "activity_id": 1, "rpe": 6,
+        "base_rpe": 4, "created_at": now,
+    }
+    replacement = {
+        "edit_id": "d" * 32, "activity_id": 1, "rpe": 8,
+        "base_rpe": 4, "created_at": now + 1,
+    }
+    pending = [first]
+    pulls = []
+    acks = []
+    publishes = []
+
+    def transport(url, _headers, body):
+        if url.endswith("/api/v1/edits/pull"):
+            pulls.append(1)
+            return 200, json.dumps({"edits": list(pending)}).encode()
+        if url.endswith("/api/v1/sync/batches"):
+            publishes.append(json.loads(body))
+            return 200, b'{"revision":1}'
+        if url.endswith("/api/v1/edits/ack"):
+            results = json.loads(body)["results"]
+            acks.extend(results)
+            if results[0]["edit_id"] == first["edit_id"]:
+                # The phone replaced E1 before its acknowledgement arrived.
+                pending[:] = [replacement]
+                return 200, b'{"acked":0}'
+            pending.clear()
+            return 200, b'{"acked":1}'
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now)
+    try:
+        assert all(result.ok for result in sync.sync_once(user_id))
+        assert sync.sync_once(user_id) == []
+    finally:
+        sync.stop()
+
+    assert len(pulls) == 2
+    assert len(publishes) == 1
+    assert acks == [
+        {"edit_id": first["edit_id"], "status": "applied"},
+        {"edit_id": replacement["edit_id"], "status": "conflict"},
+    ]
+    assert db.get_activity(user_id, 1, path=str(path))["rpe"] == 6
+
+
+def test_edit_pull_404_backs_off_without_recording_failure_or_skipping_publish(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()
+    calls = []
+
+    def transport(url, _headers, _body):
+        if url.endswith("/api/v1/edits/pull"):
+            calls.append("pull")
+            return 404, b'{}'
+        if url.endswith("/api/v1/sync/batches"):
+            calls.append("publish")
+            return 200, b'{"revision":1}'
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now)
+    try:
+        results = sync.sync_once(user_id)
+        assert results and all(result.ok for result in results)
+        state = db.get_cloud_sync_state(user_id, path=str(path))
+        assert state["retry_count"] == 0
+        assert state["next_retry_at"] is None
+        assert state["last_error"] is None
+        assert calls == ["pull", "publish"]
+        assert sync._edit_schedule(user_id).unsupported_until == now + 86_400
+    finally:
+        sync.stop()
+
+
+def test_edit_pull_schedule_decays_and_caps_idle_polls(tmp_path):
+    schedule = EditPullSchedule(clock=lambda: 0.0)
+    schedule.start(0)
+    assert schedule.due(0)
+    schedule.pulled(0, has_edits=False)
+    assert schedule.next_due(0) == 600
+    assert not schedule.due(599)
+    assert schedule.due(600)
+    schedule.pulled(600, has_edits=False)
+    assert schedule.next_due(600) == 1_800
+    assert not schedule.due(1_799)
+    assert schedule.due(1_800)
+    schedule.pulled(1_800, has_edits=False)
+    assert schedule.next_due(1_800) == 7_200
+    assert not schedule.due(7_199)
+    assert schedule.due(7_200)
+    schedule.pulled(7_200, has_edits=False)
+    assert schedule.next_due(7_200) == 21_600
+    assert not schedule.due(21_599)
+    assert schedule.due(21_600)
+    schedule.published(10_000)
+    assert schedule.next_due(10_000) == 10_600
+    assert not schedule.due(10_599)
+
+    idle = EditPullSchedule(clock=lambda: 0.0)
+    idle.start(0)
+    pulls = 0
+    for now in range(0, 86_401, 60):
+        if idle.due(now):
+            pulls += 1
+            idle.pulled(now, has_edits=False)
+    assert pulls <= 8
+    assert idle.pulls_today == 1  # the final poll landed at the UTC day edge
+    assert not idle.due(86_401)
+    assert idle.next_due(86_401) == 172_800
+    assert idle.due(172_800)
+
+
 def test_same_count_activity_edit_invalidates_snapshot_gate(tmp_path):
     path, user_id = _fixture_db(tmp_path, count=1)
     store = CloudCredentialStore(MemorySecrets())
@@ -868,6 +1115,8 @@ def test_same_count_activity_edit_invalidates_snapshot_gate(tmp_path):
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -912,6 +1161,8 @@ def test_source_write_racing_success_baseline_is_published_next_cycle(
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -1037,6 +1288,8 @@ def test_derived_snapshot_gate_expires_when_calendar_day_changes(
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -1132,6 +1385,34 @@ def test_idle_scheduler_wait_is_untimed(tmp_path):
     try:
         assert entered.wait(2)
         assert None in sync._scheduler_lock.timeouts
+    finally:
+        sync.stop()
+
+
+def test_scheduler_start_preserves_persisted_retry_deadline(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    now = 1_000.0
+    retry_at = now + 300
+    db.save_cloud_sync_state(
+        user_id,
+        {
+            "enabled": True,
+            "read_endpoint": "https://read.example",
+            "sync_endpoint": "https://sync.example",
+            "next_retry_at": retry_at,
+        },
+        path=str(path),
+    )
+    attempted = threading.Event()
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(MemorySecrets()), clock=lambda: now,
+    )
+    sync.sync_once = lambda _uid: attempted.set() or []
+    sync.start()
+    try:
+        with sync._scheduler_lock:
+            assert sync._scheduled[user_id] == retry_at
+        assert not attempted.wait(0.05)
     finally:
         sync.stop()
 

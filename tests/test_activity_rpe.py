@@ -6,10 +6,12 @@ verified plan/standalone workout drives that workout's rating; an unmatched
 ride carries its own subjective rating).
 """
 import sqlite3
+import datetime as dt
 
 import pytest
 
 from wattracker import auth, db
+from wattracker.ingest import importer
 
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
@@ -116,6 +118,85 @@ def test_activity_rpe_user_scoped(client):
     r = client.post(f"/api/activity/{aid}/rpe", json={"rpe": 5})
     assert r.status_code == 404
     assert db.get_activity(alice, aid)["rpe"] is None
+
+
+def test_cloud_rpe_edit_compare_and_set_and_same_value_is_no_write(client, monkeypatch):
+    uid = _register(client)
+    aid = _insert(uid, start="2026-06-10T10:00:00")
+    now = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
+
+    assert importer.apply_cloud_rpe_edit(uid, aid, 6, None, now=now) == "applied"
+    assert db.get_activity(uid, aid)["rpe"] == 6
+
+    def unexpected_write(*_args, **_kwargs):
+        pytest.fail("an already-current cloud rating must not write")
+
+    monkeypatch.setattr(db, "set_activity_rpe", unexpected_write)
+    assert importer.apply_cloud_rpe_edit(uid, aid, 6, None, now=now) == "applied"
+    assert importer.apply_cloud_rpe_edit(uid, aid, 8, None, now=now) == "conflict"
+    assert db.get_activity(uid, aid)["rpe"] == 6
+
+
+@pytest.mark.parametrize("rpe,base_rpe", [(True, None), (11, None), (6, True), (6, 6)])
+def test_cloud_rpe_edit_rejects_invalid_wire_values(client, rpe, base_rpe):
+    uid = _register(client)
+    aid = _insert(uid, start="2026-06-10T10:00:00")
+    assert importer.apply_cloud_rpe_edit(
+        uid, aid, rpe, base_rpe,
+        now=dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc),
+    ) == "rejected"
+    assert db.get_activity(uid, aid)["rpe"] is None
+
+
+def test_cloud_rpe_edit_rejects_missing_duplicate_old_and_other_user_targets(client):
+    alice = _register(client, "alice")
+    recent = _insert(alice, start="2026-06-10T10:00:00")
+    duplicate = _insert(alice, start="2026-06-11T10:00:00")
+    assert db.set_duplicate_of(alice, duplicate, recent)
+    bob = db.create_user("bob", "not-a-password")
+    bob_activity = _insert(bob, start="2026-06-10T10:00:00")
+    old = _insert(alice, start="2026-04-01T10:00:00")
+    now = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
+
+    assert importer.apply_cloud_rpe_edit(alice, 999999, 6, None, now=now) == "rejected"
+    assert importer.apply_cloud_rpe_edit(alice, duplicate, 6, None, now=now) == "rejected"
+    assert importer.apply_cloud_rpe_edit(alice, bob_activity, 6, None, now=now) == "rejected"
+    assert importer.apply_cloud_rpe_edit(alice, old, 6, None, now=now) == "rejected"
+    assert db.get_activity(bob, bob_activity)["rpe"] is None
+
+
+def test_cloud_rpe_edit_updates_verified_workout_through_shared_resolver(client, monkeypatch):
+    uid = _register(client)
+    aid = _insert(uid, seconds=3600, start="2026-06-10T10:00:00")
+    plan_id = db.create_plan(uid, "Base", "2026-06-01", 4)
+    workout_id = db.add_plan_workout(
+        plan_id, uid, "2026-06-10", "Endurance", "endurance", 3600, 50.0, "<>"
+    )
+    assert db.mark_plan_workout_completed(uid, workout_id, aid, "2026-06-10")
+    calls = []
+    save_calls = []
+    original_set = db.set_plan_workout_rpe
+    original_save = importer.save_workout_rpe
+
+    def save_workout(user_id, kind, workout_id, rpe, now=None, *, conn=None):
+        save_calls.append((user_id, kind, workout_id, rpe, conn is not None))
+        return original_save(user_id, kind, workout_id, rpe, now, conn=conn)
+    def set_workout(user_id, workout_id, rpe, path=None, *, conn=None):
+        calls.append((user_id, workout_id, rpe, conn is not None))
+        return original_set(user_id, workout_id, rpe, path, conn=conn)
+
+    monkeypatch.setattr(db, "set_plan_workout_rpe", set_workout)
+    monkeypatch.setattr(importer, "save_workout_rpe", save_workout)
+    monkeypatch.setattr(importer, "apply_rpe_ftp_feedback", lambda user_id, now=None: calls.append(("feedback", user_id)))
+
+    assert importer.apply_cloud_rpe_edit(
+        uid, aid, 7, None,
+        now=dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc),
+    ) == "applied"
+    assert db.get_plan_workout(uid, workout_id)["rpe"] == 7
+    assert db.get_activity(uid, aid)["rpe"] is None
+    assert calls == [(uid, workout_id, 7, True), ("feedback", uid)]
+    assert save_calls == [(uid, "plan", workout_id, 7, True)]
 
 
 # ----------------------------------------------- type-aware linkage
