@@ -340,4 +340,81 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertEqual(groups[1].rows.map(\.percent), [100])
         XCTAssertTrue(ZoneGroup.extract(from: nil).isEmpty)
     }
+
+    func testStreamSelectionNearestSample() {
+        let xs = [0.0, 10, 20]
+        XCTAssertEqual(StreamSelection.nearestIndex(xs: xs, at: 10), 1)
+        XCTAssertEqual(StreamSelection.nearestIndex(xs: xs, at: 17), 2)
+        XCTAssertEqual(StreamSelection.nearestIndex(xs: xs, at: 15), 1)
+        XCTAssertEqual(StreamSelection.nearestIndex(xs: xs, at: -1), 0)
+        XCTAssertEqual(StreamSelection.nearestIndex(xs: xs, at: 30), 2)
+        XCTAssertEqual(StreamSelection.nearestIndex(xs: [4], at: 30), 0)
+        XCTAssertNil(StreamSelection.nearestIndex(xs: [], at: 0))
+    }
+
+    func testStreamReadoutUsesRawValuesAndClock() throws {
+        let payload = ActivityStreams(streams: .init(
+            time: [1_825, 3_723], power: [245, 400], heartrate: [152, 160],
+            cadence: [88, 90], altitude: [1_000, 1_100]))
+        let series = CombinedChartSeries.build(from: payload)
+        XCTAssertNotEqual(series.first { $0.id == "power" }?.points[0].scaled, 245)
+        XCTAssertEqual(try XCTUnwrap(StreamReadout(series: series, index: 0, hidden: [])).text,
+                       "30:25 · 245 W · 88 rpm · 152 bpm")
+        XCTAssertEqual(try XCTUnwrap(StreamReadout(series: series, index: 1, hidden: [])).text,
+                       "1:02:03 · 400 W · 90 rpm · 160 bpm")
+        XCTAssertNil(StreamReadout(series: series, index: 2, hidden: []))
+    }
+
+    func testStreamReadoutGapsHiddenChannelsAndSharedFallbackClock() throws {
+        let payload = ActivityStreams(streams: .init(
+            time: [nil, nil, nil], power: [100, nil, 300], heartrate: [140, 150, 160],
+            cadence: nil, altitude: [50, 60, 70]))
+        let series = CombinedChartSeries.build(from: payload, durationSeconds: 3_600)
+        let xs = StreamSelection.xs(in: series)
+        XCTAssertEqual(xs, [0, 30, 60])
+        let index = try XCTUnwrap(StreamSelection.nearestIndex(xs: xs, at: 30.1))
+        let readout = try XCTUnwrap(StreamReadout(series: series, index: index, hidden: []))
+        XCTAssertEqual(readout.minutes, series.first { $0.id == "heart-rate" }?.points[1].minutes)
+        XCTAssertEqual(readout.text, "30:00 · — W · — rpm · 150 bpm")
+        XCTAssertEqual(try XCTUnwrap(StreamReadout(series: series, index: 2, hidden: ["power", "cadence"])).text,
+                       "1:00:00 · 160 bpm")
+        XCTAssertEqual(try XCTUnwrap(StreamReadout(series: series, index: 0,
+                                                 hidden: ["power", "cadence", "heart-rate", "altitude"])).text,
+                       "0:00")
+    }
+
+    func testStreamDragClampsButOutsideTapClears() {
+        let frame = CGRect(x: 20, y: 10, width: 100, height: 50)
+        XCTAssertEqual(StreamSelection.plotX(at: CGPoint(x: 5, y: 30), frame: frame, dragging: true), 0)
+        XCTAssertEqual(StreamSelection.plotX(at: CGPoint(x: 140, y: 30), frame: frame, dragging: true), 100)
+        XCTAssertEqual(StreamSelection.plotX(at: CGPoint(x: 70, y: -50), frame: frame, dragging: true), 50)
+        XCTAssertEqual(StreamSelection.plotX(at: CGPoint(x: 70, y: 100), frame: frame, dragging: true), 50)
+        XCTAssertNil(StreamSelection.plotX(at: CGPoint(x: 5, y: 30), frame: frame, dragging: false))
+        XCTAssertNil(StreamSelection.plotX(at: CGPoint(x: 70, y: 100), frame: frame, dragging: false))
+        XCTAssertEqual(StreamSelection.plotX(at: CGPoint(x: 70, y: 30), frame: frame, dragging: false), 50)
+    }
+
+    func testStreamReadoutRoundsFallbackTimeAndRawValues() throws {
+        let payload = ActivityStreams(streams: .init(
+            time: [nil, nil, nil], power: [100, 245.6, 300], heartrate: nil,
+            cadence: nil, altitude: nil))
+        let series = CombinedChartSeries.build(from: payload, durationSeconds: 3_649.1)
+        let readout = try XCTUnwrap(StreamReadout(series: series, index: 1, hidden: []))
+        XCTAssertEqual(readout.minutes * 60, 1_824.55, accuracy: 1e-9)
+        XCTAssertEqual(readout.text, "30:25 · 246 W · — rpm · — bpm")
+    }
+
+    func testStreamSelectionUnionsEverySeriesSample() throws {
+        let payload = ActivityStreams(streams: .init(
+            time: [0, 60, 120], power: [100, 245, 300], heartrate: nil,
+            cadence: nil, altitude: [50, nil, 70]))
+        let series = CombinedChartSeries.build(from: payload)
+        XCTAssertEqual(series.first?.id, "altitude")
+        XCTAssertEqual(series.first?.points.map(\.minutes), [0, 2])
+        XCTAssertEqual(StreamSelection.xs(in: series), [0, 1, 2])
+        let index = try XCTUnwrap(StreamSelection.nearestIndex(xs: StreamSelection.xs(in: series), at: 1))
+        XCTAssertEqual(try XCTUnwrap(StreamReadout(series: series, index: index, hidden: [])).text,
+                       "1:00 · 245 W · — rpm · — bpm")
+    }
+
 }

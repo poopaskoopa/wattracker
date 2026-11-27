@@ -273,6 +273,56 @@ struct CombinedChartSeries: Identifiable {
     }
 }
 
+/// Selection uses the union of plotted sample positions, never a second clock.
+enum StreamSelection {
+    static func xs(in series: [CombinedChartSeries]) -> [Double] {
+        Array(Set(series.flatMap(\.points).map(\.minutes))).sorted()
+    }
+
+    /// Expanded scrubbing clamps to an edge sample even in the label gutters
+    /// or beyond the plot vertically. Inline taps outside the plot clear.
+    static func plotX(at point: CGPoint, frame: CGRect, dragging: Bool) -> Double? {
+        guard dragging || frame.contains(point) else { return nil }
+        return min(max(point.x, frame.minX), frame.maxX) - frame.minX
+    }
+
+    /// Binary search; an exact midpoint belongs to the earlier sample.
+    static func nearestIndex(xs: [Double], at x: Double) -> Int? {
+        guard !xs.isEmpty, x.isFinite else { return nil }
+        var low = 0, high = xs.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if xs[mid] < x { low = mid + 1 } else { high = mid }
+        }
+        if low == 0 { return 0 }
+        if low == xs.count { return xs.count - 1 }
+        return x - xs[low - 1] <= xs[low] - x ? low - 1 : low
+    }
+}
+
+struct StreamReadout {
+    let minutes: Double
+    let text: String
+
+    init?(series: [CombinedChartSeries], index: Int, hidden: Set<String>) {
+        let xs = StreamSelection.xs(in: series)
+        guard xs.indices.contains(index) else { return nil }
+        let selected = xs[index]
+        minutes = selected
+        let seconds = max(0, Int((minutes * 60).rounded()))
+        let time = seconds >= 3_600
+            ? String(format: "%d:%02d:%02d", seconds / 3_600, seconds % 3_600 / 60, seconds % 60)
+            : String(format: "%d:%02d", seconds / 60, seconds % 60)
+        let channels = [("power", "W"), ("cadence", "rpm"), ("heart-rate", "bpm")]
+        let values = channels.compactMap { id, unit -> String? in
+            guard !hidden.contains(id) else { return nil }
+            let point = series.first { $0.id == id }?.points.first { $0.minutes == selected }
+            return point.map { "\(Int($0.value.rounded())) \(unit)" } ?? "— \(unit)"
+        }
+        text = ([time] + values).joined(separator: " · ")
+    }
+}
+
 /// Converts a stream sample to true elapsed minutes.
 ///
 /// The cloud's `time` channel is usually all nil: the desktop stores ISO

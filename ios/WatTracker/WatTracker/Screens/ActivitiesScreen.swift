@@ -300,8 +300,21 @@ struct StreamCharts: View {
     let streams: ActivityStreams
     var durationSeconds: Double?
     @State private var hidden: Set<String> = []
+    @State private var expanded = false
+    @State private var selectedMinutes: Double?
 
     var body: some View {
+        Panel { chartContent(expanded: false) }
+            .fullScreenCover(isPresented: $expanded, onDismiss: { selectedMinutes = nil }) {
+                chartContent(expanded: true)
+                    .padding(16)
+                    .background(Palette.bg)
+            }
+            .onChange(of: streams) { _, _ in selectedMinutes = nil }
+            .onChange(of: durationSeconds) { _, _ in selectedMinutes = nil }
+    }
+
+    private func chartContent(expanded: Bool) -> some View {
         let series = CombinedChartSeries.build(from: streams, durationSeconds: durationSeconds)
         let visible = series.filter { !hidden.contains($0.id) }
         let all = StreamSeries.all(in: streams)
@@ -311,85 +324,152 @@ struct StreamCharts: View {
             ? CombinedChartSeries.axis(.shared, in: all) : nil
         let extent = CombinedChartSeries.extent(series)
         let xTicks = ChartTicks.minutes(upTo: extent)
-        Panel {
-            VStack(alignment: .leading, spacing: 8) {
+        let xs = StreamSelection.xs(in: series)
+        let readout = selectedMinutes.flatMap { x in
+            StreamSelection.nearestIndex(xs: xs, at: x).flatMap {
+                StreamReadout(series: series, index: $0, hidden: hidden)
+            }
+        }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
                 Text("Ride graphs").font(.headline).foregroundStyle(Palette.textBright)
-                HStack {
-                    Text(powerAxis?.title ?? "").foregroundStyle(Palette.accent)
-                    Spacer()
-                    Text(sharedAxis?.title ?? "").foregroundStyle(Palette.muted)
+                Spacer()
+                Button {
+                    if expanded { selectedMinutes = nil; self.expanded = false }
+                    else { self.expanded = true }
+                } label: {
+                    Image(systemName: expanded ? "xmark" : "arrow.up.left.and.arrow.down.right")
+                        .padding(6)
                 }
-                .font(.caption2)
-                Chart {
-                    ForEach(visible) { s in
-                        ForEach(s.points) { p in
-                            if s.isBackground {
-                                AreaMark(x: .value("Minutes", p.minutes),
-                                         y: .value(s.title, p.scaled),
-                                         series: .value("Series", s.id))
-                                    .foregroundStyle(s.color.opacity(CombinedChartSeries.altitudeFillOpacity))
-                                    .interpolationMethod(.linear)
-                                LineMark(x: .value("Minutes", p.minutes),
-                                         y: .value(s.title, p.scaled),
-                                         series: .value("Series", s.id))
-                                    .foregroundStyle(s.color.opacity(CombinedChartSeries.altitudeLineOpacity))
-                                    .lineStyle(StrokeStyle(lineWidth: 1))
-                                    .interpolationMethod(.linear)
-                            } else {
-                                LineMark(x: .value("Minutes", p.minutes),
-                                         y: .value(s.title, p.scaled),
-                                         series: .value("Series", s.id))
-                                    .foregroundStyle(s.color)
-                                    .lineStyle(StrokeStyle(lineWidth: 1.5))
-                                    .interpolationMethod(.linear)
-                            }
+                .accessibilityLabel(expanded ? "Close ride graph" : "Expand ride graph")
+            }
+            HStack {
+                Text(powerAxis?.title ?? "").foregroundStyle(Palette.accent)
+                Spacer()
+                Text(sharedAxis?.title ?? "").foregroundStyle(Palette.muted)
+            }
+            .font(.caption2)
+            Chart {
+                if let readout {
+                    RuleMark(x: .value("Selected minutes", readout.minutes))
+                        .foregroundStyle(Palette.textBright)
+                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                }
+                ForEach(visible) { s in
+                    ForEach(s.points) { p in
+                        if s.isBackground {
+                            AreaMark(x: .value("Minutes", p.minutes),
+                                     y: .value(s.title, p.scaled),
+                                     series: .value("Series", s.id))
+                                .foregroundStyle(s.color.opacity(CombinedChartSeries.altitudeFillOpacity))
+                                .interpolationMethod(.linear)
+                            LineMark(x: .value("Minutes", p.minutes),
+                                     y: .value(s.title, p.scaled),
+                                     series: .value("Series", s.id))
+                                .foregroundStyle(s.color.opacity(CombinedChartSeries.altitudeLineOpacity))
+                                .lineStyle(StrokeStyle(lineWidth: 1))
+                                .interpolationMethod(.linear)
+                        } else {
+                            LineMark(x: .value("Minutes", p.minutes),
+                                     y: .value(s.title, p.scaled),
+                                     series: .value("Series", s.id))
+                                .foregroundStyle(s.color)
+                                .lineStyle(StrokeStyle(lineWidth: 1.5))
+                                .interpolationMethod(.linear)
                         }
                     }
                 }
-                .chartForegroundStyleScale(domain: series.map(\.id), range: series.map(\.color))
-                .chartLegend(.hidden)
-                .chartYScale(domain: 0...1)
-                .chartXScale(domain: 0...max(extent, 1.0 / 60))
-                .chartYAxis {
-                    if let powerAxis {
-                        AxisMarks(position: .leading, values: powerAxis.scaledTicks) { value in
-                            AxisGridLine().foregroundStyle(Palette.surfaceBorder)
-                            AxisValueLabel {
-                                if let p = value.as(Double.self) {
-                                    Text(Self.tickLabel(powerAxis.value(atScaled: p)))
-                                }
-                            }
-                            .foregroundStyle(Palette.muted)
-                        }
-                    }
-                    if let sharedAxis {
-                        AxisMarks(position: .trailing, values: sharedAxis.scaledTicks) { value in
-                            if powerAxis == nil { AxisGridLine().foregroundStyle(Palette.surfaceBorder) }
-                            AxisValueLabel {
-                                if let p = value.as(Double.self) {
-                                    Text(Self.tickLabel(sharedAxis.value(atScaled: p)))
-                                }
-                            }
-                            .foregroundStyle(Palette.muted)
-                        }
-                    }
-                }
-                .chartXAxis {
-                    AxisMarks(values: xTicks) { value in
+            }
+            .chartForegroundStyleScale(domain: series.map(\.id), range: series.map(\.color))
+            .chartLegend(.hidden)
+            .chartYScale(domain: 0...1)
+            .chartXScale(domain: 0...max(extent, 1.0 / 60))
+            .chartYAxis {
+                if let powerAxis {
+                    AxisMarks(position: .leading, values: powerAxis.scaledTicks) { value in
                         AxisGridLine().foregroundStyle(Palette.surfaceBorder)
                         AxisValueLabel {
-                            if let m = value.as(Double.self) { Text(Self.tickLabel(m)) }
+                            if let p = value.as(Double.self) {
+                                Text(Self.tickLabel(powerAxis.value(atScaled: p)))
+                            }
                         }
                         .foregroundStyle(Palette.muted)
                     }
                 }
-                .frame(height: 220)
-                .accessibilityLabel("Ride graphs chart")
-                Text("Time (min). Altitude is a faint background without an axis.")
-                    .font(.caption2).foregroundStyle(Palette.muted)
-                legend(series)
+                if let sharedAxis {
+                    AxisMarks(position: .trailing, values: sharedAxis.scaledTicks) { value in
+                        if powerAxis == nil { AxisGridLine().foregroundStyle(Palette.surfaceBorder) }
+                        AxisValueLabel {
+                            if let p = value.as(Double.self) {
+                                Text(Self.tickLabel(sharedAxis.value(atScaled: p)))
+                            }
+                        }
+                        .foregroundStyle(Palette.muted)
+                    }
+                }
             }
+            .chartXAxis {
+                AxisMarks(values: xTicks) { value in
+                    AxisGridLine().foregroundStyle(Palette.surfaceBorder)
+                    AxisValueLabel {
+                        if let m = value.as(Double.self) { Text(Self.tickLabel(m)) }
+                    }
+                    .foregroundStyle(Palette.muted)
+                }
+            }
+            .chartOverlay { proxy in
+                GeometryReader { geometry in
+                    if let anchor = proxy.plotFrame {
+                        let frame = geometry[anchor]
+                        ZStack(alignment: .topLeading) {
+                            if expanded {
+                                Rectangle().fill(.clear).contentShape(Rectangle())
+                                    .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                                        select(at: value.location, frame: frame, proxy: proxy, xs: xs, dragging: true)
+                                    })
+                            } else {
+                                // Taps only: vertical drags belong to the surrounding ScrollView.
+                                Rectangle().fill(.clear).contentShape(Rectangle())
+                                    .gesture(SpatialTapGesture().onEnded { value in
+                                        select(at: value.location, frame: frame, proxy: proxy, xs: xs)
+                                    })
+                            }
+                            if let readout {
+                                Text(readout.text)
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(Palette.textBright)
+                                    .padding(6)
+                                    .frame(width: max(0, frame.width), alignment: .leading)
+                                    .background(Palette.panel.opacity(0.95))
+                                    .offset(x: frame.minX, y: frame.minY)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(height: expanded ? nil : 220)
+            .frame(maxHeight: expanded ? .infinity : nil)
+            .accessibilityLabel("Ride graphs chart")
+            .accessibilityValue(readout?.text ?? "No sample selected")
+            Text("Time (min). Altitude is a faint background without an axis.")
+                .font(.caption2).foregroundStyle(Palette.muted)
+            legend(series)
         }
+        .contentShape(Rectangle())
+        .onTapGesture { selectedMinutes = nil }
+    }
+
+    private func select(
+        at point: CGPoint, frame: CGRect, proxy: ChartProxy, xs: [Double], dragging: Bool = false
+    ) {
+        guard let plotX = StreamSelection.plotX(at: point, frame: frame, dragging: dragging),
+              let x: Double = proxy.value(atX: plotX),
+              let index = StreamSelection.nearestIndex(xs: xs, at: x) else {
+            selectedMinutes = nil
+            return
+        }
+        selectedMinutes = xs[index]
     }
 
     private static func range(_ s: CombinedChartSeries) -> String {
@@ -410,6 +490,7 @@ struct StreamCharts: View {
             ForEach(series) { s in
                 let off = hidden.contains(s.id)
                 Button {
+                    selectedMinutes = nil
                     if off { hidden.remove(s.id) } else { hidden.insert(s.id) }
                 } label: {
                     HStack(spacing: 6) {
