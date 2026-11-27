@@ -1180,6 +1180,7 @@ def test_scheduler_requeue_bounds_sync_once_calls_under_frozen_clock(
     schedule.start(now)
     if failure_mode == "daily-cap":
         schedule.pulls_today = 8
+        schedule.pending = True
         schedule.immediate = True
     else:
         schedule.anchor = now - 90_000
