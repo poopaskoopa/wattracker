@@ -7,6 +7,7 @@ ride carries its own subjective rating).
 """
 import sqlite3
 import datetime as dt
+import threading
 
 import pytest
 
@@ -66,7 +67,7 @@ def test_fresh_schema_has_activities_rpe():
     assert "rpe_source" not in plan_cols
     assert "rpe_source" not in standalone_cols
     assert has_applied_edit_table
-    assert {"edit_id", "feedback_pending"} <= edit_cols
+    assert {"edit_id", "status", "feedback_pending"} <= edit_cols
 
 
 def test_migration_adds_activities_rpe(tmp_path):
@@ -146,7 +147,7 @@ def test_v38_migration_creates_applied_edit_table_and_preserves_ratings(tmp_path
                 "PRAGMA table_info(cloud_applied_rpe_edits)"
             )
         }
-        assert "feedback_pending" in edit_cols
+        assert {"status", "feedback_pending"} <= edit_cols
     finally:
         conn.close()
 
@@ -306,6 +307,172 @@ def test_cloud_edit_redelivery_does_not_overwrite_later_desktop_rating(client):
     assert db.get_plan_workout(uid, workout_id)["rpe"] == 4
 
 
+def test_conflicted_cloud_edit_stays_conflicted_after_desktop_returns_to_base(client, monkeypatch):
+    uid = _register(client)
+    aid = _insert(uid, seconds=3600, start="2026-06-10T10:00:00")
+    plan_id = db.create_plan(uid, "Base", "2026-06-01", 4)
+    workout_id = db.add_plan_workout(
+        plan_id, uid, "2026-06-10", "Endurance", "endurance", 3600, 50.0, "<>"
+    )
+    assert db.mark_plan_workout_completed(uid, workout_id, aid, "2026-06-10")
+    assert db.set_plan_workout_rpe(uid, workout_id, 5)
+    db.add_ftp_entry(uid, "2026-06-15", 200, "estimated")
+    feedback_calls = []
+    monkeypatch.setattr(
+        importer, "apply_rpe_ftp_feedback",
+        lambda *args, **kwargs: feedback_calls.append((args, kwargs)),
+    )
+    now = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
+
+    # E1's first outcome is a conflict. Its acknowledgement can be lost.
+    assert importer.apply_cloud_rpe_edit(
+        uid, aid, 7, 4, edit_id="a" * 32, now=now,
+    ) == "conflict"
+
+    assert importer.save_workout_rpe(uid, "plan", workout_id, 4, now)
+    ftp_after_desktop_rerate = db.latest_ftp(uid)["ftp_watts"]
+    feedback_count_after_desktop_rerate = len(feedback_calls)
+
+    # The lost-ack redelivery replays its recorded outcome; it cannot turn the
+    # desktop's 4 back into 7 or run FTP feedback a second time.
+    assert importer.apply_cloud_rpe_edit(
+        uid, aid, 7, 4, edit_id="a" * 32, now=now,
+    ) == "conflict"
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT status FROM cloud_applied_rpe_edits WHERE user_id=? AND edit_id=?",
+            (uid, "a" * 32),
+        ).fetchone()
+    assert row["status"] == "conflict"
+    assert db.get_plan_workout(uid, workout_id)["rpe"] == 4
+    assert db.latest_ftp(uid)["ftp_watts"] == ftp_after_desktop_rerate
+    assert len(feedback_calls) == feedback_count_after_desktop_rerate
+
+
+@pytest.mark.parametrize("ftp_source", ["estimated", "manual"])
+def test_duplicate_cloud_edit_cannot_consume_ftp_evidence_twice(
+    tmp_path, monkeypatch, ftp_source,
+):
+    path = str(tmp_path / f"duplicate-feedback-{ftp_source}.db")
+    db.init_db(path)
+    uid = db.create_user("concurrent-rider", "unused-password", path=path)
+    if ftp_source == "manual":
+        db.save_user_settings(uid, {"ftp": 200}, path=path)
+    db.add_ftp_entry(uid, "2026-06-15", 200, ftp_source, path=path)
+    plan_id = db.create_plan(uid, "Base", "2026-06-01", 4, path=path)
+
+    activity_ids = []
+    workout_ids = []
+    for index, day in enumerate((10, 11)):
+        activity_id = db.insert_activity(
+            uid,
+            {
+                "dedup_hash": f"concurrent-{index}",
+                "filename": f"concurrent-{index}.fit",
+                "start_time": f"2026-06-{day:02d}T10:00:00",
+                "duration_s": 3600,
+                "distance_m": 1000.0,
+                "avg_power": 200.0,
+                "avg_hr": 140.0,
+                "np": 205.0,
+                "if_": 0.8,
+                "tss": 50.0,
+            },
+            path=path,
+        )
+        workout_id = db.add_plan_workout(
+            plan_id, uid, f"2026-06-{day:02d}", "Threshold", "threshold",
+            3600, 50.0, "<>", path=path,
+        )
+        assert db.mark_plan_workout_completed(
+            uid, workout_id, activity_id, f"2026-06-{day:02d}",
+            0.95, 230.0, path=path,
+        )
+        activity_ids.append(activity_id)
+        workout_ids.append(workout_id)
+    assert db.set_plan_workout_rpe(uid, workout_ids[1], 6, path=path)
+
+    now = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
+    with monkeypatch.context() as initial_failure:
+        initial_failure.setattr(
+            importer, "apply_rpe_ftp_feedback",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("temporary feedback failure")
+            ),
+        )
+        with pytest.raises(RuntimeError, match="temporary feedback failure"):
+            importer.apply_cloud_rpe_edit(
+                uid, activity_ids[0], 6, None, edit_id="e" * 32,
+                now=now, path=path,
+            )
+
+    barrier = threading.Barrier(2)
+    original_evidence = db.unused_feedback_evidence
+
+    def synchronized_evidence(user_id, since_date, path=None):
+        selected = original_evidence(user_id, since_date, path=path)
+        barrier.wait(timeout=15)
+        return selected
+
+    monkeypatch.setattr(db, "unused_feedback_evidence", synchronized_evidence)
+    results = []
+    errors = []
+
+    def retry_same_edit():
+        try:
+            results.append(importer.apply_cloud_rpe_edit(
+                uid, activity_ids[0], 6, None, edit_id="e" * 32,
+                now=now, path=path,
+            ))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=retry_same_edit) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert results == ["applied", "applied"]
+    assert db.get_plan_workout(uid, workout_ids[0], path=path)["rpe"] == 6
+    assert db.latest_ftp(uid, path=path)["ftp_watts"] == (
+        210.0 if ftp_source == "estimated" else 200.0
+    )
+
+    conn = db.connect(path, read_only=True)
+    try:
+        assert conn.execute(
+            "SELECT count(*) FROM ftp_feedback_batches WHERE user_id=?",
+            (uid,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT count(*) FROM ftp_feedback_batches WHERE user_id=? AND applied=1",
+            (uid,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT count(*) FROM ftp_feedback_batches b WHERE b.user_id=? "
+            "AND b.applied=1 AND NOT EXISTS ("
+            "SELECT 1 FROM plan_workouts p WHERE p.user_id=b.user_id "
+            "AND p.feedback_batch_id=b.id) AND NOT EXISTS ("
+            "SELECT 1 FROM standalone_workouts s WHERE s.user_id=b.user_id "
+            "AND s.feedback_batch_id=b.id)",
+            (uid,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT count(*) FROM ftp_suggestions WHERE user_id=? AND status='pending'",
+            (uid,),
+        ).fetchone()[0] == (1 if ftp_source == "manual" else 0)
+        assert conn.execute(
+            "SELECT feedback_pending FROM cloud_applied_rpe_edits "
+            "WHERE user_id=? AND edit_id=?",
+            (uid, "e" * 32),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_cloud_edit_redelivery_retries_failed_feedback_without_rewriting(client, monkeypatch):
     uid = _register(client)
     aid = _insert(uid, seconds=3600, start="2026-06-10T10:00:00")
@@ -342,9 +509,7 @@ def test_cloud_edit_redelivery_retries_failed_feedback_without_rewriting(client,
             "WHERE user_id=? AND edit_id=?", (uid, "8" * 32),
         ).fetchone()[0] == 1
 
-    assert importer.apply_cloud_rpe_edit(
-        uid, aid, 7, None, edit_id="8" * 32, now=now,
-    ) == "applied"
+    assert importer.retry_pending_cloud_rpe_feedback(uid, now) == 1
     assert db.get_plan_workout(uid, workout_id)["rpe"] == 7
     assert save_calls == [1]
     assert feedback_calls == [1, 1]

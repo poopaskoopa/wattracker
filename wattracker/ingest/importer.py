@@ -1375,6 +1375,35 @@ def _clear_cloud_rpe_feedback_pending(
         conn.close()
 
 
+def retry_pending_cloud_rpe_feedback(
+    user_id: int, now: Optional[_dt.datetime] = None, *,
+    path: Optional[str] = None,
+) -> int:
+    """Retry FTP feedback left pending after a committed cloud RPE write."""
+    if type(user_id) is not int or user_id < 1:
+        return 0
+    conn = db.connect(path, read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT edit_id FROM cloud_applied_rpe_edits "
+            "WHERE user_id=? AND feedback_pending=1 ORDER BY applied_at, edit_id",
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    edit_ids = [row["edit_id"] for row in rows]
+    if not edit_ids:
+        return 0
+
+    # Feedback consumes the rider's eligible evidence as a unit. Clear only
+    # the rows observed above, and only after it returns successfully; an
+    # exception leaves every marker available for the next pull cycle.
+    apply_rpe_ftp_feedback(user_id, now, path=path)
+    for edit_id in edit_ids:
+        _clear_cloud_rpe_feedback_pending(user_id, edit_id, path=path)
+    return len(edit_ids)
+
+
 def apply_cloud_rpe_edit(
     user_id: int,
     activity_id: int,
@@ -1393,13 +1422,8 @@ def apply_cloud_rpe_edit(
     """
     if (
         type(user_id) is not int or user_id < 1
-        or type(activity_id) is not int or not 1 <= activity_id <= 2**53 - 1
-        or not isinstance(edit_id, str) or re.fullmatch(r"[0-9a-f]{32}", edit_id) is None
-        or type(rpe) is not int or not 1 <= rpe <= 10
-        or (base_rpe is not None and (
-            type(base_rpe) is not int or not 1 <= base_rpe <= 10
-        ))
-        or base_rpe == rpe
+        or not isinstance(edit_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", edit_id) is None
     ):
         return "rejected"
     now = now or utc_now()
@@ -1408,60 +1432,68 @@ def apply_cloud_rpe_edit(
         if now.tzinfo is None else now.astimezone(_dt.timezone.utc)
     )
     conn = db.connect(path)
-    target = None
+    outcome: Literal["applied", "conflict", "rejected"] = "rejected"
     should_feed_ftp = False
     try:
         conn.execute("BEGIN IMMEDIATE")
-        already_applied = conn.execute(
-            "SELECT feedback_pending FROM cloud_applied_rpe_edits "
+        recorded = conn.execute(
+            "SELECT status, feedback_pending FROM cloud_applied_rpe_edits "
             "WHERE user_id=? AND edit_id=?",
             (user_id, edit_id),
         ).fetchone()
-        if already_applied is not None:
-            should_feed_ftp = bool(already_applied["feedback_pending"])
-            conn.commit()
+        if recorded is not None:
+            outcome = recorded["status"]
+            should_feed_ftp = (
+                outcome == "applied" and bool(recorded["feedback_pending"])
+            )
         else:
-            target = resolve_rpe_target(user_id, activity_id, conn=conn)
-            if target is None:
-                conn.rollback()
-                return "rejected"
-            activity = conn.execute(
-                "SELECT start_time FROM activities WHERE user_id = ? AND id = ?",
-                (user_id, activity_id),
-            ).fetchone()
-            started = parse_naive(activity["start_time"]) if activity is not None else None
-            if started is None:
-                conn.rollback()
-                return "rejected"
-            started = started.replace(tzinfo=_dt.timezone.utc)
-            if started < now_utc - _dt.timedelta(days=30):
-                conn.rollback()
-                return "rejected"
-            if target.current != base_rpe:
-                conn.rollback()
-                return "conflict"
-            try:
-                target = set_ride_rpe(
-                    user_id, activity_id, rpe, conn=conn,
-                    expected_current=base_rpe, path=path,
-                )
-            except RpeCompareAndSetConflict:
-                conn.rollback()
-                return "conflict"
-            except LookupError:
-                conn.rollback()
-                return "rejected"
-            should_feed_ftp = target.tunes_ftp
+            valid_values = (
+                type(activity_id) is int and 1 <= activity_id <= 2**53 - 1
+                and type(rpe) is int and 1 <= rpe <= 10
+                and (base_rpe is None or (
+                    type(base_rpe) is int and 1 <= base_rpe <= 10
+                ))
+                and base_rpe != rpe
+            )
+            if valid_values:
+                target = resolve_rpe_target(user_id, activity_id, conn=conn)
+                if target is not None:
+                    activity = conn.execute(
+                        "SELECT start_time FROM activities WHERE user_id = ? AND id = ?",
+                        (user_id, activity_id),
+                    ).fetchone()
+                    started = (
+                        parse_naive(activity["start_time"])
+                        if activity is not None else None
+                    )
+                    if started is not None:
+                        started = started.replace(tzinfo=_dt.timezone.utc)
+                        if started >= now_utc - _dt.timedelta(days=30):
+                            if target.current != base_rpe:
+                                outcome = "conflict"
+                            else:
+                                try:
+                                    target = set_ride_rpe(
+                                        user_id, activity_id, rpe, conn=conn,
+                                        expected_current=base_rpe, path=path,
+                                    )
+                                except RpeCompareAndSetConflict:
+                                    outcome = "conflict"
+                                except LookupError:
+                                    outcome = "rejected"
+                                else:
+                                    outcome = "applied"
+                                    should_feed_ftp = target.tunes_ftp
             conn.execute(
                 "INSERT INTO cloud_applied_rpe_edits "
-                "(user_id, edit_id, applied_at, feedback_pending) "
-                "VALUES (?, ?, ?, ?)",
+                "(user_id, edit_id, applied_at, status, feedback_pending) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (
-                    user_id, edit_id, now_utc.isoformat(timespec="seconds"),
+                    user_id, edit_id, now_utc.isoformat(timespec="seconds"), outcome,
                     int(should_feed_ftp),
                 ),
             )
-            conn.commit()
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
@@ -1470,7 +1502,7 @@ def apply_cloud_rpe_edit(
     if should_feed_ftp:
         apply_rpe_ftp_feedback(user_id, now, path=path)
         _clear_cloud_rpe_feedback_pending(user_id, edit_id, path=path)
-    return "applied"
+    return outcome
 
 
 def plan_workout_completion_verified(

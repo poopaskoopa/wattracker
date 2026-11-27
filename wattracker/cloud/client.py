@@ -338,6 +338,7 @@ class CloudSyncClient:
                 isinstance(retry_after, str)
                 and retry_after.isascii()
                 and retry_after.isdigit()
+                and len(retry_after) <= 6
             ):
                 self.last_retry_after_seconds = min(int(retry_after), 86_400)
         return status_code, payload

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
 from wattracker.cloud.client import (
     CloudEditsNotSupported,
+    CloudEnrollmentError,
     CloudSyncClient,
     SyncCredentials,
     SyncResult,
@@ -701,6 +702,24 @@ def test_sync_client_reports_pre_s2_edit_pull_as_unsupported():
 
     with pytest.raises(CloudEditsNotSupported):
         client.pull_edits()
+
+
+@pytest.mark.parametrize("retry_after", ["9" * 7, "9" * 5_000])
+def test_sync_client_ignores_oversized_retry_after_without_integer_conversion(
+    retry_after,
+):
+    client = CloudSyncClient(
+        "https://cloud.example",
+        SyncCredentials("c" * 64, "subscription", b"signing-key", "a" * 64),
+        transport=lambda *_args: (
+            429, b'{"detail":"quota"}', {"Retry-After": retry_after},
+        ),
+        clock=lambda: 100,
+    )
+
+    with pytest.raises(CloudEnrollmentError):
+        client.pull_edits()
+    assert client.last_retry_after_seconds is None
 
 
 def test_sync_client_classifies_a_wrapped_upload_timeout_without_details():

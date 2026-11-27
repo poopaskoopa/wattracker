@@ -1018,6 +1018,35 @@ def test_edit_ack_429_retry_after_defers_the_next_pull(tmp_path):
         sync.stop()
 
 
+def test_sync_once_recovers_pending_ftp_feedback_before_pulling(tmp_path, monkeypatch):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    calls = []
+
+    def transport(url, _headers, _body):
+        calls.append("pull" if url.endswith("/api/v1/edits/pull") else "publish")
+        if url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
+        return 200, b'{"revision":1}'
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: 100)
+    from wattracker.ingest import importer
+    expected_path = str(path)
+
+    def recover(uid, now, *, path):
+        assert uid == user_id
+        assert now.timestamp() == 100
+        assert path == expected_path
+        calls.append("recover")
+        return 1
+
+    monkeypatch.setattr(importer, "retry_pending_cloud_rpe_feedback", recover)
+    try:
+        assert all(result.ok for result in sync.sync_once(user_id))
+        assert calls == ["recover", "pull", "publish"]
+    finally:
+        sync.stop()
+
+
 def test_replaced_edit_stale_ack_is_noop_then_new_edit_conflicts(tmp_path):
     path, user_id = _fixture_db(tmp_path, count=1)
     now = dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()
@@ -1189,12 +1218,33 @@ def test_scheduler_requeue_bounds_sync_once_calls_under_frozen_clock(
         schedule.unsupported_until = now - 1
 
     calls = []
+    requeue_observations = []
     first_call = threading.Event()
+    original_next_due = schedule.next_due
+
+    def observe_next_due(current=None):
+        result = original_next_due(current)
+        if failure_mode == "expired-404":
+            requeue_observations.append((
+                result, schedule.unsupported_until, schedule.anchor,
+                schedule.immediate,
+            ))
+        return result
+
+    schedule.next_due = observe_next_due
 
     def sync_cycle(_uid):
         if failure_mode == "expired-404":
-            assert schedule.due(now)
-            schedule.pulled(now, has_edits=False)
+            if not calls:
+                # Model a 404 backoff that expired while the worker was idle.
+                # The scheduler's requeue path must clear it via next_due;
+                # calling due() here would hide that regression.
+                schedule.unsupported_until = now - 1
+            else:
+                # The post-backoff retry also receives a 404 and starts a new
+                # bounded window instead of spinning in this test cycle.
+                schedule.pulled(now, has_edits=False)
+                schedule.unsupported(now)
         calls.append(now)
         first_call.set()
         return []
@@ -1209,7 +1259,9 @@ def test_scheduler_requeue_bounds_sync_once_calls_under_frozen_clock(
     try:
         assert first_call.wait(1)
         time.sleep(0.05)
-        assert len(calls) == 1
+        assert len(calls) == (1 if failure_mode == "daily-cap" else 2)
+        if failure_mode == "expired-404":
+            assert requeue_observations[0] == (now, None, now, True)
         with sync._scheduler_lock:
             assert sync._scheduled[user_id] > now
     finally:

@@ -629,6 +629,16 @@ class DesktopCloudSync:
                 schedule.retry_pull(now, getattr(client, "last_retry_after_seconds", None))
                 pull_error = True
             if sync_endpoint:
+                from ..ingest import importer
+
+                try:
+                    importer.retry_pending_cloud_rpe_feedback(
+                        user_id,
+                        _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc),
+                        path=self.path,
+                    )
+                except Exception:
+                    _log.info("cloud RPE FTP feedback recovery deferred")
                 try:
                     edits = get_client().pull_edits()
                 except CloudEditsNotSupported:
@@ -642,8 +652,6 @@ class DesktopCloudSync:
                 else:
                     schedule.pulled(now, has_edits=bool(edits))
                     if edits:
-                        from ..ingest import importer
-
                         for edit in edits:
                             try:
                                 status = importer.apply_cloud_rpe_edit(
