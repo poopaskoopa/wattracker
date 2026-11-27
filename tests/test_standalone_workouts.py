@@ -448,14 +448,17 @@ def test_cloud_and_desktop_rerates_produce_equal_ftp_and_suggestion_state(user_i
     desktop_user = db.create_user("desktop-parity", "unused-password")
     for rider in (user_id, desktop_user):
         db.add_ftp_entry(rider, DATE, 200, "estimated")
+        db.save_user_settings(rider, {"ftp": 200})
     cloud_workout, cloud_activity = _cloud_target(
         user_id, "cloud-parity", rpe=8,
     )
+    _cloud_target(user_id, "cloud-parity-peer", rpe=7)
     desktop_workout, _ = _cloud_target(
         desktop_user, "desktop-parity", rpe=8,
     )
-    assert importer.apply_rpe_ftp_feedback(user_id, _cloud_now()) == 210.0
-    assert importer.apply_rpe_ftp_feedback(desktop_user, _cloud_now()) == 210.0
+    _cloud_target(desktop_user, "desktop-parity-peer", rpe=7)
+    assert importer.apply_rpe_ftp_feedback(user_id, _cloud_now()) is None
+    assert importer.apply_rpe_ftp_feedback(desktop_user, _cloud_now()) is None
 
     assert importer.apply_cloud_rpe_edit(
         user_id, cloud_activity, 7, 8, edit_id="d" * 32, now=_cloud_now(),

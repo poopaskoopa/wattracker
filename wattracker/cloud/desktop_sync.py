@@ -712,7 +712,7 @@ class DesktopCloudSync:
                 schedule.published(float(self.clock()))
         else:
             self._record_failure(user_id, self._error_text(failed))
-            if failed.status == 429:
+            if failed.status_code == 429:
                 schedule.retry_pull(
                     float(self.clock()),
                     getattr(client, "last_retry_after_seconds", None),

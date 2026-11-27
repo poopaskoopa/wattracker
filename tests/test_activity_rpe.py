@@ -370,11 +370,12 @@ def test_unlinked_cloud_rating_matches_desktop_passive_estimate(client):
         cloud_uid, cloud_activity, 1, None, edit_id="2" * 32, now=now,
     ) == "applied"
     assert db.set_activity_rpe(desktop_uid, desktop_activity, 1)
+    estimate_now = dt.datetime(2026, 6, 15)
     cloud_estimate = importer._current_estimate(
-        importer.passive_ftp_evidence(cloud_uid), now,
+        importer.passive_ftp_evidence(cloud_uid), estimate_now,
     )
     desktop_estimate = importer._current_estimate(
-        importer.passive_ftp_evidence(desktop_uid), now,
+        importer.passive_ftp_evidence(desktop_uid), estimate_now,
     )
     assert cloud_estimate == pytest.approx(desktop_estimate)
 
