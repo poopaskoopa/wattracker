@@ -508,8 +508,15 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
     36: [_backfill_plan_completion_dates],
     37: [_migrate_cloud_sync_endpoints],
     38: [
-        "ALTER TABLE plan_workouts ADD COLUMN rpe_source TEXT",
-        "ALTER TABLE standalone_workouts ADD COLUMN rpe_source TEXT",
+        # Remember which cloud edits have already affected local RPE/FTP state.
+        # The edit id is scoped to the local rider because cloud queues are
+        # scoped to the writer installation, while one local DB can hold more
+        # than one rider.
+        "CREATE TABLE IF NOT EXISTS cloud_applied_rpe_edits ("
+        "user_id INTEGER NOT NULL, edit_id TEXT NOT NULL, applied_at TEXT NOT NULL, "
+        "feedback_pending INTEGER NOT NULL DEFAULT 0 CHECK (feedback_pending IN (0, 1)), "
+        "PRIMARY KEY(user_id, edit_id), "
+        "FOREIGN KEY(user_id) REFERENCES users(id))",
     ],
 }
 
@@ -517,6 +524,7 @@ _DROP = """
 DROP TABLE IF EXISTS cloud_publication_state;
 DROP TABLE IF EXISTS cloud_publication_pending;
 DROP TABLE IF EXISTS cloud_publication_ledger;
+DROP TABLE IF EXISTS cloud_applied_rpe_edits;
 DROP TABLE IF EXISTS cloud_sync_state;
 DROP TABLE IF EXISTS weight_history;
 DROP TABLE IF EXISTS connector_devices;
@@ -700,7 +708,6 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     adjustment_id     INTEGER,
     adjustment_state  TEXT,
     adjustment_source_id INTEGER,
-    rpe_source        TEXT,
     FOREIGN KEY(plan_id) REFERENCES plans(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
@@ -725,7 +732,6 @@ CREATE TABLE IF NOT EXISTS standalone_workouts (
     effective_ftp         REAL,
     feedback_applied      INTEGER NOT NULL DEFAULT 0,
     feedback_batch_id     INTEGER,
-    rpe_source            TEXT,
     created               TEXT NOT NULL,
     UNIQUE(user_id, export_key),
     FOREIGN KEY(user_id) REFERENCES users(id)
@@ -934,6 +940,17 @@ CREATE TABLE IF NOT EXISTS cloud_publication_ledger (
 );
 CREATE INDEX IF NOT EXISTS idx_cloud_publication_ledger_user
     ON cloud_publication_ledger(user_id, kind, object_id);
+
+-- The edit id survives restarts so a lost acknowledgement cannot make a
+-- redelivered rating reverse later desktop work or apply FTP feedback twice.
+CREATE TABLE IF NOT EXISTS cloud_applied_rpe_edits (
+    user_id          INTEGER NOT NULL,
+    edit_id          TEXT NOT NULL,
+    applied_at       TEXT NOT NULL,
+    feedback_pending INTEGER NOT NULL DEFAULT 0 CHECK (feedback_pending IN (0, 1)),
+    PRIMARY KEY (user_id, edit_id),
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 
 -- A prepared batch remains resumable until its server response is known to
 -- have been accepted locally. Keeping the exact payload makes a retry safe
@@ -3553,7 +3570,7 @@ def set_plan_workout_rpe(
         conn = connect(path)
     try:
         cur = conn.execute(
-            "UPDATE plan_workouts SET rpe = ?, rpe_source = NULL "
+            "UPDATE plan_workouts SET rpe = ? "
             "WHERE user_id = ? AND id = ? AND completed_activity_id IS NOT NULL",
             (int(rpe), user_id, workout_id),
         )
@@ -3748,7 +3765,7 @@ def set_standalone_rpe(
         conn = connect(path)
     try:
         cur = conn.execute(
-            "UPDATE standalone_workouts SET rpe=?, rpe_source=NULL "
+            "UPDATE standalone_workouts SET rpe=? "
             "WHERE user_id=? AND id=? "
             "AND completed_activity_id IS NOT NULL",
             (int(rpe), user_id, workout_id),
@@ -3870,14 +3887,13 @@ def unused_feedback_evidence(
             "SELECT 'plan' AS kind,id,completed_date,type,rpe,compliance,"
             "effective_ftp,zwo_or_segments AS zwo "
             "FROM plan_workouts WHERE user_id=? AND completed_date>=? "
-            "AND rpe IS NOT NULL AND feedback_batch_id IS NULL "
-            "AND COALESCE(rpe_source, '') != 'cloud' AND type IN "
+            "AND rpe IS NOT NULL AND feedback_batch_id IS NULL AND type IN "
             "('threshold','sweet_spot','vo2max') AND compliance IS NOT NULL "
             "AND effective_ftp IS NOT NULL UNION ALL "
             "SELECT 'standalone',id,completed_date,type,rpe,compliance,effective_ftp,zwo "
             "FROM standalone_workouts WHERE user_id=? AND completed_date>=? "
             "AND rpe IS NOT NULL AND feedback_batch_id IS NULL "
-            "AND COALESCE(rpe_source, '') != 'cloud' AND type IN "
+            "AND type IN "
             "('threshold','sweet_spot','vo2max') AND compliance IS NOT NULL "
             "AND effective_ftp IS NOT NULL ORDER BY completed_date,id",
             (user_id, since_date, user_id, since_date),

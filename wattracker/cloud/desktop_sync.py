@@ -53,6 +53,7 @@ class EditPullSchedule:
         self.pending = False
         self.immediate = False
         self.retry_required = False
+        self.retry_until: Optional[float] = None
         self.unsupported_until: Optional[float] = None
 
     @staticmethod
@@ -88,10 +89,14 @@ class EditPullSchedule:
         self._clear_expired_unsupported(current)
         if self.unsupported_until is not None and current < self.unsupported_until:
             return False
-        if self.pending:
-            return True
         if self.pulls_today >= _EDIT_PULL_LIMIT_PER_DAY:
             return False
+        if self.retry_until is not None and current < self.retry_until:
+            return False
+        if self.retry_until is not None:
+            self.retry_until = None
+        if self.pending:
+            return True
         if self.immediate:
             return True
         assert self.anchor is not None
@@ -104,10 +109,14 @@ class EditPullSchedule:
             if current < self.unsupported_until:
                 return self.unsupported_until
             self._clear_expired_unsupported(current)
-        if self.pending:
-            return current
         if self.pulls_today >= _EDIT_PULL_LIMIT_PER_DAY:
             return (self._utc_day(current) + 1) * 86_400.0
+        if self.retry_until is not None:
+            if current < self.retry_until:
+                return self.retry_until
+            self.retry_until = None
+        if self.pending:
+            return current
         if self.immediate:
             return current
         assert self.anchor is not None
@@ -120,6 +129,7 @@ class EditPullSchedule:
         was_immediate = self.immediate
         self.immediate = False
         self.retry_required = False
+        self.retry_until = None
         self.pending = bool(has_edits)
         if not has_edits:
             if was_immediate:
@@ -141,16 +151,24 @@ class EditPullSchedule:
     def acknowledged(self, *, remaining: bool = False) -> None:
         self.pending = remaining
         self.immediate = not remaining
+        if not remaining:
+            self.retry_until = None
 
-    def retry_pull(self) -> None:
+    def retry_pull(
+        self, now: Optional[float] = None, retry_after_seconds: Optional[int] = None,
+    ) -> None:
         self.immediate = True
         self.retry_required = True
+        if retry_after_seconds is not None and retry_after_seconds > 0:
+            current = self.clock() if now is None else float(now)
+            self.retry_until = current + min(int(retry_after_seconds), 86_400)
 
     def unsupported(self, now: float) -> None:
         self.unsupported_until = float(now) + _EDIT_UNSUPPORTED_BACKOFF
         self.pending = False
         self.immediate = False
         self.retry_required = False
+        self.retry_until = None
 
 
 class _UnavailableSecretBackend:
@@ -608,7 +626,7 @@ class DesktopCloudSync:
             except Exception:
                 sync_endpoint = None
                 schedule.pulled(now, has_edits=False)
-                schedule.retry_pull()
+                schedule.retry_pull(now, getattr(client, "last_retry_after_seconds", None))
                 pull_error = True
             if sync_endpoint:
                 try:
@@ -619,7 +637,7 @@ class DesktopCloudSync:
                 except Exception:
                     # A read failure must not prevent normal snapshot publication.
                     schedule.pulled(now, has_edits=False)
-                    schedule.retry_pull()
+                    schedule.retry_pull(now, getattr(client, "last_retry_after_seconds", None))
                     pull_error = True
                 else:
                     schedule.pulled(now, has_edits=bool(edits))
@@ -633,6 +651,7 @@ class DesktopCloudSync:
                                     edit.activity_id,
                                     edit.rpe,
                                     edit.base_rpe,
+                                    edit_id=edit.edit_id,
                                     now=_dt.datetime.fromtimestamp(
                                         now, tz=_dt.timezone.utc,
                                     ),
@@ -693,6 +712,11 @@ class DesktopCloudSync:
                 schedule.published(float(self.clock()))
         else:
             self._record_failure(user_id, self._error_text(failed))
+            if failed.status == 429:
+                schedule.retry_pull(
+                    float(self.clock()),
+                    getattr(client, "last_retry_after_seconds", None),
+                )
         if failed is None and edit_acks:
             try:
                 assert client is not None
@@ -706,7 +730,10 @@ class DesktopCloudSync:
                         user_id, "Cloud RPE edit application was deferred."
                     )
             else:
-                schedule.retry_pull()
+                schedule.retry_pull(
+                    float(self.clock()),
+                    getattr(client, "last_retry_after_seconds", None),
+                )
                 self._record_failure(user_id, "Cloud RPE edit acknowledgement failed.")
         elif failed is None and unprocessed_edits:
             self._record_failure(user_id, "Cloud RPE edit application was deferred.")

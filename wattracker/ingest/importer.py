@@ -6,6 +6,7 @@ import datetime as _dt
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -1347,12 +1348,40 @@ def set_ride_rpe(
     return updated
 
 
+def _clear_cloud_rpe_feedback_pending(
+    user_id: int, edit_id: str, *, path: Optional[str] = None,
+) -> None:
+    conn = db.connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        updated = conn.execute(
+            "UPDATE cloud_applied_rpe_edits SET feedback_pending=0 "
+            "WHERE user_id=? AND edit_id=? AND feedback_pending=1",
+            (user_id, edit_id),
+        )
+        if updated.rowcount == 0:
+            row = conn.execute(
+                "SELECT feedback_pending FROM cloud_applied_rpe_edits "
+                "WHERE user_id=? AND edit_id=?",
+                (user_id, edit_id),
+            ).fetchone()
+            if row is None or row["feedback_pending"] != 0:
+                raise RuntimeError("cloud RPE feedback recovery record disappeared")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def apply_cloud_rpe_edit(
     user_id: int,
     activity_id: int,
     rpe: object,
     base_rpe: object,
     *,
+    edit_id: str,
     now: Optional[_dt.datetime] = None,
     path: Optional[str] = None,
 ) -> Literal["applied", "conflict", "rejected"]:
@@ -1365,6 +1394,7 @@ def apply_cloud_rpe_edit(
     if (
         type(user_id) is not int or user_id < 1
         or type(activity_id) is not int or not 1 <= activity_id <= 2**53 - 1
+        or not isinstance(edit_id, str) or re.fullmatch(r"[0-9a-f]{32}", edit_id) is None
         or type(rpe) is not int or not 1 <= rpe <= 10
         or (base_rpe is not None and (
             type(base_rpe) is not int or not 1 <= base_rpe <= 10
@@ -1379,58 +1409,67 @@ def apply_cloud_rpe_edit(
     )
     conn = db.connect(path)
     target = None
+    should_feed_ftp = False
     try:
         conn.execute("BEGIN IMMEDIATE")
-        target = resolve_rpe_target(user_id, activity_id, conn=conn)
-        if target is None:
-            conn.rollback()
-            return "rejected"
-        activity = conn.execute(
-            "SELECT start_time FROM activities WHERE user_id = ? AND id = ?",
-            (user_id, activity_id),
+        already_applied = conn.execute(
+            "SELECT feedback_pending FROM cloud_applied_rpe_edits "
+            "WHERE user_id=? AND edit_id=?",
+            (user_id, edit_id),
         ).fetchone()
-        started = parse_naive(activity["start_time"]) if activity is not None else None
-        if started is None:
-            conn.rollback()
-            return "rejected"
-        started = started.replace(tzinfo=_dt.timezone.utc)
-        if started < now_utc - _dt.timedelta(days=30):
-            conn.rollback()
-            return "rejected"
-        if target.current == rpe:
+        if already_applied is not None:
+            should_feed_ftp = bool(already_applied["feedback_pending"])
             conn.commit()
-        elif target.current != base_rpe:
-            conn.rollback()
-            return "conflict"
         else:
-            if target.tunes_ftp:
-                saved = save_workout_rpe(
-                    user_id, target.kind, target.record_id, rpe,
-                    conn=conn, path=path, source="cloud",
-                    expected_current=base_rpe,
+            target = resolve_rpe_target(user_id, activity_id, conn=conn)
+            if target is None:
+                conn.rollback()
+                return "rejected"
+            activity = conn.execute(
+                "SELECT start_time FROM activities WHERE user_id = ? AND id = ?",
+                (user_id, activity_id),
+            ).fetchone()
+            started = parse_naive(activity["start_time"]) if activity is not None else None
+            if started is None:
+                conn.rollback()
+                return "rejected"
+            started = started.replace(tzinfo=_dt.timezone.utc)
+            if started < now_utc - _dt.timedelta(days=30):
+                conn.rollback()
+                return "rejected"
+            if target.current != base_rpe:
+                conn.rollback()
+                return "conflict"
+            try:
+                target = set_ride_rpe(
+                    user_id, activity_id, rpe, conn=conn,
+                    expected_current=base_rpe, path=path,
                 )
-                if not saved:
-                    conn.rollback()
-                    return "conflict"
-                target = replace(target, current=rpe)
-            else:
-                try:
-                    saved = db.set_activity_rpe(
-                        user_id, target.record_id, rpe, path=path, conn=conn,
-                    )
-                except RpeCompareAndSetConflict:
-                    conn.rollback()
-                    return "conflict"
-                if not saved:
-                    conn.rollback()
-                    return "conflict"
-                target = replace(target, current=rpe)
+            except RpeCompareAndSetConflict:
+                conn.rollback()
+                return "conflict"
+            except LookupError:
+                conn.rollback()
+                return "rejected"
+            should_feed_ftp = target.tunes_ftp
+            conn.execute(
+                "INSERT INTO cloud_applied_rpe_edits "
+                "(user_id, edit_id, applied_at, feedback_pending) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    user_id, edit_id, now_utc.isoformat(timespec="seconds"),
+                    int(should_feed_ftp),
+                ),
+            )
             conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+    if should_feed_ftp:
+        apply_rpe_ftp_feedback(user_id, now, path=path)
+        _clear_cloud_rpe_feedback_pending(user_id, edit_id, path=path)
     return "applied"
 
 
@@ -2131,11 +2170,10 @@ def save_workout_rpe(
     user_id: int, kind: str, workout_id: int, rpe: int,
     now: Optional[_dt.datetime] = None,
     *, conn: Optional[sqlite3.Connection] = None, path: Optional[str] = None,
-    source: Literal["desktop", "cloud"] = "desktop",
     expected_current: object = _RPE_EXPECTATION_UNSET,
 ) -> bool:
-    """Save a workout rating; desktop writes also reverse and rerun FTP feedback."""
-    if kind not in ("plan", "standalone") or source not in ("desktop", "cloud"):
+    """Save a workout rating, reversing then rerunning FTP feedback."""
+    if kind not in ("plan", "standalone"):
         return False
     owned = conn is None
     if owned:
@@ -2149,8 +2187,6 @@ def save_workout_rpe(
                 if owned:
                     conn.rollback()
                 return False
-        elif source == "cloud":
-            workout = db.get_standalone_workout(user_id, workout_id, conn=conn)
         else:
             workout = db.get_standalone_workout(user_id, workout_id, conn=conn)
         if not workout or workout.get("completed_activity_id") is None:
@@ -2164,25 +2200,15 @@ def save_workout_rpe(
             if owned:
                 conn.rollback()
             return False
-        if source == "cloud":
-            table = "plan_workouts" if kind == "plan" else "standalone_workouts"
-            cursor = conn.execute(
-                f"UPDATE {table} SET rpe=?, rpe_source='cloud' "
-                "WHERE user_id=? AND id=? AND completed_activity_id IS NOT NULL "
-                "AND rpe IS ?",
-                (rpe, user_id, workout_id, workout.get("rpe")),
+        db.rollback_feedback_for_workout(user_id, kind, workout_id, conn=conn)
+        if kind == "plan":
+            saved = db.set_plan_workout_rpe(
+                user_id, workout_id, rpe, path=path, conn=conn,
             )
-            saved = cursor.rowcount == 1
         else:
-            db.rollback_feedback_for_workout(user_id, kind, workout_id, conn=conn)
-            if kind == "plan":
-                saved = db.set_plan_workout_rpe(
-                    user_id, workout_id, rpe, path=path, conn=conn,
-                )
-            else:
-                saved = db.set_standalone_rpe(
-                    user_id, workout_id, rpe, path=path, conn=conn,
-                )
+            saved = db.set_standalone_rpe(
+                user_id, workout_id, rpe, path=path, conn=conn,
+            )
         if owned:
             conn.commit()
     except Exception:
@@ -2192,7 +2218,7 @@ def save_workout_rpe(
     finally:
         if owned:
             conn.close()
-    if saved and owned and source == "desktop":
+    if saved and owned:
         apply_rpe_ftp_feedback(user_id, now, path=path)
     return saved
 

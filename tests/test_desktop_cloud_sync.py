@@ -991,6 +991,33 @@ def test_failed_publish_retries_edit_without_duplicate_write(tmp_path, monkeypat
     assert db.get_activity(user_id, 1, path=str(path))["rpe"] == 6
 
 
+def test_edit_ack_429_retry_after_defers_the_next_pull(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()
+    edit = {
+        "edit_id": "e" * 32, "activity_id": 1, "rpe": 6,
+        "base_rpe": None, "created_at": now,
+    }
+
+    def transport(url, _headers, _body):
+        if url.endswith("/api/v1/edits/pull"):
+            return 200, json.dumps({"edits": [edit]}).encode()
+        if url.endswith("/api/v1/sync/batches"):
+            return 200, b'{"revision":1}'
+        if url.endswith("/api/v1/edits/ack"):
+            return 429, b'{"detail":"quota"}', {"Retry-After": "120"}
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now)
+    try:
+        assert all(result.ok for result in sync.sync_once(user_id))
+        schedule = sync._edit_schedule(user_id)
+        assert schedule.retry_until == now + 120
+        assert schedule.next_due(now) == now + 120
+    finally:
+        sync.stop()
+
+
 def test_replaced_edit_stale_ack_is_noop_then_new_edit_conflicts(tmp_path):
     path, user_id = _fixture_db(tmp_path, count=1)
     now = dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()
@@ -1120,6 +1147,23 @@ def test_next_due_clears_expired_unsupported_window_without_backlog_burst():
     assert schedule.anchor == 86_410
     schedule.pulled(86_410, has_edits=False)
     assert schedule.next_due(86_410) == 87_010
+
+
+def test_pending_edits_obey_daily_cap_and_retry_after():
+    schedule = EditPullSchedule(clock=lambda: 0.0)
+    schedule.start(100)
+    schedule.pending = True
+    schedule.pulls_today = 8
+    schedule.immediate = True
+    assert not schedule.due(100)
+    assert schedule.next_due(100) == 86_400
+
+    schedule.pulls_today = 1
+    schedule.retry_pull(100, 120)
+    assert not schedule.due(100)
+    assert schedule.next_due(100) == 220
+    assert not schedule.due(219)
+    assert schedule.due(220)
 
 
 @pytest.mark.parametrize("failure_mode", ["daily-cap", "expired-404"])

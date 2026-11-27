@@ -70,15 +70,6 @@ def _cloud_target(user_id, key, rpe=None, path=None, date=DATE):
     return workout_id, activity_id
 
 
-def _rpe_source(user_id, workout_id):
-    with db.connect() as conn:
-        row = conn.execute(
-            "SELECT rpe_source FROM standalone_workouts WHERE user_id=? AND id=?",
-            (user_id, workout_id),
-        ).fetchone()
-    return row[0]
-
-
 def _cloud_now():
     return dt.datetime.fromisoformat(f"{DATE}T20:00:00+00:00")
 
@@ -435,27 +426,56 @@ def test_feedback_raises_and_caps_then_is_idempotent(user_id):
     assert all(db.get_standalone_workout(user_id, item)["feedback_applied"] for item in ids)
 
 
-def test_cloud_rating_is_excluded_from_ftp_evidence_and_suggestions(user_id):
+def test_cloud_rating_uses_the_desktop_ftp_feedback_path(user_id, monkeypatch):
     db.add_ftp_entry(user_id, DATE, 200, "estimated")
-    db.save_user_settings(user_id, {"ftp": 240})
     cloud_workout, cloud_activity = _cloud_target(user_id, "cloud-evidence")
-    local_workout, _ = _cloud_target(user_id, "local-evidence", rpe=6)
+    feedback_calls = []
+    monkeypatch.setattr(
+        importer, "apply_rpe_ftp_feedback",
+        lambda *args, **kwargs: feedback_calls.append((args, kwargs)),
+    )
 
     assert importer.apply_cloud_rpe_edit(
-        user_id, cloud_activity, 6, None, now=_cloud_now(),
+        user_id, cloud_activity, 6, None, edit_id="a" * 32, now=_cloud_now(),
     ) == "applied"
-    assert _rpe_source(user_id, cloud_workout) == "cloud"
-    assert db.latest_ftp(user_id)["ftp_watts"] == 200
-    assert db.pending_ftp_suggestion(user_id) is None
-
+    assert db.get_standalone_workout(user_id, cloud_workout)["rpe"] == 6
+    assert len(feedback_calls) == 1
     evidence = db.unused_feedback_evidence(user_id, DATE)
-    assert [item["id"] for item in evidence] == [local_workout]
-    assert importer.apply_rpe_ftp_feedback(user_id, _cloud_now()) is None
-    assert db.latest_ftp(user_id)["ftp_watts"] == 200
-    assert db.pending_ftp_suggestion(user_id) is None
+    assert [item["id"] for item in evidence] == [cloud_workout]
 
 
-def test_cloud_edit_preserves_existing_feedback_batch_and_ftp(user_id):
+def test_cloud_and_desktop_rerates_produce_equal_ftp_and_suggestion_state(user_id):
+    desktop_user = db.create_user("desktop-parity", "unused-password")
+    for rider in (user_id, desktop_user):
+        db.add_ftp_entry(rider, DATE, 200, "estimated")
+    cloud_workout, cloud_activity = _cloud_target(
+        user_id, "cloud-parity", rpe=8,
+    )
+    desktop_workout, _ = _cloud_target(
+        desktop_user, "desktop-parity", rpe=8,
+    )
+    assert importer.apply_rpe_ftp_feedback(user_id, _cloud_now()) == 210.0
+    assert importer.apply_rpe_ftp_feedback(desktop_user, _cloud_now()) == 210.0
+
+    assert importer.apply_cloud_rpe_edit(
+        user_id, cloud_activity, 7, 8, edit_id="d" * 32, now=_cloud_now(),
+    ) == "applied"
+    assert importer.save_workout_rpe(
+        desktop_user, "standalone", desktop_workout, 7, _cloud_now(),
+    )
+
+    assert db.latest_ftp(user_id)["ftp_watts"] == db.latest_ftp(desktop_user)["ftp_watts"]
+    cloud_suggestion = db.pending_ftp_suggestion(user_id)
+    desktop_suggestion = db.pending_ftp_suggestion(desktop_user)
+    assert (cloud_suggestion or {}).get("suggested_ftp") == (
+        (desktop_suggestion or {}).get("suggested_ftp")
+    )
+    assert (cloud_suggestion or {}).get("status") == (
+        (desktop_suggestion or {}).get("status")
+    )
+
+
+def test_cloud_edit_reverses_and_reapplies_existing_feedback(user_id, monkeypatch):
     db.add_ftp_entry(user_id, DATE, 200, "estimated")
     cloud_workout, cloud_activity = _cloud_target(
         user_id, "cloud-in-batch", rpe=6,
@@ -466,32 +486,43 @@ def test_cloud_edit_preserves_existing_feedback_batch_and_ftp(user_id):
     assert before["feedback_applied"]
     assert before["feedback_batch_id"] is not None
 
+    rollback_calls = []
+    feedback_calls = []
+    original_rollback = db.rollback_feedback_for_workout
+    original_feedback = importer.apply_rpe_ftp_feedback
+
+    def rollback(*args, **kwargs):
+        rollback_calls.append((args, kwargs))
+        return original_rollback(*args, **kwargs)
+
+    def feedback(*args, **kwargs):
+        feedback_calls.append((args, kwargs))
+        return original_feedback(*args, **kwargs)
+
+    monkeypatch.setattr(db, "rollback_feedback_for_workout", rollback)
+    monkeypatch.setattr(importer, "apply_rpe_ftp_feedback", feedback)
     assert importer.apply_cloud_rpe_edit(
-        user_id, cloud_activity, 9, 6, now=_cloud_now(),
+        user_id, cloud_activity, 9, 6, edit_id="b" * 32, now=_cloud_now(),
     ) == "applied"
     after = db.get_standalone_workout(user_id, cloud_workout)
     assert after["rpe"] == 9
-    assert after["feedback_batch_id"] == before["feedback_batch_id"]
-    assert after["feedback_applied"]
-    assert _rpe_source(user_id, cloud_workout) == "cloud"
-    assert db.get_standalone_workout(user_id, other_workout)["feedback_batch_id"] == before["feedback_batch_id"]
-    assert db.latest_ftp(user_id)["ftp_watts"] == 210.0
+    assert after["feedback_batch_id"] != before["feedback_batch_id"]
+    assert len(rollback_calls) == 1
+    assert len(feedback_calls) == 1
 
 
-def test_desktop_same_value_rerate_clears_cloud_source_and_feeds_ftp(user_id):
+def test_desktop_same_value_rerate_after_cloud_edit_feeds_ftp(user_id):
     db.add_ftp_entry(user_id, DATE, 200, "estimated")
     cloud_workout, cloud_activity = _cloud_target(user_id, "desktop-rerate")
     _cloud_target(user_id, "desktop-rerate-peer", rpe=6)
     assert importer.apply_cloud_rpe_edit(
-        user_id, cloud_activity, 6, None, now=_cloud_now(),
+        user_id, cloud_activity, 6, None, edit_id="c" * 32, now=_cloud_now(),
     ) == "applied"
-    assert _rpe_source(user_id, cloud_workout) == "cloud"
-    assert db.latest_ftp(user_id)["ftp_watts"] == 200
+    assert db.latest_ftp(user_id)["ftp_watts"] == 210.0
 
     assert importer.save_workout_rpe(
         user_id, "standalone", cloud_workout, 6, _cloud_now(),
     )
-    assert _rpe_source(user_id, cloud_workout) is None
     assert db.latest_ftp(user_id)["ftp_watts"] == 210.0
     assert db.get_standalone_workout(user_id, cloud_workout)["feedback_applied"]
 

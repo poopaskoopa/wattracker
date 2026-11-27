@@ -195,7 +195,9 @@ def https_transport(
     ca_file: Optional[str] = None,
     timeout: float = DEFAULT_HTTP_TIMEOUT,
     post_timeout: float = DEFAULT_POST_TIMEOUT,
-) -> Callable[[str, Mapping[str, str], bytes], tuple[int, bytes]]:
+) -> Callable[
+    [str, Mapping[str, str], bytes], tuple[int, bytes, Mapping[str, str]],
+]:
     """Create a strict HTTPS/mTLS transport for an enabled desktop worker.
 
     Certificate verification remains enabled; there is no insecure HTTP or
@@ -211,7 +213,7 @@ def https_transport(
 
     def send(
         url: str, headers: Mapping[str, str], body: bytes, method: str = "POST",
-    ) -> tuple[int, bytes]:
+    ) -> tuple[int, bytes, Mapping[str, str]]:
         validate_cloud_endpoint(url.rsplit("/api/v1/", 1)[0])
         method = method.upper()
         if method not in {"GET", "POST"}:
@@ -226,9 +228,14 @@ def https_transport(
             request_timeout = post_timeout if method == "POST" else timeout
             response = opener.open(request, timeout=request_timeout)
         except HTTPError as exc:
-            return exc.code, exc.read(MAX_RESPONSE_BYTES)
+            response_headers = dict(exc.headers.items()) if exc.headers else {}
+            return exc.code, exc.read(MAX_RESPONSE_BYTES), response_headers
         with response:
-            return int(response.status), response.read(MAX_RESPONSE_BYTES)
+            response_headers = getattr(response, "headers", {}) or {}
+            return (
+                int(response.status), response.read(MAX_RESPONSE_BYTES),
+                dict(response_headers.items()),
+            )
 
     send.supports_method = True  # type: ignore[attr-defined]
     return send
@@ -243,7 +250,12 @@ class CloudSyncClient:
         credentials: Optional[SyncCredentials] = None,
         *,
         sync_endpoint: Optional[str] = None,
-        transport: Optional[Callable[[str, Mapping[str, str], bytes], tuple[int, bytes]]] = None,
+        transport: Optional[
+            Callable[
+                [str, Mapping[str, str], bytes],
+                tuple[int, bytes] | tuple[int, bytes, Mapping[str, str]],
+            ]
+        ] = None,
         mtls_headers: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -255,6 +267,7 @@ class CloudSyncClient:
         self.transport = transport
         self.mtls_headers = dict(mtls_headers or {})
         self.clock = clock
+        self.last_retry_after_seconds: Optional[int] = None
         self._transport_accepts_method = bool(
             getattr(self.transport, "supports_method", False)
         )
@@ -273,6 +286,7 @@ class CloudSyncClient:
         self, method: str, path: str, body: bytes,
         *, headers: Optional[Mapping[str, str]] = None,
     ) -> tuple[Optional[int], dict[str, Any]]:
+        self.last_retry_after_seconds = None
         if self.transport is None:
             return None, {}
         request_headers = {"Content-Length": str(len(body))}
@@ -289,17 +303,21 @@ class CloudSyncClient:
             return None, {}
         try:
             if self._transport_accepts_method:
-                status, response_body = self.transport(
+                response = self.transport(
                     endpoint + path, request_headers, body, method,
                 )
             else:
-                status, response_body = self.transport(
+                response = self.transport(
                     endpoint + path, request_headers, body,
                 )
         except Exception as exc:
             if _is_timeout_error(exc):
                 return None, {_TRANSPORT_ERROR_KEY: _TRANSPORT_TIMEOUT}
             return None, {}
+        if not isinstance(response, tuple) or len(response) not in (2, 3):
+            return None, {}
+        status, response_body = response[:2]
+        response_headers = response[2] if len(response) == 3 else {}
         try:
             payload = json.loads(response_body.decode("utf-8"))
             if not isinstance(payload, dict):
@@ -310,6 +328,18 @@ class CloudSyncClient:
             status_code = int(status)
         except (TypeError, ValueError):
             return None, {}
+        if status_code == 429 and isinstance(response_headers, Mapping):
+            retry_after = next(
+                (value for name, value in response_headers.items()
+                 if isinstance(name, str) and name.lower() == "retry-after"),
+                None,
+            )
+            if (
+                isinstance(retry_after, str)
+                and retry_after.isascii()
+                and retry_after.isdigit()
+            ):
+                self.last_retry_after_seconds = min(int(retry_after), 86_400)
         return status_code, payload
 
     @classmethod
@@ -318,7 +348,9 @@ class CloudSyncClient:
         endpoint: str,
         invitation: str,
         *,
-        transport: Optional[Callable[..., tuple[int, bytes]]] = None,
+        transport: Optional[
+            Callable[..., tuple[int, bytes] | tuple[int, bytes, Mapping[str, str]]]
+        ] = None,
         mtls_headers: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.time,
     ) -> EnrollmentResult:

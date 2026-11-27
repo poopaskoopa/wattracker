@@ -1,6 +1,6 @@
 """Type-aware perceived-exertion (RPE) rating for imported activities.
 
-Covers the schema column, the activity-scoped subjective-rating endpoint, and
+Covers the activity-scoped subjective-rating endpoint and
 the type-aware linkage exposed by the activity-detail API (a ride matched to a
 verified plan/standalone workout drives that workout's rating; an unmatched
 ride carries its own subjective rating).
@@ -52,11 +52,21 @@ def test_fresh_schema_has_activities_rpe():
         standalone_cols = {
             r["name"] for r in conn.execute("PRAGMA table_info(standalone_workouts)")
         }
+        edit_cols = {
+            r["name"] for r in conn.execute(
+                "PRAGMA table_info(cloud_applied_rpe_edits)"
+            )
+        }
+        has_applied_edit_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cloud_applied_rpe_edits'"
+        ).fetchone() is not None
     finally:
         conn.close()
     assert "rpe" in cols
-    assert "rpe_source" in plan_cols
-    assert "rpe_source" in standalone_cols
+    assert "rpe_source" not in plan_cols
+    assert "rpe_source" not in standalone_cols
+    assert has_applied_edit_table
+    assert {"edit_id", "feedback_pending"} <= edit_cols
 
 
 def test_migration_adds_activities_rpe(tmp_path):
@@ -87,7 +97,7 @@ def test_migration_adds_activities_rpe(tmp_path):
     assert ver == db.SCHEMA_VERSION
 
 
-def test_v38_migration_preserves_ratings_as_local(tmp_path):
+def test_v38_migration_creates_applied_edit_table_and_preserves_ratings(tmp_path):
     path = str(tmp_path / "v38.db")
     db.init_db(path)
     uid = db.create_user("v38-rider", "unused-password", path=path)
@@ -110,8 +120,7 @@ def test_v38_migration_preserves_ratings_as_local(tmp_path):
             "UPDATE standalone_workouts SET rpe=7 WHERE user_id=? AND id=?",
             (uid, standalone_workout),
         )
-        conn.execute("ALTER TABLE plan_workouts DROP COLUMN rpe_source")
-        conn.execute("ALTER TABLE standalone_workouts DROP COLUMN rpe_source")
+        conn.execute("DROP TABLE cloud_applied_rpe_edits")
         conn.execute("PRAGMA user_version=38")
         conn.commit()
     finally:
@@ -123,12 +132,21 @@ def test_v38_migration_preserves_ratings_as_local(tmp_path):
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 39
         assert conn.execute(
-            "SELECT rpe,rpe_source FROM plan_workouts WHERE id=?", (plan_workout,),
-        ).fetchone()[:] == (6, None)
+            "SELECT rpe FROM plan_workouts WHERE id=?", (plan_workout,),
+        ).fetchone()[0] == 6
         assert conn.execute(
-            "SELECT rpe,rpe_source FROM standalone_workouts WHERE id=?",
+            "SELECT rpe FROM standalone_workouts WHERE id=?",
             (standalone_workout,),
-        ).fetchone()[:] == (7, None)
+        ).fetchone()[0] == 7
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cloud_applied_rpe_edits'"
+        ).fetchone() is not None
+        edit_cols = {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(cloud_applied_rpe_edits)"
+            )
+        }
+        assert "feedback_pending" in edit_cols
     finally:
         conn.close()
 
@@ -172,20 +190,20 @@ def test_activity_rpe_user_scoped(client):
     assert db.get_activity(alice, aid)["rpe"] is None
 
 
-def test_cloud_rpe_edit_compare_and_set_and_same_value_is_no_write(client, monkeypatch):
+def test_cloud_rpe_edit_compare_and_set_and_dedupe_redelivery(client, monkeypatch):
     uid = _register(client)
     aid = _insert(uid, start="2026-06-10T10:00:00")
     now = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
 
-    assert importer.apply_cloud_rpe_edit(uid, aid, 6, None, now=now) == "applied"
+    assert importer.apply_cloud_rpe_edit(uid, aid, 6, None, edit_id="a" * 32, now=now) == "applied"
     assert db.get_activity(uid, aid)["rpe"] == 6
 
     def unexpected_write(*_args, **_kwargs):
         pytest.fail("an already-current cloud rating must not write")
 
     monkeypatch.setattr(db, "set_activity_rpe", unexpected_write)
-    assert importer.apply_cloud_rpe_edit(uid, aid, 6, None, now=now) == "applied"
-    assert importer.apply_cloud_rpe_edit(uid, aid, 8, None, now=now) == "conflict"
+    assert importer.apply_cloud_rpe_edit(uid, aid, 6, None, edit_id="a" * 32, now=now) == "applied"
+    assert importer.apply_cloud_rpe_edit(uid, aid, 8, None, edit_id="b" * 32, now=now) == "conflict"
     assert db.get_activity(uid, aid)["rpe"] == 6
 
 
@@ -194,7 +212,7 @@ def test_cloud_rpe_edit_rejects_invalid_wire_values(client, rpe, base_rpe):
     uid = _register(client)
     aid = _insert(uid, start="2026-06-10T10:00:00")
     assert importer.apply_cloud_rpe_edit(
-        uid, aid, rpe, base_rpe,
+        uid, aid, rpe, base_rpe, edit_id="c" * 32,
         now=dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc),
     ) == "rejected"
     assert db.get_activity(uid, aid)["rpe"] is None
@@ -210,10 +228,10 @@ def test_cloud_rpe_edit_rejects_missing_duplicate_old_and_other_user_targets(cli
     old = _insert(alice, start="2026-04-01T10:00:00")
     now = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
 
-    assert importer.apply_cloud_rpe_edit(alice, 999999, 6, None, now=now) == "rejected"
-    assert importer.apply_cloud_rpe_edit(alice, duplicate, 6, None, now=now) == "rejected"
-    assert importer.apply_cloud_rpe_edit(alice, bob_activity, 6, None, now=now) == "rejected"
-    assert importer.apply_cloud_rpe_edit(alice, old, 6, None, now=now) == "rejected"
+    assert importer.apply_cloud_rpe_edit(alice, 999999, 6, None, edit_id="a" * 32, now=now) == "rejected"
+    assert importer.apply_cloud_rpe_edit(alice, duplicate, 6, None, edit_id="b" * 32, now=now) == "rejected"
+    assert importer.apply_cloud_rpe_edit(alice, bob_activity, 6, None, edit_id="c" * 32, now=now) == "rejected"
+    assert importer.apply_cloud_rpe_edit(alice, old, 6, None, edit_id="d" * 32, now=now) == "rejected"
     assert db.get_activity(bob, bob_activity)["rpe"] is None
 
 
@@ -231,41 +249,42 @@ def test_cloud_rpe_edit_updates_verified_workout_through_shared_resolver(client,
     def save_workout(user_id, kind, workout_id, rpe, now=None, **kwargs):
         save_calls.append((
             user_id, kind, workout_id, rpe,
-            kwargs.get("conn") is not None, kwargs.get("source"),
+            kwargs.get("conn") is not None,
         ))
         return original_save(user_id, kind, workout_id, rpe, now, **kwargs)
     monkeypatch.setattr(importer, "save_workout_rpe", save_workout)
+    feedback_calls = []
     monkeypatch.setattr(
         importer, "apply_rpe_ftp_feedback",
-        lambda *args, **kwargs: pytest.fail("cloud RPE must not feed FTP"),
+        lambda *args, **kwargs: feedback_calls.append((args, kwargs)),
     )
 
     assert importer.apply_cloud_rpe_edit(
-        uid, aid, 7, None,
+        uid, aid, 7, None, edit_id="e" * 32,
         now=dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc),
     ) == "applied"
     assert db.get_plan_workout(uid, workout_id)["rpe"] == 7
-    with db.connect() as conn:
-        source = conn.execute(
-            "SELECT rpe_source FROM plan_workouts WHERE user_id=? AND id=?",
-            (uid, workout_id),
-        ).fetchone()[0]
-    assert source == "cloud"
     assert db.get_activity(uid, aid)["rpe"] is None
-    assert save_calls == [(uid, "plan", workout_id, 7, True, "cloud")]
-    # Re-delivery of an already-equal edit must not alter provenance.
+    assert save_calls == [(uid, "plan", workout_id, 7, True)]
+    assert len(feedback_calls) == 1
+    # Re-delivery of the same id must not call the desktop write path again.
     assert importer.apply_cloud_rpe_edit(
-        uid, aid, 7, None,
+        uid, aid, 7, None, edit_id="e" * 32,
         now=dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc),
     ) == "applied"
-    with db.connect() as conn:
-        assert conn.execute(
-            "SELECT rpe_source FROM plan_workouts WHERE user_id=? AND id=?",
-            (uid, workout_id),
-        ).fetchone()[0] == "cloud"
+    assert save_calls == [(uid, "plan", workout_id, 7, True)]
+    assert len(feedback_calls) == 1
+
+    # A stale edit conflicts even when its value now matches the desktop's.
+    assert importer.apply_cloud_rpe_edit(
+        uid, aid, 7, 6, edit_id="9" * 32,
+        now=dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc),
+    ) == "conflict"
+    assert save_calls == [(uid, "plan", workout_id, 7, True)]
+    assert len(feedback_calls) == 1
 
 
-def test_already_equal_cloud_edit_keeps_desktop_source_unchanged(client):
+def test_cloud_edit_redelivery_does_not_overwrite_later_desktop_rating(client):
     uid = _register(client)
     aid = _insert(uid, seconds=3600, start="2026-06-10T10:00:00")
     plan_id = db.create_plan(uid, "Base", "2026-06-01", 4)
@@ -273,18 +292,94 @@ def test_already_equal_cloud_edit_keeps_desktop_source_unchanged(client):
         plan_id, uid, "2026-06-10", "Endurance", "endurance", 3600, 50.0, "<>"
     )
     assert db.mark_plan_workout_completed(uid, workout_id, aid, "2026-06-10")
-    assert db.set_plan_workout_rpe(uid, workout_id, 7)
+    assert db.set_plan_workout_rpe(uid, workout_id, 4)
     now = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
 
-    assert importer.apply_cloud_rpe_edit(uid, aid, 7, None, now=now) == "applied"
+    assert importer.apply_cloud_rpe_edit(uid, aid, 7, 4, edit_id="f" * 32, now=now) == "applied"
     with db.connect() as conn:
         assert conn.execute(
-            "SELECT rpe_source FROM plan_workouts WHERE user_id=? AND id=?",
-            (uid, workout_id),
-        ).fetchone()[0] is None
+            "SELECT count(*) FROM cloud_applied_rpe_edits WHERE user_id=? AND edit_id=?",
+            (uid, "f" * 32),
+        ).fetchone()[0] == 1
+    assert importer.save_workout_rpe(uid, "plan", workout_id, 4, now)
+    assert importer.apply_cloud_rpe_edit(uid, aid, 7, 4, edit_id="f" * 32, now=now) == "applied"
+    assert db.get_plan_workout(uid, workout_id)["rpe"] == 4
 
 
-def test_plan_desktop_same_value_rerate_clears_cloud_source_and_feeds_ftp(
+def test_cloud_edit_redelivery_retries_failed_feedback_without_rewriting(client, monkeypatch):
+    uid = _register(client)
+    aid = _insert(uid, seconds=3600, start="2026-06-10T10:00:00")
+    plan_id = db.create_plan(uid, "Base", "2026-06-01", 4)
+    workout_id = db.add_plan_workout(
+        plan_id, uid, "2026-06-10", "Endurance", "endurance", 3600, 50.0, "<>"
+    )
+    assert db.mark_plan_workout_completed(uid, workout_id, aid, "2026-06-10")
+    save_calls = []
+    feedback_calls = []
+    original_save = importer.save_workout_rpe
+
+    def save_workout(*args, **kwargs):
+        save_calls.append(1)
+        return original_save(*args, **kwargs)
+
+    def feedback(*_args, **_kwargs):
+        feedback_calls.append(1)
+        if len(feedback_calls) == 1:
+            raise RuntimeError("temporary FTP feedback failure")
+
+    monkeypatch.setattr(importer, "save_workout_rpe", save_workout)
+    monkeypatch.setattr(importer, "apply_rpe_ftp_feedback", feedback)
+    now = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
+
+    with pytest.raises(RuntimeError, match="temporary FTP feedback failure"):
+        importer.apply_cloud_rpe_edit(
+            uid, aid, 7, None, edit_id="8" * 32, now=now,
+        )
+    assert db.get_plan_workout(uid, workout_id)["rpe"] == 7
+    with db.connect() as conn:
+        assert conn.execute(
+            "SELECT feedback_pending FROM cloud_applied_rpe_edits "
+            "WHERE user_id=? AND edit_id=?", (uid, "8" * 32),
+        ).fetchone()[0] == 1
+
+    assert importer.apply_cloud_rpe_edit(
+        uid, aid, 7, None, edit_id="8" * 32, now=now,
+    ) == "applied"
+    assert db.get_plan_workout(uid, workout_id)["rpe"] == 7
+    assert save_calls == [1]
+    assert feedback_calls == [1, 1]
+    with db.connect() as conn:
+        assert conn.execute(
+            "SELECT feedback_pending FROM cloud_applied_rpe_edits "
+            "WHERE user_id=? AND edit_id=?", (uid, "8" * 32),
+        ).fetchone()[0] == 0
+
+
+def test_unlinked_cloud_rating_matches_desktop_passive_estimate(client):
+    cloud_uid = _register(client, "cloud-rider")
+    cloud_activity = _insert(
+        cloud_uid, seconds=1800, start="2026-06-10T10:00:00",
+    )
+    desktop_uid = db.create_user("desktop-rider", "unused-password")
+    desktop_activity = _insert(
+        desktop_uid, seconds=1800, start="2026-06-10T10:00:00",
+    )
+    now = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
+
+    assert importer.apply_cloud_rpe_edit(
+        cloud_uid, cloud_activity, 1, None, edit_id="2" * 32, now=now,
+    ) == "applied"
+    assert db.set_activity_rpe(desktop_uid, desktop_activity, 1)
+    cloud_estimate = importer._current_estimate(
+        importer.passive_ftp_evidence(cloud_uid), now,
+    )
+    desktop_estimate = importer._current_estimate(
+        importer.passive_ftp_evidence(desktop_uid), now,
+    )
+    assert cloud_estimate == pytest.approx(desktop_estimate)
+
+
+def test_plan_desktop_same_value_rerate_after_cloud_edit_feeds_ftp(
     client, monkeypatch,
 ):
     uid = _register(client)
@@ -316,23 +411,15 @@ def test_plan_desktop_same_value_rerate_clears_cloud_source_and_feeds_ftp(
     assert db.set_plan_workout_rpe(uid, peer_id, 6)
 
     assert importer.apply_cloud_rpe_edit(
-        uid, target_activity, 6, None, now=now,
+        uid, target_activity, 6, None, edit_id="1" * 32, now=now,
     ) == "applied"
-    with db.connect() as conn:
-        assert conn.execute(
-            "SELECT rpe_source FROM plan_workouts WHERE id=?", (target_id,),
-        ).fetchone()[0] == "cloud"
-    assert db.latest_ftp(uid)["ftp_watts"] == 200.0
+    assert db.latest_ftp(uid)["ftp_watts"] == 210.0
 
     response = client.post(
         f"/api/plan/workout/{target_id}/rpe", json={"rpe": 6},
     )
     assert response.status_code == 200
     assert response.json()["ftp_feedback_applied"] is True
-    with db.connect() as conn:
-        assert conn.execute(
-            "SELECT rpe_source FROM plan_workouts WHERE id=?", (target_id,),
-        ).fetchone()[0] is None
     assert db.latest_ftp(uid)["ftp_watts"] == 210.0
     assert db.get_plan_workout(uid, target_id)["feedback_applied"]
 
