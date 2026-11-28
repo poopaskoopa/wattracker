@@ -514,6 +514,85 @@ def test_cloud_edit_reverses_and_reapplies_existing_feedback(user_id, monkeypatc
     assert len(feedback_calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("write_error", "expected_status"),
+    [
+        (LookupError, "rejected"),
+        (importer.RpeCompareAndSetConflict, "conflict"),
+        (RuntimeError, None),
+    ],
+)
+def test_cloud_edit_savepoint_preserves_feedback_on_write_error(
+    user_id, monkeypatch, write_error, expected_status,
+):
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+    target_workout, target_activity = _cloud_target(
+        user_id, "savepoint-target", rpe=6,
+    )
+    _cloud_target(user_id, "savepoint-peer", rpe=6)
+    assert importer.apply_rpe_ftp_feedback(user_id, _cloud_now()) == 210.0
+
+    tables = {
+        "ftp_history": "date, source",
+        "ftp_feedback_batches": "id",
+        "ftp_suggestions": "id",
+        "standalone_workouts": "id",
+    }
+
+    def feedback_state():
+        conn = db.connect(read_only=True)
+        try:
+            return {
+                table: tuple(
+                    tuple(row) for row in conn.execute(
+                        f"SELECT * FROM {table} WHERE user_id=? ORDER BY {ordering}",
+                        (user_id,),
+                    ).fetchall()
+                )
+                for table, ordering in tables.items()
+            }
+        finally:
+            conn.close()
+
+    before = feedback_state()
+    original_save = importer.save_workout_rpe
+
+    def save_then_fail(*args, **kwargs):
+        assert original_save(*args, **kwargs)
+        raise write_error("injected failure after feedback rollback")
+
+    monkeypatch.setattr(importer, "save_workout_rpe", save_then_fail)
+    edit_id = "f" * 32
+    if expected_status is None:
+        with pytest.raises(
+            RuntimeError, match="injected failure after feedback rollback",
+        ):
+            importer.apply_cloud_rpe_edit(
+                user_id, target_activity, 9, 6, edit_id=edit_id,
+                now=_cloud_now(),
+            )
+    else:
+        assert importer.apply_cloud_rpe_edit(
+            user_id, target_activity, 9, 6, edit_id=edit_id, now=_cloud_now(),
+        ) == expected_status
+
+    assert feedback_state() == before
+    assert db.get_standalone_workout(user_id, target_workout)["rpe"] == 6
+    conn = db.connect(read_only=True)
+    try:
+        row = conn.execute(
+            "SELECT status FROM cloud_applied_rpe_edits "
+            "WHERE user_id=? AND edit_id=?",
+            (user_id, edit_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    if expected_status is None:
+        assert row is None
+    else:
+        assert row["status"] == expected_status
+
+
 def test_desktop_same_value_rerate_after_cloud_edit_feeds_ftp(user_id):
     db.add_ftp_entry(user_id, DATE, 200, "estimated")
     cloud_workout, cloud_activity = _cloud_target(user_id, "desktop-rerate")

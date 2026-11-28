@@ -1018,6 +1018,45 @@ def test_edit_ack_429_retry_after_defers_the_next_pull(tmp_path):
         sync.stop()
 
 
+def test_cloud_sync_state_read_error_counts_one_pull_and_sets_retry_backoff(
+    tmp_path, monkeypatch,
+):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = 100_000.0
+    calls = []
+
+    def transport(url, _headers, _body):
+        calls.append(url)
+        if url.endswith("/api/v1/edits/pull"):
+            pytest.fail("a state-read error must not attempt an edit pull")
+        if url.endswith("/api/v1/sync/batches"):
+            return 200, b'{"revision":1}'
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now)
+    original_get_state = db.get_cloud_sync_state
+    read_count = 0
+
+    def fail_edit_schedule_read(uid, *, path=None):
+        nonlocal read_count
+        read_count += 1
+        if read_count == 2:
+            raise sqlite3.OperationalError("temporary state read failure")
+        return original_get_state(uid, path=path)
+
+    monkeypatch.setattr(db, "get_cloud_sync_state", fail_edit_schedule_read)
+    try:
+        results = sync.sync_once(user_id)
+        schedule = sync._edit_schedule(user_id)
+        assert results and all(result.ok for result in results)
+        assert schedule.pulls_today == 1
+        assert schedule.retry_until == now + 60
+        assert schedule.next_due(now) == now + 60
+        assert calls and all(url.endswith("/api/v1/sync/batches") for url in calls)
+    finally:
+        sync.stop()
+
+
 def test_sync_once_recovers_pending_ftp_feedback_before_pulling(tmp_path, monkeypatch):
     path, user_id = _fixture_db(tmp_path, count=1)
     calls = []

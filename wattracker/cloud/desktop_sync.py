@@ -32,6 +32,7 @@ DEFAULT_BATCH_LIMIT = 100
 _EDIT_PULL_OFFSETS = (0.0, 600.0, 1_800.0, 7_200.0, 21_600.0, 43_200.0, 64_800.0, 86_400.0)
 _EDIT_PULL_LIMIT_PER_DAY = 8
 _EDIT_UNSUPPORTED_BACKOFF = 86_400.0
+_EDIT_PULL_STATE_ERROR_BACKOFF = 60.0
 
 
 _log = logging.getLogger(__name__)
@@ -626,7 +627,7 @@ class DesktopCloudSync:
             except Exception:
                 sync_endpoint = None
                 schedule.pulled(now, has_edits=False)
-                schedule.retry_pull(now, getattr(client, "last_retry_after_seconds", None))
+                schedule.retry_pull(now, _EDIT_PULL_STATE_ERROR_BACKOFF)
                 pull_error = True
             if sync_endpoint:
                 from ..ingest import importer
@@ -681,7 +682,7 @@ class DesktopCloudSync:
                             edit_acks.append(edit.ack(status))
                         if unprocessed_edits:
                             schedule.retry_pull()
-            else:
+            elif not pull_error:
                 # Without a writer endpoint there is no pull to perform. Move
                 # past the immediate start slot instead of requeueing now.
                 schedule.pulled(now, has_edits=False)
