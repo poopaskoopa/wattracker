@@ -1,0 +1,332 @@
+name: Android signed release
+
+# Tag-triggered, and tag-triggered only. There is deliberately no
+# `pull_request` trigger: this job holds the upload key and the Play service
+# account, and a PR trigger would hand both to any fork's diff. android.yml
+# stays the PR workflow and carries no signing material.
+#
+# The `android/v*` tag is admin-only. The "Android release tag policy" ruleset
+# (id 27997494) lets only the Admin role create, move or delete one, with
+# bypass `always`, so a write collaborator cannot tag a commit carrying an
+# altered copy of this file and dispatch it. That ruleset is load-bearing, not
+# housekeeping: it is the only thing between a write collaborator and these
+# secrets. Do not add a bypass actor for Actions or for a workflow token.
+#
+# The secrets live in the `android-code-signing` environment (#486), which
+# admits only `main` and `android/v*` tags and carries a required reviewer.
+# That is why this job declares it and android.yml does not.
+on:
+  push:
+    tags:
+      - "android/v*"
+
+# Nothing by default. Each job asks for exactly what it uses. No job writes
+# repository contents: the tag is the trigger, never something this workflow
+# creates, moves or deletes.
+permissions:
+  contents: read
+
+# One group for all tag runs, never cancel-in-progress: a run is never killed
+# mid-upload, which would leave Play holding a half-published track. GitHub
+# keeps at most one run PENDING per group, so back-to-back tags supersede the
+# older *pending* run and the newest tag wins. A run that already started
+# finishes and uploads; the duplicate build that costs is harmless, and a
+# cancelled upload is not.
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: android-code-signing
+    timeout-minutes: 60
+    env:
+      # The tag that triggered this run, e.g. android/v1.2.3. Gradle derives
+      # versionName and versionCode from it (app/build.gradle.kts), so Play
+      # never sees a repeated versionCode and a human never has to remember.
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+        with:
+          # The tag, not a branch: a release must build what was tagged.
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          # Nothing here pushes, and a persisted credential in .git/config is
+          # one more place a secret could be read from.
+          persist-credentials: false
+
+      # android/gradle/gradle-daemon-jvm.properties pins toolchainVersion=25.
+      # Left unpinned, Gradle resolves it through foojay and downloads a JDK on
+      # every run. Temurin 25 matches android.yml and the developer machine.
+      - name: Provision JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # compileSdk is release(37), which is not on the runner image. AGP will
+      # fetch it, but only once the licences are accepted.
+      - name: Accept Android SDK licences
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+
+      # Before anything is signed or uploaded, because a bad host or tag must
+      # cost nothing but time. This mirrors ios-release.yml's "Validate the iOS
+      # API host" step: the authority is an environment secret, not a
+      # checked-in value, so it is validated rather than trusted. Keep it out of
+      # shell diagnostics, and reject URI-shaped values so an accidental scheme
+      # or path cannot change the app's endpoint semantics.
+      #
+      # A bare host is what the build field wants (WATTRACKER_CLOUD_SCHEME
+      # supplies https separately). The default in app/build.gradle.kts is
+      # cloud.wattracker.example, which does not resolve; the *.example refusal
+      # below is what stops that placeholder from shipping.
+      - name: Validate the cloud authority and the tag
+        env:
+          WATTRACKER_ANDROID_CLOUD_AUTHORITY: ${{ secrets.WATTRACKER_ANDROID_CLOUD_AUTHORITY }}
+        run: |
+          set -euo pipefail
+          host="${WATTRACKER_ANDROID_CLOUD_AUTHORITY:-}"
+          if [ -z "$host" ] || [[ "$host" =~ [[:space:]] ]]; then
+            echo "WATTRACKER_ANDROID_CLOUD_AUTHORITY is missing, empty, or contains whitespace." >&2
+            echo "Check that this job declares 'environment: android-code-signing' and that the secret is set at environment scope." >&2
+            exit 1
+          fi
+          if [[ "$host" == *://* || "$host" == */* || "$host" == *\?* || "$host" == *#* || "$host" == *:* ]]; then
+            echo "WATTRACKER_ANDROID_CLOUD_AUTHORITY must be a bare hostname, not a URL, host:port, or path." >&2
+            exit 1
+          fi
+          if ! [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]; then
+            echo "WATTRACKER_ANDROID_CLOUD_AUTHORITY is not a valid hostname." >&2
+            exit 1
+          fi
+          host_lower="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$host_lower" == *.example ]]; then
+            echo "WATTRACKER_ANDROID_CLOUD_AUTHORITY must not be the placeholder host." >&2
+            exit 1
+          fi
+          # A malformed tag would silently fall back to versionCode 1 in
+          # build.gradle.kts, which Play has already seen, so it is refused here
+          # rather than at upload time.
+          tag="${RELEASE_TAG:-}"
+          if ! [[ "$tag" =~ ^android/v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "RELEASE_TAG '$tag' is not android/v<major>.<minor>.<patch>." >&2
+            exit 1
+          fi
+          echo "The cloud authority and the tag are valid."
+
+      # The keystore is base64 in a secret and is written to the runner only,
+      # never to the tree: .gitignore covers *.jks / *.keystore, and no key
+      # material is committed. umask 077 so the file is not group- or
+      # world-readable, and RUNNER_TEMP is wiped with the runner.
+      #
+      # The password goes to a file rather than the command line, so it cannot
+      # appear in the process list, and keytool only reports whether the
+      # keystore opened -- never its contents.
+      - name: Decode and check the upload keystore
+        env:
+          ANDROID_UPLOAD_KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_B64 }}
+          ANDROID_UPLOAD_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_UPLOAD_KEYSTORE_B64:-}" ] || [ -z "${ANDROID_UPLOAD_KEYSTORE_PASSWORD:-}" ]; then
+            echo "The android-code-signing environment did not supply the upload keystore." >&2
+            exit 1
+          fi
+          keystore_dir="$RUNNER_TEMP/keystore"
+          (umask 077; mkdir -p "$keystore_dir")
+          keystore="$keystore_dir/upload.jks"
+          printf '%s' "$ANDROID_UPLOAD_KEYSTORE_B64" | base64 --decode > "$keystore"
+          chmod 600 "$keystore"
+          password_file="$keystore_dir/store.pass"
+          (umask 077; printf '%s' "$ANDROID_UPLOAD_KEYSTORE_PASSWORD" > "$password_file")
+          chmod 600 "$password_file"
+          # Prove the decode produced a usable keystore before spending the
+          # build on it. Output is discarded: only the exit code is the answer.
+          keytool -list -keystore "$keystore" -storepass:file "$password_file" > /dev/null
+          echo "ANDROID_UPLOAD_KEYSTORE_FILE=$keystore" >> "$GITHUB_ENV"
+
+      # build.gradle.kts reads all four from the environment, and a partial set
+      # counts as absent, so a missing one produces an unsigned bundle rather
+      # than a half-configured signer. That would still upload, so it is
+      # refused here instead.
+      #
+      # No -PallowPlaceholderHost: the guard in app/build.gradle.kts must pass
+      # on its own, so a placeholder host fails instead of shipping.
+      - name: Build the signed bundle
+        working-directory: android
+        env:
+          ANDROID_UPLOAD_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          ANDROID_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+          ANDROID_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          WATTRACKER_ANDROID_CLOUD_AUTHORITY: ${{ secrets.WATTRACKER_ANDROID_CLOUD_AUTHORITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_UPLOAD_KEYSTORE_PASSWORD:-}" ] || [ -z "${ANDROID_UPLOAD_KEY_PASSWORD:-}" ] || [ -z "${ANDROID_UPLOAD_KEY_ALIAS:-}" ]; then
+            echo "The android-code-signing environment did not supply every upload-key value." >&2
+            exit 1
+          fi
+          ./gradlew --no-daemon :app:bundleRelease \
+            -PwattrackerCloudAuthority="$WATTRACKER_ANDROID_CLOUD_AUTHORITY" \
+            -PwattrackerReleaseTag="$RELEASE_TAG"
+
+      # An unsigned bundle still uploads, so prove the signature rather than
+      # trusting the configuration. keytool ships with the JDK and reads an
+      # .aab because the format is a jar-shaped zip.
+      #
+      # Assert on the output, never on the exit code. Measured on this repo's
+      # toolchain: keytool -printcert and jarsigner -verify BOTH exit 0 for an
+      # unsigned bundle, printing "Not a signed jar file" and "jar is unsigned"
+      # respectively. Either one used as an exit-code gate passes an unsigned
+      # bundle to Play. So the certificate output is what is checked, and the
+      # expected Owner is confirmed to be the upload key rather than any key.
+      - name: Verify the bundle is signed by the upload key
+        working-directory: android
+        run: |
+          set -euo pipefail
+          bundle="$PWD/app/build/outputs/bundle/release/app-release.aab"
+          if [ ! -f "$bundle" ]; then
+            echo "No bundle at $bundle." >&2
+            exit 1
+          fi
+          # A certificate block, not the exit code. "Not a signed jar file"
+          # carries exit 0, so its absence from the output is the real signal.
+          certs="$(keytool -printcert -jarfile "$bundle" 2>&1 || true)"
+          if ! printf '%s' "$certs" | grep -q '^Owner:'; then
+            echo "The bundle carries no signer: the release signingConfig did not apply." >&2
+            exit 1
+          fi
+          # Report the certificate SHA-256, which is public and is the value
+          # #486 recorded for the upload key (E7:BD:E9:12:...:30:54). It names
+          # no secret and lets a reviewer confirm the identity from the log.
+          printf '%s' "$certs" | sed -n 's/^[[:space:]]*SHA256: /SHA256: /p' | head -1
+          echo "The bundle is signed."
+
+      # The Play upload needs the Developer API. No Google client library is in
+      # the app's dependency tree (the epic's rule) and none is needed here: the
+      # service-account JSON becomes an OAuth token through a JWT grant, and the
+      # upload is one HTTPS POST. openssl and curl are on the runner image.
+      #
+      # Nothing about the key is printed: a failure reports only the HTTP
+      # status, and the token and upload URL are masked before use.
+      - name: Mint a Play Developer API token
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PLAY_SERVICE_ACCOUNT_JSON:-}" ]; then
+            echo "The android-code-signing environment did not supply PLAY_SERVICE_ACCOUNT_JSON." >&2
+            exit 1
+          fi
+          key_dir="$RUNNER_TEMP/play"
+          (umask 077; mkdir -p "$key_dir")
+          key_path="$key_dir/service-account.json"
+          (umask 077; printf '%s' "$PLAY_SERVICE_ACCOUNT_JSON" > "$key_path")
+          chmod 600 "$key_path"
+          # Read the claims out of the JSON rather than pulling in a Google
+          # library. The private key never leaves RUNNER_TEMP.
+          read_claim() {
+            python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$key_path" "$1"
+          }
+          client_email="$(read_claim client_email)"
+          token_uri="$(read_claim token_uri)"
+          private_key="$(read_claim private_key)"
+          project_id="$(read_claim project_id)"
+          if [ -z "$client_email" ] || [ -z "$token_uri" ] || [ -z "$private_key" ] || [ -z "$project_id" ]; then
+            echo "PLAY_SERVICE_ACCOUNT_JSON is not a service-account key." >&2
+            exit 1
+          fi
+          pem="$key_dir/private.pem"
+          (umask 077; printf '%s' "$private_key" > "$pem")
+          chmod 600 "$pem"
+          # The JWT grant: header, claim set, RS256 signature, base64url with no
+          # padding.
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          iat="$(date +%s)"
+          exp="$((iat + 3600))"
+          scope="https://www.googleapis.com/auth/androidpublisher"
+          header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+          claims="$(printf '{"iss":"%s","scope":"%s","aud":"%s","iat":%s,"exp":%s}' \
+            "$client_email" "$scope" "$token_uri" "$iat" "$exp" | b64url)"
+          signing_input="$header.$claims"
+          signature="$(printf '%s' "$signing_input" | openssl dgst -sha256 -sign "$pem" -binary | b64url)"
+          token="$(curl --silent --show-error --fail \
+            --header 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
+            --data-urlencode "assertion=$signing_input.$signature" \
+            "$token_uri" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("access_token", ""))')"
+          if [ -z "$token" ]; then
+            echo "The token endpoint returned no access token." >&2
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          {
+            echo "PLAY_ACCESS_TOKEN=$token"
+            echo "PLAY_PROJECT_ID=$project_id"
+          } >> "$GITHUB_ENV"
+
+      # The internal track is the target (#199), not open or closed testing: up
+      # to 100 testers by email, no review queue, builds do not expire.
+      #
+      # An edit is the unit every Play write happens in, and nothing reaches the
+      # track until the commit at the end succeeds. So a failure in the middle
+      # leaves Play untouched rather than half-written, which is why no cleanup
+      # step is needed.
+      - name: Upload to the internal track
+        run: |
+          set -euo pipefail
+          bundle="android/app/build/outputs/bundle/release/app-release.aab"
+          package="com.wattracker.android"
+          auth=("--header" "Authorization: Bearer $PLAY_ACCESS_TOKEN")
+          # versionCode comes from the tag through build.gradle.kts. The same
+          # formula is repeated here only to read it back, and the tag format was
+          # pinned by the validation step, so the two cannot disagree.
+          #
+          # 10# before each field: bash reads a leading zero as octal, so
+          # android/v1.08.0 would otherwise be 8 instead of 80 and disagree with
+          # Gradle's toInt().
+          tag="${RELEASE_TAG#android/v}"
+          major="${tag%%.*}"
+          rest="${tag#*.}"
+          minor="${rest%%.*}"
+          patch="${rest#*.}"
+          version_code="$(( 10#$major * 10000 + 10#$minor * 100 + 10#$patch ))"
+          # 1. Open an edit.
+          edit="$(curl --silent --show-error --fail "${auth[@]}" \
+            --header 'Content-Type: application/json' \
+            --request POST \
+            "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$package/edits" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id", ""))')"
+          if [ -z "$edit" ]; then
+            echo "Play returned no edit id." >&2
+            exit 1
+          fi
+          echo "::add-mask::$edit"
+          # 2. Upload the bundle as a media upload, which returns the versionCode
+          # Play read from it. That is checked against the tag's, so a mismatch
+          # cannot silently publish the wrong version.
+          uploaded="$(curl --silent --show-error --fail "${auth[@]}" \
+            --header 'Content-Type: application/octet-stream' \
+            --request POST \
+            --data-binary "@$bundle" \
+            "https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/$package/edits/$edit/bundles?uploadType=media" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("versionCode", ""))')"
+          if [ "$uploaded" != "$version_code" ]; then
+            echo "Play read versionCode '$uploaded' from the bundle, but the tag gives '$version_code'." >&2
+            exit 1
+          fi
+          # 3. Assign the bundle to the internal track. `completed` publishes it
+          # to testers; Play App Signing re-signs the delivered artifacts.
+          curl --silent --show-error --fail "${auth[@]}" \
+            --header 'Content-Type: application/json' \
+            --request PUT \
+            "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$package/edits/$edit/tracks/internal" \
+            --data "{\"track\":\"internal\",\"releases\":[{\"versionCodes\":[\"$version_code\"],\"status\":\"completed\"}]}" \
+            > /dev/null
+          # 4. Commit the edit. This is the only step that changes the track.
+          curl --silent --show-error --fail "${auth[@]}" \
+            --header 'Content-Type: application/json' \
+            --request POST \
+            "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$package/edits/$edit:commit" > /dev/null
+          echo "Uploaded $RELEASE_TAG (versionCode $version_code) to the internal track."
