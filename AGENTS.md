@@ -187,22 +187,29 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#510: cloud edit queue review follow-ups (Python).** Spec in the issue body.
+1. **#517: cloud RPE apply hardening (Python).** Spec in the issue body: a savepoint
+   around the write in `apply_cloud_rpe_edit`, so a rejected or conflicting edit undoes any
+   FTP feedback rollback, and a single `pulled()` call when `get_cloud_sync_state` fails, so
+   the retry backoff is kept. Both come from the #512 security review. No schema change.
+   It touches the same files as #510 (`importer.py`, `desktop_sync.py`), so land it first,
+   then rebase #510 onto it. Light security review.
+
+2. **#510: cloud edit queue review follow-ups (Python).** Spec in the issue body.
    Light security review. Must land before #502's device run, which uses the
    in-memory backend that item 4 of #510 deadlocks.
 
-2. **#494: set a ride's RPE from the mobile app on the local backend.** Unblocked:
+3. **#494: set a ride's RPE from the mobile app on the local backend.** Unblocked:
    #495 merged as PR #503 and #498 as PR #504. The spec is the integrator's two comments on the issue.
    The activity RPE route becomes the single explicitly connector-writable
    route, and the plan and standalone RPE routes refuse connector sessions. Flag the PR for
    security review.
 
-3. **#502: iOS RPE editing on the cloud backend.** After #494 merges
+4. **#502: iOS RPE editing on the cloud backend.** After #494 merges
    ("one iOS issue at a time") and after #510. #500's API contract is on `main`. The design,
    the slice order and the owner's deploy step (S5) are in umbrella #497. Cloud-applied
    ratings feed FTP exactly like desktop ratings (#501 Addendum 4, which reversed C2).
 
-4. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+5. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -218,7 +225,7 @@ preview verified on `preview-latest` 2026-10-27), #464 via #471, #479 via #489, 
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**#249 stays skipped** pending taksmon's log and invocation. Once items 1-3 are done the queue is empty. Do not pick up unlabelled issues or anything
+**#249 stays skipped** pending taksmon's log and invocation. Once items 1-4 are done the queue is empty. Do not pick up unlabelled issues or anything
 below on your own. Say the queue ran out rather than inventing scope.
 
 **Not codex work, do not start:**
