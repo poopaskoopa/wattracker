@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import inspect
+import logging
+import math
 import re
 import secrets
 import socket
@@ -37,11 +39,15 @@ ENROLLMENT_PATH = "/api/v1/enrollment/complete"
 PAIRING_CODE_PATH = "/api/v1/devices/pairing-codes"
 DEVICES_PATH = "/api/v1/devices"
 WIPE_PATH = "/api/v1/account/wipe"
+EDIT_PULL_PATH = "/api/v1/edits/pull"
+EDIT_ACK_PATH = "/api/v1/edits/ack"
 PAIRING_IDEMPOTENCY_KEY = "device-pairing-code"
 DEVICE_LIST_IDEMPOTENCY_KEY = "device-list"
 DEVICE_REVOKE_IDEMPOTENCY_KEY = "device-revoke"
 DEVICE_CAPABILITIES_IDEMPOTENCY_KEY = "device-capabilities"
 WIPE_IDEMPOTENCY_KEY = "account-wipe"
+EDIT_PULL_IDEMPOTENCY_KEY = "edit-pull"
+EDIT_ACK_IDEMPOTENCY_KEY = "edit-ack"
 OFFLINE_MESSAGE = "Cloud sync offline — local data and features are unaffected."
 SYNC_ENDPOINT_NOT_CONFIGURED = "Cloud sync endpoint is not configured."
 UPLOAD_TIMEOUT_MESSAGE = "Cloud upload timed out; will retry."
@@ -54,10 +60,33 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
 _CREDENTIAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _NAMESPACE_RE = re.compile(r"^[0-9a-f]{64}$")
 _PUBLIC_KEY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_EDIT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_EDIT_FIELDS = frozenset({"edit_id", "activity_id", "rpe", "base_rpe", "created_at"})
+_EDIT_ACK_STATUSES = frozenset({"applied", "conflict", "rejected"})
+
+_log = logging.getLogger(__name__)
 
 
 class CloudEnrollmentError(ValueError):
     """Enrollment failed before a credential could be stored."""
+
+
+class CloudEditsNotSupported(CloudEnrollmentError):
+    """The configured cloud deployment does not expose the edit endpoint yet."""
+
+
+@dataclass(frozen=True)
+class PulledEdit:
+    """Validated, allowlisted edit fields returned by the cloud."""
+
+    edit_id: str
+    activity_id: int
+    rpe: int
+    base_rpe: Optional[int]
+    created_at: float
+
+    def ack(self, status: str) -> dict[str, str]:
+        return {"edit_id": self.edit_id, "status": status}
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -166,7 +195,9 @@ def https_transport(
     ca_file: Optional[str] = None,
     timeout: float = DEFAULT_HTTP_TIMEOUT,
     post_timeout: float = DEFAULT_POST_TIMEOUT,
-) -> Callable[[str, Mapping[str, str], bytes], tuple[int, bytes]]:
+) -> Callable[
+    [str, Mapping[str, str], bytes], tuple[int, bytes, Mapping[str, str]],
+]:
     """Create a strict HTTPS/mTLS transport for an enabled desktop worker.
 
     Certificate verification remains enabled; there is no insecure HTTP or
@@ -182,7 +213,7 @@ def https_transport(
 
     def send(
         url: str, headers: Mapping[str, str], body: bytes, method: str = "POST",
-    ) -> tuple[int, bytes]:
+    ) -> tuple[int, bytes, Mapping[str, str]]:
         validate_cloud_endpoint(url.rsplit("/api/v1/", 1)[0])
         method = method.upper()
         if method not in {"GET", "POST"}:
@@ -197,9 +228,14 @@ def https_transport(
             request_timeout = post_timeout if method == "POST" else timeout
             response = opener.open(request, timeout=request_timeout)
         except HTTPError as exc:
-            return exc.code, exc.read(MAX_RESPONSE_BYTES)
+            response_headers = dict(exc.headers.items()) if exc.headers else {}
+            return exc.code, exc.read(MAX_RESPONSE_BYTES), response_headers
         with response:
-            return int(response.status), response.read(MAX_RESPONSE_BYTES)
+            response_headers = getattr(response, "headers", {}) or {}
+            return (
+                int(response.status), response.read(MAX_RESPONSE_BYTES),
+                dict(response_headers.items()),
+            )
 
     send.supports_method = True  # type: ignore[attr-defined]
     return send
@@ -214,7 +250,12 @@ class CloudSyncClient:
         credentials: Optional[SyncCredentials] = None,
         *,
         sync_endpoint: Optional[str] = None,
-        transport: Optional[Callable[[str, Mapping[str, str], bytes], tuple[int, bytes]]] = None,
+        transport: Optional[
+            Callable[
+                [str, Mapping[str, str], bytes],
+                tuple[int, bytes] | tuple[int, bytes, Mapping[str, str]],
+            ]
+        ] = None,
         mtls_headers: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -226,6 +267,7 @@ class CloudSyncClient:
         self.transport = transport
         self.mtls_headers = dict(mtls_headers or {})
         self.clock = clock
+        self.last_retry_after_seconds: Optional[int] = None
         self._transport_accepts_method = bool(
             getattr(self.transport, "supports_method", False)
         )
@@ -244,6 +286,7 @@ class CloudSyncClient:
         self, method: str, path: str, body: bytes,
         *, headers: Optional[Mapping[str, str]] = None,
     ) -> tuple[Optional[int], dict[str, Any]]:
+        self.last_retry_after_seconds = None
         if self.transport is None:
             return None, {}
         request_headers = {"Content-Length": str(len(body))}
@@ -260,17 +303,21 @@ class CloudSyncClient:
             return None, {}
         try:
             if self._transport_accepts_method:
-                status, response_body = self.transport(
+                response = self.transport(
                     endpoint + path, request_headers, body, method,
                 )
             else:
-                status, response_body = self.transport(
+                response = self.transport(
                     endpoint + path, request_headers, body,
                 )
         except Exception as exc:
             if _is_timeout_error(exc):
                 return None, {_TRANSPORT_ERROR_KEY: _TRANSPORT_TIMEOUT}
             return None, {}
+        if not isinstance(response, tuple) or len(response) not in (2, 3):
+            return None, {}
+        status, response_body = response[:2]
+        response_headers = response[2] if len(response) == 3 else {}
         try:
             payload = json.loads(response_body.decode("utf-8"))
             if not isinstance(payload, dict):
@@ -281,6 +328,19 @@ class CloudSyncClient:
             status_code = int(status)
         except (TypeError, ValueError):
             return None, {}
+        if status_code == 429 and isinstance(response_headers, Mapping):
+            retry_after = next(
+                (value for name, value in response_headers.items()
+                 if isinstance(name, str) and name.lower() == "retry-after"),
+                None,
+            )
+            if (
+                isinstance(retry_after, str)
+                and retry_after.isascii()
+                and retry_after.isdigit()
+                and len(retry_after) <= 6
+            ):
+                self.last_retry_after_seconds = min(int(retry_after), 86_400)
         return status_code, payload
 
     @classmethod
@@ -289,7 +349,9 @@ class CloudSyncClient:
         endpoint: str,
         invitation: str,
         *,
-        transport: Optional[Callable[..., tuple[int, bytes]]] = None,
+        transport: Optional[
+            Callable[..., tuple[int, bytes] | tuple[int, bytes, Mapping[str, str]]]
+        ] = None,
         mtls_headers: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.time,
     ) -> EnrollmentResult:
@@ -434,6 +496,100 @@ class CloudSyncClient:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 result[key] = value
         return result
+
+    @staticmethod
+    def _pulled_edit(value: object) -> Optional[PulledEdit]:
+        if not isinstance(value, dict) or set(value) != _EDIT_FIELDS:
+            return None
+        edit_id = value.get("edit_id")
+        activity_id = value.get("activity_id")
+        rpe = value.get("rpe")
+        base_rpe = value.get("base_rpe")
+        created_at = value.get("created_at")
+        try:
+            created_timestamp = float(created_at)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if (
+            not isinstance(edit_id, str) or _EDIT_ID_RE.fullmatch(edit_id) is None
+            or type(activity_id) is not int or not 1 <= activity_id <= 2**53 - 1
+            or type(rpe) is not int or not 1 <= rpe <= 10
+            or (base_rpe is not None and (
+                type(base_rpe) is not int or not 1 <= base_rpe <= 10
+            ))
+            or base_rpe == rpe
+            or isinstance(created_at, bool)
+            or not isinstance(created_at, (int, float))
+            or not math.isfinite(created_timestamp)
+            or created_timestamp < 0
+        ):
+            return None
+        return PulledEdit(
+            edit_id=edit_id,
+            activity_id=activity_id,
+            rpe=rpe,
+            base_rpe=base_rpe,
+            created_at=created_timestamp,
+        )
+
+    def pull_edits(self) -> list[PulledEdit]:
+        """Pull pending RPE edits, keeping only S2's strict wire shape."""
+        body = b""
+        headers = self._signed_headers(
+            "POST", EDIT_PULL_PATH, body,
+            idempotency_key=EDIT_PULL_IDEMPOTENCY_KEY, revision=0,
+        )
+        status, payload = self._request("POST", EDIT_PULL_PATH, body, headers=headers)
+        if status == 404:
+            raise CloudEditsNotSupported("cloud RPE edits are not available")
+        if (
+            status != 200 or set(payload) != {"edits"}
+            or not isinstance(payload.get("edits"), list)
+            or len(payload["edits"]) > 50
+        ):
+            raise CloudEnrollmentError("cloud RPE edits request failed")
+        edits: list[PulledEdit] = []
+        seen: set[str] = set()
+        for value in payload["edits"]:
+            edit = self._pulled_edit(value)
+            if edit is None or edit.edit_id in seen:
+                _log.warning("cloud RPE pull discarded malformed entry")
+                continue
+            seen.add(edit.edit_id)
+            edits.append(edit)
+        return edits
+
+    def ack_edits(self, results: list[dict[str, str]]) -> bool:
+        """Acknowledge validated edit outcomes; a stale ack may settle zero rows."""
+        if not isinstance(results, list) or len(results) > 50:
+            return False
+        seen: set[str] = set()
+        for item in results:
+            if (
+                not isinstance(item, dict) or set(item) != {"edit_id", "status"}
+                or not isinstance(item.get("edit_id"), str)
+                or _EDIT_ID_RE.fullmatch(item["edit_id"]) is None
+                or item["edit_id"] in seen
+                or not isinstance(item.get("status"), str)
+                or item["status"] not in _EDIT_ACK_STATUSES
+            ):
+                return False
+            seen.add(item["edit_id"])
+        body = json.dumps(
+            {"results": results}, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        headers = self._signed_headers(
+            "POST", EDIT_ACK_PATH, body,
+            idempotency_key=EDIT_ACK_IDEMPOTENCY_KEY, revision=0,
+        )
+        status, payload = self._request("POST", EDIT_ACK_PATH, body, headers=headers)
+        acked = payload.get("acked")
+        return (
+            status == 200
+            and set(payload) == {"acked"}
+            and type(acked) is int
+            and 0 <= acked <= len(results)
+        )
 
     def list_devices(self) -> list[dict[str, Any]]:
         """List allowlisted device metadata; response secrets are discarded."""

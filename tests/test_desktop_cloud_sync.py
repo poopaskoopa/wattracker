@@ -19,7 +19,11 @@ from wattracker.cloud.client import (
     validate_cloud_endpoint,
 )
 from wattracker.cloud.credentials import CloudCredentialStore, CloudCredentialUnavailable
-from wattracker.cloud.desktop_sync import CloudDependencyUnavailable, DesktopCloudSync
+from wattracker.cloud.desktop_sync import (
+    CloudDependencyUnavailable,
+    DesktopCloudSync,
+    EditPullSchedule,
+)
 from wattracker.cloud.models import SyncBatch
 from wattracker.cloud.security import PublicKeyUnavailable
 from wattracker.cloud.snapshot import snapshot_objects
@@ -90,6 +94,24 @@ def _credentials():
     )
 
 
+def _configured_edit_sync(path, user_id, transport, *, clock):
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(_credentials(), user_id=user_id)
+    db.save_cloud_sync_state(
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
+    )
+    return DesktopCloudSync(
+        str(path), store, transport=transport, clock=clock,
+        include_derived=False,
+    )
+
+
 def _two_rider_sync(tmp_path):
     path, first_user_id = _fixture_db(tmp_path, count=1)
     second_user_id = db.create_user("second-rider", "not-a-password", path=str(path))
@@ -149,6 +171,8 @@ def test_desktop_sync_publishes_streams_by_default(tmp_path):
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -182,6 +206,8 @@ def test_stream_option_gate_uploads_only_new_stream_objects(tmp_path):
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -472,6 +498,8 @@ def test_offline_queue_retry_and_drain_preserves_snapshot_ledger(tmp_path):
     responses = [(503, b'{"detail":"offline"}'), (200, b'{"revision":1}')]
 
     def transport(_url, _headers, _body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 404, b"{}"
         return responses.pop(0)
 
     sync = DesktopCloudSync(
@@ -504,6 +532,8 @@ def test_default_batch_limit_uses_the_measured_100_object_page(tmp_path):
     bodies = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         bodies.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -543,6 +573,8 @@ def test_timeout_then_retry_replays_same_batch_and_records_success(tmp_path):
     requests = []
 
     def transport(_url, headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 404, b"{}"
         wire = json.loads(body)
         requests.append((dict(headers), wire))
         batch = SyncBatch.from_wire(wire)
@@ -591,6 +623,8 @@ def test_disable_between_pages_stops_before_the_next_outbound_request(tmp_path):
     sync = None
 
     def transport(url, _headers, _body):
+        if url.endswith("/api/v1/edits/pull"):
+            return 404, b"{}"
         calls.append(url)
         sync.set_enabled(user_id, False)
         return 200, b'{"revision":1}'
@@ -832,6 +866,8 @@ def test_unchanged_sync_skips_snapshot_rebuild(tmp_path, monkeypatch):
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -861,6 +897,403 @@ def test_unchanged_sync_skips_snapshot_rebuild(tmp_path, monkeypatch):
         sync.stop()
 
 
+def test_edit_pull_runs_before_snapshot_gate_and_publish_precedes_ack(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = [dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()]
+    edit = {
+        "edit_id": "a" * 32, "activity_id": 1, "rpe": 6,
+        "base_rpe": None, "created_at": now[0],
+    }
+    calls = []
+    published = []
+    pull_count = 0
+
+    def transport(url, _headers, body):
+        nonlocal pull_count
+        if url.endswith("/api/v1/edits/pull"):
+            calls.append("pull")
+            pull_count += 1
+            return 200, json.dumps({"edits": [] if pull_count == 1 else [edit]}).encode()
+        if url.endswith("/api/v1/sync/batches"):
+            calls.append("publish")
+            published.append(json.loads(body))
+            return 200, b'{"revision":1}'
+        if url.endswith("/api/v1/edits/ack"):
+            calls.append("ack")
+            assert json.loads(body) == {
+                "results": [{"edit_id": "a" * 32, "status": "applied"}]
+            }
+            return 200, b'{"acked":1}'
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now[0])
+    try:
+        first_results = sync.sync_once(user_id)
+        assert first_results and all(result.ok for result in first_results)
+        now[0] += 600
+        results = sync.sync_once(user_id)
+    finally:
+        sync.stop()
+
+    assert results and all(result.ok for result in results)
+    assert calls == ["pull", "publish", "pull", "publish", "ack"]
+    activity = next(obj for obj in published[1]["objects"] if obj["kind"] == "activity")
+    assert activity["data"]["rpe"] == 6
+    assert db.get_activity(user_id, 1, path=str(path))["rpe"] == 6
+
+
+def test_failed_publish_retries_edit_without_duplicate_write(tmp_path, monkeypatch):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()
+    edit = {
+        "edit_id": "b" * 32, "activity_id": 1, "rpe": 6,
+        "base_rpe": None, "created_at": now,
+    }
+    calls = []
+    publish_attempts = 0
+    writes = []
+    original_set = db.set_activity_rpe
+
+    def set_activity_rpe(*args, **kwargs):
+        writes.append((args, kwargs))
+        return original_set(*args, **kwargs)
+
+    monkeypatch.setattr(db, "set_activity_rpe", set_activity_rpe)
+
+    def transport(url, _headers, body):
+        if url.endswith("/api/v1/edits/pull"):
+            calls.append("pull")
+            return 200, json.dumps({"edits": [edit]}).encode()
+        if url.endswith("/api/v1/sync/batches"):
+            calls.append("publish")
+            nonlocal publish_attempts
+            publish_attempts += 1
+            if publish_attempts == 1:
+                return 503, b'{"detail":"offline"}'
+            return 200, b'{"revision":2}'
+        if url.endswith("/api/v1/edits/ack"):
+            calls.append("ack")
+            return 200, b'{"acked":1}'
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now)
+    try:
+        results = sync.sync_once(user_id)
+        assert results and not results[0].ok
+        assert calls == ["pull", "publish"]
+        assert sync._edit_schedule(user_id).pending
+        retry = sync.sync_once(user_id)
+        assert retry and all(result.ok for result in retry)
+    finally:
+        sync.stop()
+    assert calls == ["pull", "publish", "pull", "publish", "ack"]
+    assert len(writes) == 1
+    assert db.get_activity(user_id, 1, path=str(path))["rpe"] == 6
+
+
+def test_edit_ack_429_retry_after_defers_the_next_pull(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()
+    edit = {
+        "edit_id": "e" * 32, "activity_id": 1, "rpe": 6,
+        "base_rpe": None, "created_at": now,
+    }
+
+    def transport(url, _headers, _body):
+        if url.endswith("/api/v1/edits/pull"):
+            return 200, json.dumps({"edits": [edit]}).encode()
+        if url.endswith("/api/v1/sync/batches"):
+            return 200, b'{"revision":1}'
+        if url.endswith("/api/v1/edits/ack"):
+            return 429, b'{"detail":"quota"}', {"Retry-After": "120"}
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now)
+    try:
+        assert all(result.ok for result in sync.sync_once(user_id))
+        schedule = sync._edit_schedule(user_id)
+        assert schedule.retry_until == now + 120
+        assert schedule.next_due(now) == now + 120
+    finally:
+        sync.stop()
+
+
+def test_sync_once_recovers_pending_ftp_feedback_before_pulling(tmp_path, monkeypatch):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    calls = []
+
+    def transport(url, _headers, _body):
+        calls.append("pull" if url.endswith("/api/v1/edits/pull") else "publish")
+        if url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
+        return 200, b'{"revision":1}'
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: 100)
+    from wattracker.ingest import importer
+    expected_path = str(path)
+
+    def recover(uid, now, *, path):
+        assert uid == user_id
+        assert now.timestamp() == 100
+        assert path == expected_path
+        calls.append("recover")
+        return 1
+
+    monkeypatch.setattr(importer, "retry_pending_cloud_rpe_feedback", recover)
+    try:
+        assert all(result.ok for result in sync.sync_once(user_id))
+        assert calls == ["recover", "pull", "publish"]
+    finally:
+        sync.stop()
+
+
+def test_replaced_edit_stale_ack_is_noop_then_new_edit_conflicts(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()
+    assert db.set_activity_rpe(user_id, 1, 4, path=str(path))
+    first = {
+        "edit_id": "c" * 32, "activity_id": 1, "rpe": 6,
+        "base_rpe": 4, "created_at": now,
+    }
+    replacement = {
+        "edit_id": "d" * 32, "activity_id": 1, "rpe": 8,
+        "base_rpe": 4, "created_at": now + 1,
+    }
+    pending = [first]
+    pulls = []
+    acks = []
+    publishes = []
+
+    def transport(url, _headers, body):
+        if url.endswith("/api/v1/edits/pull"):
+            pulls.append(1)
+            return 200, json.dumps({"edits": list(pending)}).encode()
+        if url.endswith("/api/v1/sync/batches"):
+            publishes.append(json.loads(body))
+            return 200, b'{"revision":1}'
+        if url.endswith("/api/v1/edits/ack"):
+            results = json.loads(body)["results"]
+            acks.extend(results)
+            if results[0]["edit_id"] == first["edit_id"]:
+                # The phone replaced E1 before its acknowledgement arrived.
+                pending[:] = [replacement]
+                return 200, b'{"acked":0}'
+            pending.clear()
+            return 200, b'{"acked":1}'
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now)
+    try:
+        assert all(result.ok for result in sync.sync_once(user_id))
+        assert sync.sync_once(user_id) == []
+    finally:
+        sync.stop()
+
+    assert len(pulls) == 2
+    assert len(publishes) == 1
+    assert acks == [
+        {"edit_id": first["edit_id"], "status": "applied"},
+        {"edit_id": replacement["edit_id"], "status": "conflict"},
+    ]
+    assert db.get_activity(user_id, 1, path=str(path))["rpe"] == 6
+
+
+def test_edit_pull_404_backs_off_without_recording_failure_or_skipping_publish(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    now = dt.datetime(2026, 8, 15, 12, tzinfo=dt.timezone.utc).timestamp()
+    calls = []
+
+    def transport(url, _headers, _body):
+        if url.endswith("/api/v1/edits/pull"):
+            calls.append("pull")
+            return 404, b'{}'
+        if url.endswith("/api/v1/sync/batches"):
+            calls.append("publish")
+            return 200, b'{"revision":1}'
+        pytest.fail(f"unexpected cloud request: {url}")
+
+    sync = _configured_edit_sync(path, user_id, transport, clock=lambda: now)
+    try:
+        results = sync.sync_once(user_id)
+        assert results and all(result.ok for result in results)
+        state = db.get_cloud_sync_state(user_id, path=str(path))
+        assert state["retry_count"] == 0
+        assert state["next_retry_at"] is None
+        assert state["last_error"] is None
+        assert calls == ["pull", "publish"]
+        assert sync._edit_schedule(user_id).unsupported_until == now + 86_400
+    finally:
+        sync.stop()
+
+
+def test_edit_pull_schedule_decays_and_caps_idle_polls(tmp_path):
+    schedule = EditPullSchedule(clock=lambda: 0.0)
+    schedule.start(0)
+    assert schedule.due(0)
+    schedule.pulled(0, has_edits=False)
+    assert schedule.next_due(0) == 600
+    assert not schedule.due(599)
+    assert schedule.due(600)
+    schedule.pulled(600, has_edits=False)
+    assert schedule.next_due(600) == 1_800
+    assert not schedule.due(1_799)
+    assert schedule.due(1_800)
+    schedule.pulled(1_800, has_edits=False)
+    assert schedule.next_due(1_800) == 7_200
+    assert not schedule.due(7_199)
+    assert schedule.due(7_200)
+    schedule.pulled(7_200, has_edits=False)
+    assert schedule.next_due(7_200) == 21_600
+    assert not schedule.due(21_599)
+    assert schedule.due(21_600)
+    schedule.published(10_000)
+    assert schedule.next_due(10_000) == 10_600
+    assert not schedule.due(10_599)
+
+    idle = EditPullSchedule(clock=lambda: 0.0)
+    idle.start(0)
+    pulls = 0
+    for now in range(0, 86_401, 60):
+        if idle.due(now):
+            pulls += 1
+            idle.pulled(now, has_edits=False)
+    assert pulls <= 8
+    assert idle.pulls_today == 1  # the final poll landed at the UTC day edge
+    assert not idle.due(86_401)
+    assert idle.next_due(86_401) == 172_800
+    assert idle.due(172_800)
+
+
+def test_next_due_clears_expired_unsupported_window_without_backlog_burst():
+    schedule = EditPullSchedule(clock=lambda: 0.0)
+    schedule.start(0)
+    schedule.pulled(0, has_edits=False)
+    schedule.unsupported(10)
+    assert schedule.next_due(86_409) == 86_410
+    assert schedule.unsupported_until == 86_410
+    assert schedule.next_due(86_410) == 86_410
+    assert schedule.unsupported_until is None
+    assert schedule.anchor == 86_410
+    schedule.pulled(86_410, has_edits=False)
+    assert schedule.next_due(86_410) == 87_010
+
+
+def test_pending_edits_obey_daily_cap_and_retry_after():
+    schedule = EditPullSchedule(clock=lambda: 0.0)
+    schedule.start(100)
+    schedule.pending = True
+    schedule.pulls_today = 8
+    schedule.immediate = True
+    assert not schedule.due(100)
+    assert schedule.next_due(100) == 86_400
+
+    schedule.pulls_today = 1
+    schedule.retry_pull(100, 120)
+    assert not schedule.due(100)
+    assert schedule.next_due(100) == 220
+    assert not schedule.due(219)
+    assert schedule.due(220)
+
+
+@pytest.mark.parametrize("failure_mode", ["daily-cap", "expired-404"])
+def test_scheduler_requeue_bounds_sync_once_calls_under_frozen_clock(
+    tmp_path, failure_mode,
+):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    now = 86_400 * 10 + 100
+    db.save_cloud_sync_state(user_id, {"enabled": True}, path=str(path))
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(MemorySecrets()), clock=lambda: now,
+    )
+    schedule = sync._edit_schedule(user_id)
+    schedule.start(now)
+    if failure_mode == "daily-cap":
+        schedule.pulls_today = 8
+        schedule.pending = True
+        schedule.immediate = True
+    else:
+        schedule.anchor = now - 90_000
+        schedule.slot = 1
+        schedule.immediate = False
+        schedule.unsupported_until = now - 1
+
+    calls = []
+    requeue_observations = []
+    first_call = threading.Event()
+    original_next_due = schedule.next_due
+
+    def observe_next_due(current=None):
+        result = original_next_due(current)
+        if failure_mode == "expired-404":
+            requeue_observations.append((
+                result, schedule.unsupported_until, schedule.anchor,
+                schedule.immediate,
+            ))
+        return result
+
+    schedule.next_due = observe_next_due
+
+    def sync_cycle(_uid):
+        if failure_mode == "expired-404":
+            if not calls:
+                # Model a 404 backoff that expired while the worker was idle.
+                # The scheduler's requeue path must clear it via next_due;
+                # calling due() here would hide that regression.
+                schedule.unsupported_until = now - 1
+            else:
+                # The post-backoff retry also receives a 404 and starts a new
+                # bounded window instead of spinning in this test cycle.
+                schedule.pulled(now, has_edits=False)
+                schedule.unsupported(now)
+        calls.append(now)
+        first_call.set()
+        return []
+
+    sync.sync_once = sync_cycle
+    with sync._scheduler_lock:
+        sync._scheduled[user_id] = now
+    sync._stop_event.clear()
+    worker = threading.Thread(target=sync._run_scheduler, daemon=True)
+    sync._worker = worker
+    worker.start()
+    try:
+        assert first_call.wait(1)
+        time.sleep(0.05)
+        assert len(calls) == (1 if failure_mode == "daily-cap" else 2)
+        if failure_mode == "expired-404":
+            assert requeue_observations[0] == (now, None, now, True)
+        with sync._scheduler_lock:
+            assert sync._scheduled[user_id] > now
+    finally:
+        sync.stop()
+
+
+def test_idle_sync_does_not_construct_client(tmp_path, monkeypatch):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    now = 1_000.0
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(MemorySecrets()), clock=lambda: now,
+    )
+    db.save_cloud_sync_state(
+        user_id,
+        {
+            "enabled": True,
+            "read_endpoint": "https://read.example",
+            "sync_endpoint": "https://sync.example",
+        },
+        path=str(path),
+    )
+    schedule = sync._edit_schedule(user_id)
+    schedule.start(now)
+    schedule.pulled(now, has_edits=False)
+    monkeypatch.setattr(sync, "_snapshot_gate_unchanged", lambda _uid: True)
+    monkeypatch.setattr(
+        sync, "_client", lambda _uid: pytest.fail("idle sync read credentials"),
+    )
+
+    assert sync.sync_once(user_id) == []
+
+
 def test_same_count_activity_edit_invalidates_snapshot_gate(tmp_path):
     path, user_id = _fixture_db(tmp_path, count=1)
     store = CloudCredentialStore(MemorySecrets())
@@ -868,6 +1301,8 @@ def test_same_count_activity_edit_invalidates_snapshot_gate(tmp_path):
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -912,6 +1347,8 @@ def test_source_write_racing_success_baseline_is_published_next_cycle(
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -1037,6 +1474,8 @@ def test_derived_snapshot_gate_expires_when_calendar_day_changes(
     calls = []
 
     def transport(_url, _headers, body):
+        if _url.endswith("/api/v1/edits/pull"):
+            return 200, b'{"edits":[]}'
         calls.append(json.loads(body))
         return 200, b'{"revision":1}'
 
@@ -1132,6 +1571,34 @@ def test_idle_scheduler_wait_is_untimed(tmp_path):
     try:
         assert entered.wait(2)
         assert None in sync._scheduler_lock.timeouts
+    finally:
+        sync.stop()
+
+
+def test_scheduler_start_preserves_persisted_retry_deadline(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    now = 1_000.0
+    retry_at = now + 300
+    db.save_cloud_sync_state(
+        user_id,
+        {
+            "enabled": True,
+            "read_endpoint": "https://read.example",
+            "sync_endpoint": "https://sync.example",
+            "next_retry_at": retry_at,
+        },
+        path=str(path),
+    )
+    attempted = threading.Event()
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(MemorySecrets()), clock=lambda: now,
+    )
+    sync.sync_once = lambda _uid: attempted.set() or []
+    sync.start()
+    try:
+        with sync._scheduler_lock:
+            assert sync._scheduled[user_id] == retry_at
+        assert not attempted.wait(0.05)
     finally:
         sync.stop()
 

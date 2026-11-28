@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 
 from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
 from wattracker.cloud.client import (
+    CloudEditsNotSupported,
+    CloudEnrollmentError,
     CloudSyncClient,
     SyncCredentials,
     SyncResult,
@@ -650,6 +652,74 @@ def test_sync_client_uses_bound_namespace_and_keeps_network_optional():
 
     offline = CloudSyncClient("https://cloud.example", credentials)
     assert offline.push(batch).detail == SYNC_ENDPOINT_NOT_CONFIGURED
+
+
+def test_sync_client_validates_pulled_edits_and_accepts_a_stale_ack():
+    calls = []
+    edit = {
+        "edit_id": "a" * 32,
+        "activity_id": 17,
+        "rpe": 7,
+        "base_rpe": None,
+        "created_at": 123.5,
+    }
+
+    def transport(url, headers, body, method):
+        calls.append((url, headers, body, method))
+        if url.endswith("/api/v1/edits/pull"):
+            response = {"edits": [edit, {**edit, "rpe": True}, {**edit, "extra": 1}]}
+        else:
+            response = {"acked": 0}
+        return 200, json.dumps(response).encode()
+
+    client = CloudSyncClient(
+        "https://cloud.example",
+        SyncCredentials("c" * 64, "subscription", b"signing-key", "a" * 64),
+        transport=transport,
+        clock=lambda: 100,
+    )
+
+    pulled = client.pull_edits()
+    assert [(item.edit_id, item.activity_id, item.rpe, item.base_rpe, item.created_at)
+            for item in pulled] == [("a" * 32, 17, 7, None, 123.5)]
+    assert "extra" not in vars(pulled[0])
+    assert client.ack_edits([pulled[0].ack("applied")])
+    assert calls[0][0] == "https://cloud.example/api/v1/edits/pull"
+    assert calls[0][3] == "POST"
+    assert calls[1][0] == "https://cloud.example/api/v1/edits/ack"
+    assert json.loads(calls[1][2]) == {
+        "results": [{"edit_id": "a" * 32, "status": "applied"}]
+    }
+
+
+def test_sync_client_reports_pre_s2_edit_pull_as_unsupported():
+    client = CloudSyncClient(
+        "https://cloud.example",
+        SyncCredentials("c" * 64, "subscription", b"signing-key", "a" * 64),
+        transport=lambda *_args: (404, b"{}"),
+        clock=lambda: 100,
+    )
+
+    with pytest.raises(CloudEditsNotSupported):
+        client.pull_edits()
+
+
+@pytest.mark.parametrize("retry_after", ["9" * 7, "9" * 5_000])
+def test_sync_client_ignores_oversized_retry_after_without_integer_conversion(
+    retry_after,
+):
+    client = CloudSyncClient(
+        "https://cloud.example",
+        SyncCredentials("c" * 64, "subscription", b"signing-key", "a" * 64),
+        transport=lambda *_args: (
+            429, b'{"detail":"quota"}', {"Retry-After": retry_after},
+        ),
+        clock=lambda: 100,
+    )
+
+    with pytest.raises(CloudEnrollmentError):
+        client.pull_edits()
+    assert client.last_retry_after_seconds is None
 
 
 def test_sync_client_classifies_a_wrapped_upload_timeout_without_details():

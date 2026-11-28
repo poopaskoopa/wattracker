@@ -31,7 +31,7 @@ from .timeutil import (
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 38
+SCHEMA_VERSION = 39
 
 
 def _restrict_db_files(path: str) -> None:
@@ -507,12 +507,25 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
     ],
     36: [_backfill_plan_completion_dates],
     37: [_migrate_cloud_sync_endpoints],
+    38: [
+        # Remember which cloud edits have already affected local RPE/FTP state.
+        # The edit id is scoped to the local rider because cloud queues are
+        # scoped to the writer installation, while one local DB can hold more
+        # than one rider.
+        "CREATE TABLE IF NOT EXISTS cloud_applied_rpe_edits ("
+        "user_id INTEGER NOT NULL, edit_id TEXT NOT NULL, applied_at TEXT NOT NULL, "
+        "status TEXT NOT NULL CHECK (status IN ('applied','conflict','rejected')), "
+        "feedback_pending INTEGER NOT NULL DEFAULT 0 CHECK (feedback_pending IN (0, 1)), "
+        "PRIMARY KEY(user_id, edit_id), "
+        "FOREIGN KEY(user_id) REFERENCES users(id))",
+    ],
 }
 
 _DROP = """
 DROP TABLE IF EXISTS cloud_publication_state;
 DROP TABLE IF EXISTS cloud_publication_pending;
 DROP TABLE IF EXISTS cloud_publication_ledger;
+DROP TABLE IF EXISTS cloud_applied_rpe_edits;
 DROP TABLE IF EXISTS cloud_sync_state;
 DROP TABLE IF EXISTS weight_history;
 DROP TABLE IF EXISTS connector_devices;
@@ -928,6 +941,18 @@ CREATE TABLE IF NOT EXISTS cloud_publication_ledger (
 );
 CREATE INDEX IF NOT EXISTS idx_cloud_publication_ledger_user
     ON cloud_publication_ledger(user_id, kind, object_id);
+
+-- The edit id survives restarts so a lost acknowledgement cannot make a
+-- redelivered rating reverse later desktop work or apply FTP feedback twice.
+CREATE TABLE IF NOT EXISTS cloud_applied_rpe_edits (
+    user_id          INTEGER NOT NULL,
+    edit_id          TEXT NOT NULL,
+    applied_at       TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('applied', 'conflict', 'rejected')),
+    feedback_pending INTEGER NOT NULL DEFAULT 0 CHECK (feedback_pending IN (0, 1)),
+    PRIMARY KEY (user_id, edit_id),
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 
 -- A prepared batch remains resumable until its server response is known to
 -- have been accepted locally. Keeping the exact payload makes a retry safe
@@ -3376,9 +3401,12 @@ def plan_workouts_in_range(
 
 
 def get_plan_workout(
-    user_id: int, workout_id: int, path: Optional[str] = None
+    user_id: int, workout_id: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> Optional[dict]:
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         row = conn.execute(
             "SELECT * FROM plan_workouts WHERE user_id = ? AND id = ?",
@@ -3386,7 +3414,8 @@ def get_plan_workout(
         ).fetchone()
         return _plan_workout_row(row, include_zwo=True) if row else None
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def delete_plan(
@@ -3530,24 +3559,29 @@ def set_plan_workout_completion(
 
 
 def set_plan_workout_rpe(
-    user_id: int, workout_id: int, rpe: int, path: Optional[str] = None
+    user_id: int, workout_id: int, rpe: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> bool:
     """Set (or overwrite) the perceived-exertion grade of a completed workout.
 
     Scoped to the user and to workouts that have been completed; returns True
     when a row was updated.
     """
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         cur = conn.execute(
             "UPDATE plan_workouts SET rpe = ? "
             "WHERE user_id = ? AND id = ? AND completed_activity_id IS NOT NULL",
             (int(rpe), user_id, workout_id),
         )
-        conn.commit()
+        if owned:
+            conn.commit()
         return cur.rowcount > 0
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 # ------------------------------------------------ standalone exported workouts
@@ -3726,18 +3760,24 @@ def pending_ratings(user_id: int, path: Optional[str] = None) -> List[dict]:
 
 def set_standalone_rpe(
     user_id: int, workout_id: int, rpe: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> bool:
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         cur = conn.execute(
-            "UPDATE standalone_workouts SET rpe=? WHERE user_id=? AND id=? "
+            "UPDATE standalone_workouts SET rpe=? "
+            "WHERE user_id=? AND id=? "
             "AND completed_activity_id IS NOT NULL",
             (int(rpe), user_id, workout_id),
         )
-        conn.commit()
+        if owned:
+            conn.commit()
         return cur.rowcount > 0
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def set_activity_distance(
@@ -3763,6 +3803,7 @@ def set_activity_distance(
 
 def set_activity_rpe(
     user_id: int, activity_id: int, rpe: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> bool:
     """Set a subjective perceived-exertion rating directly on an activity.
 
@@ -3770,16 +3811,20 @@ def set_activity_rpe(
     matched rides route their rating through the workout so it feeds the FTP
     loop. Scoped to the user; returns True when a row was updated.
     """
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         cur = conn.execute(
             "UPDATE activities SET rpe=? WHERE user_id=? AND id=?",
             (int(rpe), user_id, activity_id),
         )
-        conn.commit()
+        if owned:
+            conn.commit()
         return cur.rowcount > 0
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def linked_workout_for_activity(
@@ -3816,8 +3861,11 @@ def linked_workout_for_activity(
 
 def get_standalone_workout(
     user_id: int, workout_id: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> Optional[dict]:
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         row = conn.execute(
             "SELECT * FROM standalone_workouts WHERE user_id=? AND id=?",
@@ -3825,7 +3873,8 @@ def get_standalone_workout(
         ).fetchone()
         return _standalone_row(row, True) if row else None
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def unused_feedback_evidence(
@@ -3845,7 +3894,8 @@ def unused_feedback_evidence(
             "AND effective_ftp IS NOT NULL UNION ALL "
             "SELECT 'standalone',id,completed_date,type,rpe,compliance,effective_ftp,zwo "
             "FROM standalone_workouts WHERE user_id=? AND completed_date>=? "
-            "AND rpe IS NOT NULL AND feedback_batch_id IS NULL AND type IN "
+            "AND rpe IS NOT NULL AND feedback_batch_id IS NULL "
+            "AND type IN "
             "('threshold','sweet_spot','vo2max') AND compliance IS NOT NULL "
             "AND effective_ftp IS NOT NULL ORDER BY completed_date,id",
             (user_id, since_date, user_id, since_date),
@@ -3855,21 +3905,56 @@ def unused_feedback_evidence(
         conn.close()
 
 
+def _feedback_evidence_is_current(
+    conn: sqlite3.Connection, user_id: int, evidence: List[dict],
+) -> bool:
+    """Ensure every proposed evidence row is still unconsumed and unchanged."""
+    if not isinstance(evidence, list) or not evidence:
+        return False
+    tables = {"plan": "plan_workouts", "standalone": "standalone_workouts"}
+    seen: set[tuple[str, int]] = set()
+    for item in evidence:
+        if not isinstance(item, dict):
+            return False
+        kind = item.get("kind")
+        workout_id = item.get("id")
+        rpe = item.get("rpe")
+        if (
+            not isinstance(kind, str) or kind not in tables
+            or type(workout_id) is not int or workout_id < 1
+            or type(rpe) is not int or not 1 <= rpe <= 10
+            or (kind, workout_id) in seen
+        ):
+            return False
+        seen.add((kind, workout_id))
+        row = conn.execute(
+            f"SELECT rpe,feedback_batch_id FROM {tables[kind]} "
+            "WHERE user_id=? AND id=?",
+            (user_id, workout_id),
+        ).fetchone()
+        if (
+            row is None or row["rpe"] != rpe
+            or row["feedback_batch_id"] is not None
+        ):
+            return False
+    return True
+
+
 def _consume_evidence(
     conn: sqlite3.Connection, user_id: int, batch_id: int, evidence: List[dict]
-) -> None:
-    """Attach every rated workout in `evidence` to `batch_id` (same tx)."""
-    for kind in ("plan", "standalone"):
-        ids = [int(e["id"]) for e in evidence if e["kind"] == kind]
-        if not ids:
-            continue
-        table = "plan_workouts" if kind == "plan" else "standalone_workouts"
-        marks = ",".join("?" for _ in ids)
-        conn.execute(
+) -> bool:
+    """Attach each still-matching, unconsumed rating to `batch_id`."""
+    tables = {"plan": "plan_workouts", "standalone": "standalone_workouts"}
+    for item in evidence:
+        table = tables[item["kind"]]
+        updated = conn.execute(
             f"UPDATE {table} SET feedback_applied=1,feedback_batch_id=? "
-            f"WHERE user_id=? AND id IN ({marks})",
-            (batch_id, user_id, *ids),
+            "WHERE user_id=? AND id=? AND rpe=? AND feedback_batch_id IS NULL",
+            (batch_id, user_id, item["id"], item["rpe"]),
         )
+        if updated.rowcount != 1:
+            return False
+    return True
 
 
 def apply_feedback_batch(
@@ -3880,6 +3965,10 @@ def apply_feedback_batch(
     """Atomically adjust estimated FTP, record the batch, and consume evidence."""
     conn = connect(path)
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not _feedback_evidence_is_current(conn, user_id, evidence):
+            conn.rollback()
+            return None
         updated = conn.execute(
             "UPDATE ftp_history SET ftp_watts=? WHERE user_id=? AND date=? "
             "AND source='estimated'",
@@ -3894,7 +3983,9 @@ def apply_feedback_batch(
             (user_id, ftp_date, float(delta), utc_now().isoformat()),
         )
         batch_id = int(cur.lastrowid)
-        _consume_evidence(conn, user_id, batch_id, evidence)
+        if not _consume_evidence(conn, user_id, batch_id, evidence):
+            conn.rollback()
+            return None
         conn.commit()
         return batch_id
     finally:
@@ -3921,13 +4012,19 @@ def record_ftp_suggestion(
     """
     conn = connect(path)
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not _feedback_evidence_is_current(conn, user_id, evidence):
+            conn.rollback()
+            return None
         cur = conn.execute(
             "INSERT INTO ftp_feedback_batches(user_id,ftp_date,delta,created) "
             "VALUES (?,?,0.0,?)",
             (user_id, ftp_date, utc_now().isoformat()),
         )
         batch_id = int(cur.lastrowid)
-        _consume_evidence(conn, user_id, batch_id, evidence)
+        if not _consume_evidence(conn, user_id, batch_id, evidence):
+            conn.rollback()
+            return None
         suggestion_id = None
         if suggested_ftp is not None and abs(
             float(suggested_ftp) - float(current_ftp)
@@ -4030,10 +4127,13 @@ def resolve_ftp_suggestion(
 
 def rollback_feedback_for_workout(
     user_id: int, kind: str, workout_id: int, path: Optional[str] = None,
+    *, conn: Optional[sqlite3.Connection] = None,
 ) -> bool:
     """Undo the active batch containing a workout and release its evidence."""
     table = "plan_workouts" if kind == "plan" else "standalone_workouts"
-    conn = connect(path)
+    owned = conn is None
+    if owned:
+        conn = connect(path)
     try:
         row = conn.execute(
             f"SELECT feedback_batch_id FROM {table} WHERE user_id=? AND id=?",
@@ -4073,10 +4173,12 @@ def rollback_feedback_for_workout(
             "WHERE user_id=? AND batch_id=? AND status='pending'",
             (utc_now().isoformat(), user_id, batch_id),
         )
-        conn.commit()
+        if owned:
+            conn.commit()
         return True
     finally:
-        conn.close()
+        if owned:
+            conn.close()
 
 
 def activity_start_time(

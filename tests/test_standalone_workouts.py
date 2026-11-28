@@ -19,17 +19,17 @@ DATE = "2026-07-19"
 
 
 def _workout(user_id, key="one", date=DATE, kind="threshold", ftp=200.0,
-             minutes=60):
+             minutes=60, path=None):
     session = build_workout(kind, minutes)
     xml = zwo.zwo_string(session)
     workout_id = db.add_standalone_workout(
         user_id, key, date, session.name, kind, session.total_duration(),
-        session.estimated_tss, xml, ftp,
+        session.estimated_tss, xml, ftp, path=path,
     )
     return workout_id, xml
 
 
-def _activity(user_id, date, power, duration=None, suffix="a"):
+def _activity(user_id, date, power, duration=None, suffix="a", path=None):
     duration = duration if duration is not None else len(power)
     return db.insert_activity(user_id, {
         "dedup_hash": f"{user_id}-{date}-{suffix}",
@@ -43,7 +43,7 @@ def _activity(user_id, date, power, duration=None, suffix="a"):
         "if_": None,
         "tss": 999,
         "streams": {"power": power},
-    })
+    }, path=path)
 
 
 def _complete(user_id, key, rpe, compliance=.95, effective=220.0,
@@ -54,6 +54,24 @@ def _complete(user_id, key, rpe, compliance=.95, effective=220.0,
     )
     assert db.set_standalone_rpe(user_id, workout_id, rpe)
     return workout_id
+
+
+def _cloud_target(user_id, key, rpe=None, path=None, date=DATE):
+    workout_id, _ = _workout(user_id, key=key, date=date, path=path)
+    activity_id = _activity(
+        user_id, date, [200.0] * 60, duration=60,
+        suffix=f"cloud-{key}", path=path,
+    )
+    assert db.mark_standalone_completed(
+        user_id, workout_id, activity_id, date, .95, 230.0, path=path,
+    )
+    if rpe is not None:
+        assert db.set_standalone_rpe(user_id, workout_id, rpe, path=path)
+    return workout_id, activity_id
+
+
+def _cloud_now():
+    return dt.datetime.fromisoformat(f"{DATE}T20:00:00+00:00")
 
 
 def _plan_workout(user_id, key="plan", kind="threshold", date=DATE,
@@ -406,6 +424,133 @@ def test_feedback_raises_and_caps_then_is_idempotent(user_id):
         user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
     ) is None
     assert all(db.get_standalone_workout(user_id, item)["feedback_applied"] for item in ids)
+
+
+def test_cloud_rating_uses_the_desktop_ftp_feedback_path(user_id, monkeypatch):
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+    cloud_workout, cloud_activity = _cloud_target(user_id, "cloud-evidence")
+    feedback_calls = []
+    monkeypatch.setattr(
+        importer, "apply_rpe_ftp_feedback",
+        lambda *args, **kwargs: feedback_calls.append((args, kwargs)),
+    )
+
+    assert importer.apply_cloud_rpe_edit(
+        user_id, cloud_activity, 6, None, edit_id="a" * 32, now=_cloud_now(),
+    ) == "applied"
+    assert db.get_standalone_workout(user_id, cloud_workout)["rpe"] == 6
+    assert len(feedback_calls) == 1
+    evidence = db.unused_feedback_evidence(user_id, DATE)
+    assert [item["id"] for item in evidence] == [cloud_workout]
+
+
+def test_cloud_and_desktop_rerates_produce_equal_ftp_and_suggestion_state(user_id):
+    desktop_user = db.create_user("desktop-parity", "unused-password")
+    for rider in (user_id, desktop_user):
+        db.add_ftp_entry(rider, DATE, 200, "estimated")
+        db.save_user_settings(rider, {"ftp": 200})
+    cloud_workout, cloud_activity = _cloud_target(
+        user_id, "cloud-parity", rpe=8,
+    )
+    _cloud_target(user_id, "cloud-parity-peer", rpe=7)
+    desktop_workout, _ = _cloud_target(
+        desktop_user, "desktop-parity", rpe=8,
+    )
+    _cloud_target(desktop_user, "desktop-parity-peer", rpe=7)
+    assert importer.apply_rpe_ftp_feedback(user_id, _cloud_now()) is None
+    assert importer.apply_rpe_ftp_feedback(desktop_user, _cloud_now()) is None
+
+    assert importer.apply_cloud_rpe_edit(
+        user_id, cloud_activity, 7, 8, edit_id="d" * 32, now=_cloud_now(),
+    ) == "applied"
+    assert importer.save_workout_rpe(
+        desktop_user, "standalone", desktop_workout, 7, _cloud_now(),
+    )
+
+    assert db.latest_ftp(user_id)["ftp_watts"] == db.latest_ftp(desktop_user)["ftp_watts"]
+    cloud_suggestion = db.pending_ftp_suggestion(user_id)
+    desktop_suggestion = db.pending_ftp_suggestion(desktop_user)
+    assert (cloud_suggestion or {}).get("suggested_ftp") == (
+        (desktop_suggestion or {}).get("suggested_ftp")
+    )
+    assert (cloud_suggestion or {}).get("status") == (
+        (desktop_suggestion or {}).get("status")
+    )
+
+
+def test_cloud_edit_reverses_and_reapplies_existing_feedback(user_id, monkeypatch):
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+    cloud_workout, cloud_activity = _cloud_target(
+        user_id, "cloud-in-batch", rpe=6,
+    )
+    other_workout, _ = _cloud_target(user_id, "other-in-batch", rpe=6)
+    assert importer.apply_rpe_ftp_feedback(user_id, _cloud_now()) == 210.0
+    before = db.get_standalone_workout(user_id, cloud_workout)
+    assert before["feedback_applied"]
+    assert before["feedback_batch_id"] is not None
+
+    rollback_calls = []
+    feedback_calls = []
+    original_rollback = db.rollback_feedback_for_workout
+    original_feedback = importer.apply_rpe_ftp_feedback
+
+    def rollback(*args, **kwargs):
+        rollback_calls.append((args, kwargs))
+        return original_rollback(*args, **kwargs)
+
+    def feedback(*args, **kwargs):
+        feedback_calls.append((args, kwargs))
+        return original_feedback(*args, **kwargs)
+
+    monkeypatch.setattr(db, "rollback_feedback_for_workout", rollback)
+    monkeypatch.setattr(importer, "apply_rpe_ftp_feedback", feedback)
+    assert importer.apply_cloud_rpe_edit(
+        user_id, cloud_activity, 9, 6, edit_id="b" * 32, now=_cloud_now(),
+    ) == "applied"
+    after = db.get_standalone_workout(user_id, cloud_workout)
+    assert after["rpe"] == 9
+    assert after["feedback_batch_id"] != before["feedback_batch_id"]
+    assert len(rollback_calls) == 1
+    assert len(feedback_calls) == 1
+
+
+def test_desktop_same_value_rerate_after_cloud_edit_feeds_ftp(user_id):
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+    cloud_workout, cloud_activity = _cloud_target(user_id, "desktop-rerate")
+    _cloud_target(user_id, "desktop-rerate-peer", rpe=6)
+    assert importer.apply_cloud_rpe_edit(
+        user_id, cloud_activity, 6, None, edit_id="c" * 32, now=_cloud_now(),
+    ) == "applied"
+    assert db.latest_ftp(user_id)["ftp_watts"] == 210.0
+
+    assert importer.save_workout_rpe(
+        user_id, "standalone", cloud_workout, 6, _cloud_now(),
+    )
+    assert db.latest_ftp(user_id)["ftp_watts"] == 210.0
+    assert db.get_standalone_workout(user_id, cloud_workout)["feedback_applied"]
+
+
+def test_activity_rpe_feedback_keeps_explicit_database_path(tmp_path, monkeypatch):
+    path = str(tmp_path / "explicit-rpe.db")
+    date = dt.date.today().isoformat()
+    db.init_db(path)
+    user_id = db.create_user("explicit-rpe", "unused-password", path=path)
+    db.add_ftp_entry(user_id, date, 200, "estimated", path=path)
+    first_workout, _ = _cloud_target(
+        user_id, "explicit-first", path=path, date=date,
+    )
+    second_workout, second_activity = _cloud_target(
+        user_id, "explicit-second", path=path, date=date,
+    )
+    assert db.set_standalone_rpe(user_id, first_workout, 6, path=path)
+    monkeypatch.setattr(
+        db, "db_path", lambda: pytest.fail("feedback used the default database"),
+    )
+
+    assert importer.set_ride_rpe(
+        user_id, second_activity, 6, path=path,
+    ).current == 6
+    assert db.latest_ftp(user_id, path=path)["ftp_watts"] == 210.0
 
 
 def test_feedback_lowers_caps_and_ignores_insufficient_or_bad_evidence(user_id):
