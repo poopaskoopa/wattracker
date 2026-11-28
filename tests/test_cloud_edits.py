@@ -5,7 +5,14 @@ from dataclasses import replace
 import pytest
 
 from wattracker.cloud.api import _EDIT_ACK_IDEMPOTENCY_KEY
-from wattracker.cloud.edits import EDIT_QUEUE_KIND, EditQueue, edit_queue_key
+from wattracker.cloud.edits import (
+    EDIT_QUEUE_KIND,
+    EditQueue,
+    EditQueueFull,
+    _PAYLOAD_LIMIT,
+    _serialized_size,
+    edit_queue_key,
+)
 from wattracker.cloud.limits import (
     DEVICE_SUBJECT, METRIC_EDITS, QUOTA_RECORD_KIND, QuotaExceeded,
     PUBLIC_UNAVAILABLE_DETAIL, counter_key,
@@ -15,6 +22,7 @@ from wattracker.cloud.security import (
     ExpiredRecordSweeper,
     NEVER_SWEEP_RECORD_KINDS,
     SecurityStateUnavailable,
+    generate_signing_keypair,
 )
 from wattracker.cloud.wipe import WIPE_RECORD_KINDS, wipe_scope
 
@@ -276,6 +284,289 @@ def test_status_is_caller_filtered_scope_bound_and_rejects_get_body(deployment):
     assert nonempty.status_code == 400
     other = _rider(deployment, seed=b"b")
     assert _pull(deployment, other, nonce="other-scope").json() == {"edits": []}
+
+
+def test_status_prunes_only_in_memory_and_does_not_create_missing_row(deployment):
+    writer = _rider(deployment)
+    device, _private = _device(deployment, writer)
+    queue = EditQueue(deployment.backend, clock=deployment.clock)
+    key = edit_queue_key(writer.namespace, "scope")
+    expired = {
+        "namespace": writer.namespace,
+        "local_user_scope": "scope",
+        "pending": [{
+            "edit_id": "a" * 32,
+            "activity_id": 1,
+            "rpe": 5,
+            "base_rpe": 4,
+            "submitted_by": device.credential_id,
+            "created_at": 1_000.0,
+        }],
+        "settled": [],
+    }
+    deployment.backend.write(EDIT_QUEUE_KIND, key, expired)
+    deployment.clock.value += 14 * 24 * 60 * 60 + 1
+
+    rows = queue.status(writer.namespace, "scope", device.credential_id)
+    assert [(row["edit_id"], row["status"]) for row in rows] == [("a" * 32, "expired")]
+    assert deployment.backend.read(EDIT_QUEUE_KIND, key) == expired
+
+    absent = edit_queue_key(writer.namespace, "missing")
+    assert queue.status(writer.namespace, "missing", device.credential_id) == []
+    assert deployment.backend.read(EDIT_QUEUE_KIND, absent) is None
+
+
+def _maximal_queue(namespace, scope, submitted_by):
+    maximum_time = 1.7976931348623157e308
+    return {
+        "namespace": namespace,
+        "local_user_scope": scope,
+        "pending": [{
+            "edit_id": f"{index:032x}",
+            "activity_id": 2**53 - 1,
+            "rpe": 10,
+            "base_rpe": 9,
+            "submitted_by": submitted_by,
+            "created_at": maximum_time,
+        } for index in range(50)],
+        "settled": [{
+            "edit_id": f"{index + 50:032x}",
+            "submitted_by": submitted_by,
+            "activity_id": 2**53 - 1,
+            "rpe": 10,
+            "status": "rejected",
+            "settled_at": maximum_time,
+        } for index in range(100)],
+    }
+
+
+def test_full_maximal_queue_status_pull_and_ack_prune_settled_but_reject_pending_overflow(deployment):
+    writer = _rider(deployment)
+    device, private = _device(deployment, writer)
+    _grant(deployment, writer, device, True, "grant")
+    key = edit_queue_key(writer.namespace, "scope")
+    full = _maximal_queue(writer.namespace, "scope", device.credential_id)
+    assert _serialized_size(full) > _PAYLOAD_LIMIT
+    deployment.backend.write(EDIT_QUEUE_KIND, key, full)
+
+    status = _request(deployment, device, private, "GET", "/api/v1/edits",
+                      nonce="full-status", idem="edit-status")
+    assert status.status_code == 200
+    assert deployment.backend.read(EDIT_QUEUE_KIND, key) == full
+
+    pulled = _pull(deployment, writer, nonce="full-pull")
+    assert pulled.status_code == 200
+    assert len(pulled.json()["edits"]) == 50
+    after_pull = deployment.backend.read(EDIT_QUEUE_KIND, key)
+    assert len(after_pull["settled"]) < 100
+    assert _serialized_size(after_pull) <= _PAYLOAD_LIMIT
+    assert after_pull["settled"] == full["settled"][-len(after_pull["settled"]):]
+
+    deployment.backend.write(EDIT_QUEUE_KIND, key, full)
+    ack = _writer_request(
+        deployment, writer, "POST", "/api/v1/edits/ack", nonce="full-ack",
+        idem="edit-ack",
+        body=json.dumps({"results": [{"edit_id": "0" * 32, "status": "applied"}]},
+                        separators=(",", ":")).encode(),
+    )
+    assert ack.status_code == 200
+    assert ack.json() == {"acked": 1}
+    after_ack = deployment.backend.read(EDIT_QUEUE_KIND, key)
+    assert _serialized_size(after_ack) <= _PAYLOAD_LIMIT
+    assert after_ack["settled"][-1]["edit_id"] == "0" * 32
+
+    # Settled history can be trimmed; pending edits must never be discarded to fit.
+    pending_only = dict(full, pending=full["pending"] + [dict(full["pending"][0], edit_id="f" * 32)], settled=[])
+    deployment.backend.write(EDIT_QUEUE_KIND, key, pending_only)
+    with pytest.raises(EditQueueFull):
+        EditQueue(deployment.backend, clock=deployment.clock).ack(
+            writer.namespace, "scope", []
+        )
+
+
+def test_full_maximal_queue_keeps_newest_settled_and_prunes_oldest(deployment):
+    writer = _rider(deployment)
+    device, _private = _device(deployment, writer)
+    key = edit_queue_key(writer.namespace, "scope")
+    full = _maximal_queue(writer.namespace, "scope", device.credential_id)
+    deployment.backend.write(EDIT_QUEUE_KIND, key, full)
+
+    assert EditQueue(deployment.backend, clock=deployment.clock).ack(
+        writer.namespace, "scope", []
+    ) == 0
+
+    trimmed = deployment.backend.read(EDIT_QUEUE_KIND, key)
+    assert len(trimmed["settled"]) < len(full["settled"])
+    assert trimmed["settled"] == full["settled"][-len(trimmed["settled"]):]
+    assert trimmed["settled"][-1]["edit_id"] == full["settled"][-1]["edit_id"]
+
+
+def test_submit_binds_attested_subject_when_required(deployment):
+    writer = _rider(deployment)
+    private, public = generate_signing_keypair()
+    device = deployment.state.credentials.register_device_for_scope(
+        writer.namespace, "scope", public, subject="entra-user"
+    )
+    _grant(deployment, writer, device, True, "grant")
+    _activity(deployment, writer, 1)
+    deployment.config = replace(
+        deployment.config,
+        require_gateway_proof=True,
+        gateway_proof_value="test-gateway-secret",
+        require_verified_subject=True,
+    )
+    deployment.state.config = deployment.config
+
+    body = json.dumps({
+        "edit_id": "a" * 32, "activity_id": 1, "rpe": 5, "base_rpe": 4,
+    }, separators=(",", ":")).encode()
+    headers = _envelope(
+        device, "POST", "/api/v1/edits", nonce="subject-mismatch",
+        idem="a" * 32, body=body, signer=_device_signer(private),
+    )
+    headers["X-Gateway-Request-Proof"] = "test-gateway-secret"
+    headers["X-Verified-Entra-Subject"] = "different-user"
+    mismatch = deployment.client.post("/api/v1/edits", content=body, headers=headers)
+    assert mismatch.status_code == 401
+    assert deployment.backend.read(
+        EDIT_QUEUE_KIND, edit_queue_key(writer.namespace, "scope")
+    ) is None
+
+    headers = _envelope(
+        device, "POST", "/api/v1/edits", nonce="subject-match",
+        idem="b" * 32,
+        body=json.dumps({
+            "edit_id": "b" * 32, "activity_id": 1, "rpe": 6, "base_rpe": 4,
+        }, separators=(",", ":")).encode(),
+        signer=_device_signer(private),
+    )
+    headers["X-Gateway-Request-Proof"] = "test-gateway-secret"
+    matched_body = json.dumps({
+        "edit_id": "b" * 32, "activity_id": 1, "rpe": 6, "base_rpe": 4,
+    }, separators=(",", ":")).encode()
+    accepted = deployment.client.post("/api/v1/edits", content=matched_body, headers=headers)
+    assert accepted.status_code == 202
+
+
+def test_submit_requires_attested_subject_header_when_configured(deployment):
+    writer = _rider(deployment)
+    private, public = generate_signing_keypair()
+    device = deployment.state.credentials.register_device_for_scope(
+        writer.namespace, "scope", public, subject="entra-user"
+    )
+    _grant(deployment, writer, device, True, "grant")
+    _activity(deployment, writer, 1)
+    deployment.config = replace(
+        deployment.config,
+        require_gateway_proof=True,
+        gateway_proof_value="test-gateway-secret",
+        require_verified_subject=True,
+    )
+    deployment.state.config = deployment.config
+
+    body = json.dumps({
+        "edit_id": "c" * 32, "activity_id": 1, "rpe": 5, "base_rpe": 4,
+    }, separators=(",", ":")).encode()
+    headers = _envelope(
+        device, "POST", "/api/v1/edits", nonce="subject-missing",
+        idem="c" * 32, body=body, signer=_device_signer(private),
+    )
+    headers["X-Gateway-Request-Proof"] = "test-gateway-secret"
+    del headers["X-Verified-Entra-Subject"]
+
+    refused = deployment.client.post("/api/v1/edits", content=body, headers=headers)
+    assert refused.status_code == 401
+    assert deployment.backend.read(
+        EDIT_QUEUE_KIND, edit_queue_key(writer.namespace, "scope")
+    ) is None
+
+
+def test_pull_resolves_devices_before_backend_update_and_filters_scope(deployment, monkeypatch):
+    writer = _rider(deployment)
+    device, _private = _device(deployment, writer)
+    _grant(deployment, writer, device, True, "grant")
+    key = edit_queue_key(writer.namespace, "scope")
+    row = {
+        "namespace": writer.namespace,
+        "local_user_scope": "scope",
+        "pending": [{
+            "edit_id": "a" * 32, "activity_id": 1, "rpe": 5,
+            "base_rpe": 4, "submitted_by": device.credential_id,
+            "created_at": deployment.clock(),
+        }],
+        "settled": [],
+    }
+    deployment.backend.write(EDIT_QUEUE_KIND, key, row)
+    original_update = deployment.backend.update
+    updating = False
+
+    def tracked_update(kind, record_key, transform):
+        def guarded(current):
+            nonlocal updating
+            updating = True
+            try:
+                return transform(current)
+            finally:
+                updating = False
+        return original_update(kind, record_key, guarded)
+
+    monkeypatch.setattr(deployment.backend, "update", tracked_update)
+
+    def resolve(credential_id):
+        assert not updating
+        return deployment.state.credentials.resolve_device(credential_id)
+
+    queue = EditQueue(deployment.backend, clock=deployment.clock, resolve_device=resolve)
+    assert [item["edit_id"] for item in queue.pull(writer.namespace, "scope")] == ["a" * 32]
+
+    other_writer = _rider(deployment, seed=b"b")
+    foreign_device, _foreign_private = _device(deployment, other_writer)
+    _grant(deployment, other_writer, foreign_device, True, "grant-foreign")
+    foreign_row = dict(row, pending=[dict(row["pending"][0], submitted_by=foreign_device.credential_id)])
+    deployment.backend.write(EDIT_QUEUE_KIND, key, foreign_row)
+    assert queue.pull(writer.namespace, "scope") == []
+    rejected = deployment.backend.read(EDIT_QUEUE_KIND, key)
+    assert rejected["pending"] == []
+    assert [(item["edit_id"], item["status"]) for item in rejected["settled"]] == [
+        ("a" * 32, "rejected")
+    ]
+
+
+def test_pull_rejects_device_in_same_namespace_with_different_scope(deployment):
+    writer = _rider(deployment)
+    _private, public = generate_signing_keypair()
+    foreign_scope_device = deployment.state.credentials.register_device_for_scope(
+        writer.namespace,
+        "other-scope",
+        public,
+        capabilities=frozenset({"annotate"}),
+    )
+    key = edit_queue_key(writer.namespace, "scope")
+    deployment.backend.write(EDIT_QUEUE_KIND, key, {
+        "namespace": writer.namespace,
+        "local_user_scope": "scope",
+        "pending": [{
+            "edit_id": "a" * 32,
+            "activity_id": 1,
+            "rpe": 5,
+            "base_rpe": 4,
+            "submitted_by": foreign_scope_device.credential_id,
+            "created_at": deployment.clock(),
+        }],
+        "settled": [],
+    })
+
+    queue = EditQueue(
+        deployment.backend,
+        clock=deployment.clock,
+        resolve_device=deployment.state.credentials.resolve_device,
+    )
+    assert queue.pull(writer.namespace, "scope") == []
+    rejected = deployment.backend.read(EDIT_QUEUE_KIND, key)
+    assert rejected["pending"] == []
+    assert [(item["edit_id"], item["status"]) for item in rejected["settled"]] == [
+        ("a" * 32, "rejected")
+    ]
 
 
 def test_durable_daily_edit_limit_is_per_device_and_scope(deployment):
