@@ -187,33 +187,22 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#495: mobile ride graph, expand to full screen + touch readout (iOS). (PR #503)**
-   The full spec is the integrator's comment on the issue: a full-screen cover, plus a
-   nearest-sample readout of **raw** power, cadence and HR, with time in `MinutesClock`
-   format. It must reuse `CombinedChartSeries`'s x values, and vertical scroll in
-   activity detail must keep working. Android is not ported; say so in the PR's `Android:` line.
-
-2. **#501: desktop pull, apply and ack of cloud RPE edits (Python). (PR #512)**
-   The spec is the issue body plus the integrator's two addendum comments. Addendum 2 is the
-   owner's decision C2 on #497 (2026-11-26): cloud-applied ratings never feed FTP. That
-   needs a source column, so this item owns **`SCHEMA_VERSION` 38 → 39**. PR #512 was reviewed
-   not ready: two scheduler hot loops in `next_due`, plus the C2 rework. Security review.
-
-3. **#510: cloud edit queue review follow-ups (Python).** Spec in the issue body.
+1. **#510: cloud edit queue review follow-ups (Python).** Spec in the issue body.
    Light security review. Must land before #502's device run, which uses the
    in-memory backend that item 4 of #510 deadlocks.
 
-4. **#494: set a ride's RPE from the mobile app on the local backend.** Labelled
-   `blocked` until #495 merges (#498 has). The spec is the integrator's two comments on the issue.
+2. **#494: set a ride's RPE from the mobile app on the local backend.** Unblocked:
+   #495 merged as PR #503 and #498 as PR #504. The spec is the integrator's two comments on the issue.
    The activity RPE route becomes the single explicitly connector-writable
    route, and the plan and standalone RPE routes refuse connector sessions. Flag the PR for
    security review.
 
-5. **#502: iOS RPE editing on the cloud backend.** After #494 merges
+3. **#502: iOS RPE editing on the cloud backend.** After #494 merges
    ("one iOS issue at a time") and after #510. #500's API contract is on `main`. The design,
-   the slice order and the owner's deploy step (S5) are in umbrella #497.
+   the slice order and the owner's deploy step (S5) are in umbrella #497. Cloud-applied
+   ratings feed FTP exactly like desktop ratings (#501 Addendum 4, which reversed C2).
 
-6. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+4. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -222,13 +211,14 @@ states on `main` when the PR is merge-committed. Four such commits are on
 
 **Done (landed, off the active list):** #427 via #441, #429 via #439 and #442,
 #437 via #440, #438, and #443 (closed), #451 via #453 (rolling
-preview verified on `preview-latest` 2026-10-27), #464 via #471, #479 via #489, #487 via #490, #498 via #504, #499 via #505, and #500 via #509.
+preview verified on `preview-latest` 2026-10-27), #464 via #471, #479 via #489, #487 via #490, #498 via #504, #499 via #505, #500 via #509, #495 via #503, and #501 via #512
+(`SCHEMA_VERSION` 39: applied cloud RPE edit ledger; C2 reversed by Addendum 4).
 
 **An item with an open PR stays on this list until the PR merges**, marked with
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**#249 stays skipped** pending taksmon's log and invocation. Once items 1-5 are done the queue is empty. Do not pick up unlabelled issues or anything
+**#249 stays skipped** pending taksmon's log and invocation. Once items 1-3 are done the queue is empty. Do not pick up unlabelled issues or anything
 below on your own. Say the queue ran out rather than inventing scope.
 
 **Not codex work, do not start:**
