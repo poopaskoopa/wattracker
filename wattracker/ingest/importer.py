@@ -1472,16 +1472,22 @@ def apply_cloud_rpe_edit(
                             if target.current != base_rpe:
                                 outcome = "conflict"
                             else:
+                                conn.execute("SAVEPOINT cloud_rpe_apply")
                                 try:
                                     target = set_ride_rpe(
                                         user_id, activity_id, rpe, conn=conn,
                                         expected_current=base_rpe, path=path,
                                     )
                                 except RpeCompareAndSetConflict:
+                                    conn.execute("ROLLBACK TO cloud_rpe_apply")
+                                    conn.execute("RELEASE cloud_rpe_apply")
                                     outcome = "conflict"
                                 except LookupError:
+                                    conn.execute("ROLLBACK TO cloud_rpe_apply")
+                                    conn.execute("RELEASE cloud_rpe_apply")
                                     outcome = "rejected"
                                 else:
+                                    conn.execute("RELEASE cloud_rpe_apply")
                                     outcome = "applied"
                                     should_feed_ftp = target.tunes_ftp
             conn.execute(
