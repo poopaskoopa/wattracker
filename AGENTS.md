@@ -187,16 +187,15 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#517: cloud RPE apply hardening (Python).** Spec in the issue body: a savepoint
+1. **#510: cloud edit queue review follow-ups (Python). (PR #515)** Spec in the issue body.
+   Light security review. Must land before #502's device run, which uses the
+   in-memory backend that item 4 of #510 deadlocks.
+
+2. **#517: cloud RPE apply hardening (Python).** Spec in the issue body: a savepoint
    around the write in `apply_cloud_rpe_edit`, so a rejected or conflicting edit undoes any
    FTP feedback rollback, and a single `pulled()` call when `get_cloud_sync_state` fails, so
    the retry backoff is kept. Both come from the #512 security review. No schema change.
-   It touches the same files as #510 (`importer.py`, `desktop_sync.py`), so land it first,
-   then rebase #510 onto it. Light security review.
-
-2. **#510: cloud edit queue review follow-ups (Python).** Spec in the issue body.
-   Light security review. Must land before #502's device run, which uses the
-   in-memory backend that item 4 of #510 deadlocks.
+   Desktop side only; no file overlap with #510's cloud-server PR #515. Light security review.
 
 3. **#494: set a ride's RPE from the mobile app on the local backend.** Unblocked:
    #495 merged as PR #503 and #498 as PR #504. The spec is the integrator's two comments on the issue.
